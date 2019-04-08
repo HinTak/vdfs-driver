@@ -2834,11 +2834,6 @@ static int vdfs4_mknod(struct inode *dir, struct dentry *dentry,
 	VT_IOPS_START(vt_data, vdfs_trace_iops_mknod, dentry);
 	vdfs4_start_transaction(VDFS4_SB(dir->i_sb));
 
-	if (!new_valid_dev(rdev)) {
-		ret = -EINVAL;
-		goto exit;
-	}
-
 	ret = vdfs4_create(dir, dentry, mode, NULL);
 	if (ret)
 		goto exit;
