@@ -24,6 +24,7 @@
 
 #include <linux/slab.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/rbtree.h>
 #include <linux/fs.h>
 #include <uapi/linux/mount.h>
