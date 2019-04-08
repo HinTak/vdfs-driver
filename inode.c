@@ -3000,7 +3000,6 @@ static const struct inode_operations vdfs4_dir_inode_operations = {
  * The eMMCFS symlink inode operations.
  */
 static const struct inode_operations vdfs4_symlink_inode_operations = {
-	.readlink	= generic_readlink,
 	.get_link	= page_get_link,
 	.setattr	= vdfs4_setattr,
 
