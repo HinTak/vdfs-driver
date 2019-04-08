@@ -26,6 +26,7 @@
 #include <linux/sched.h>
 #include <linux/rbtree.h>
 #include <linux/fs.h>
+#include <uapi/linux/mount.h>
 #include <linux/aio.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
