@@ -4240,7 +4240,7 @@ struct inode *vdfs4_special_iget(struct super_block *sb, unsigned long ino)
 	inode->i_mode = 0;
 
 	/* Metadata pages can not be migrated */
-	gfp_mask = (mapping_gfp_mask(inode->i_mapping) & ~GFP_MOVABLE_MASK);
+	gfp_mask = (mapping_gfp_mask(inode->i_mapping) & ~(__GFP_RECLAIMABLE|__GFP_MOVABLE));
 	mapping_set_gfp_mask(inode->i_mapping, gfp_mask);
 
 	size = vdfs4_special_file_size(sbi, ino);
