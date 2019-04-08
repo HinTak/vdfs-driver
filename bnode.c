@@ -200,7 +200,7 @@ do_reread:
 	if (!data) {
 		VDFS4_ERR("unable to vmap %d pages", btree->pages_per_node);
 		ret = -ENOMEM;
-		release_pages(bnode->pages, (int)btree->pages_per_node, 0);
+		release_pages(bnode->pages, (int)btree->pages_per_node);
 		dump_stack();
 		vdfs4_fatal_error(bnode->host->sbi, "vm_map_ram fails");
 		goto err_read;
@@ -307,7 +307,7 @@ err_exit_vunmap:
 		 (void *)data, bnode->host->node_size_bytes);
 
 	vm_unmap_ram(data, btree->pages_per_node);
-	release_pages(bnode->pages, (int)btree->pages_per_node, 0);
+	release_pages(bnode->pages, (int)btree->pages_per_node);
 	memset(bnode->pages, 0, sizeof(struct page *) * btree->pages_per_node);
 
 	if (reread_count < VDFS4_META_REREAD_BNODE) {

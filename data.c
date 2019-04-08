@@ -1543,7 +1543,7 @@ exit_alloc_page:
 	return ret;
 exit_read_data:
 	VDFS4_ERR("Error in exit_read data");
-	release_pages(pages, pages_count, 0);
+	release_pages(pages, pages_count);
 	return ret;
 
 }
@@ -2189,7 +2189,7 @@ exit_alloc_locked_page:
 exit_validate_page:
 	VDFS4_ERR("Error in exit_validate_page");
 exit_vdfs4_meta_read:
-	release_pages(pages, (int)pages_count, 0);
+	release_pages(pages, (int)pages_count);
 	return ret;
 }
 
