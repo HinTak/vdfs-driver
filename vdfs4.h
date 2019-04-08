@@ -1499,7 +1499,7 @@ static inline void vdfs4_assert_btree_write(struct vdfs4_btree *btree)
 
 static inline void vdfs4_assert_i_mutex(struct inode *inode)
 {
-	lockdep_assert_held(&inode->i_mutex);
+	WARN_ON(!inode_is_locked(inode));
 }
 
 #else /* CONFIG_VDFS4_DEBUG */
