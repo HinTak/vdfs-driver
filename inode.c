@@ -2286,7 +2286,7 @@ static int vdfs4_setattr(struct dentry *dentry, struct iattr *iattr)
 
 	VT_IOPS_START(vt_data, vdfs_trace_iops_setattr, dentry);
 	vdfs4_start_transaction(VDFS4_SB(inode->i_sb));
-	error = inode_change_ok(inode, iattr);
+	error = setattr_prepare(dentry, iattr);
 	if (error)
 		goto exit;
 
