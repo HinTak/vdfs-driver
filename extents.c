@@ -370,7 +370,7 @@ void vdfs4_exttree_cache_destroy(void)
 struct vdfs4_exttree_key *vdfs4_get_exttree_key(void)
 {
 	struct vdfs4_exttree_key *key =
-		kmem_cache_alloc(extents_tree_key_cachep, __GFP_WAIT);
+		kmem_cache_alloc(extents_tree_key_cachep, __GFP_RECLAIM);
 	return key ? key : ERR_PTR(-ENOMEM);
 }
 
