@@ -33,6 +33,7 @@ ccflags-y += -DCONFIG_VDFS4_META_SANITY_CHECK=1
 ccflags-y += -DCONFIG_VDFS4_POSIX_ACL=1
 ccflags-y += -DCONFIG_VDFS4_DECRYPT_SUPPORT=1
 #ccflags-y += -CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT=1
+ccflags-y += -I"${PWD}"
 endif
 
 ifdef VDFS4_NO_WARN
