@@ -1,0 +1,506 @@
+VDFS4 Filesystem
+===============
+
+tools version : 0437
+driver version: 0437
+
+
+1. Quick usage instructions:
+===========================
+
+  - Compile and install the latest version of vdfs4-tools
+
+  - Create a new filesystem using the mkfs.vdfs4:
+
+        # mkfs.vdfs4 /dev/hda1
+
+  - Mounting:
+
+        # mount -t vdfs4 /dev/hda1 /wherever
+
+2. Mount options
+================
+
+When mounting an vdfs4 filesystem, the following option are accepted:
+
+novercheck              Mount filesystem without checking versions of driver and
+                        on disk layout.
+
+btreecheck              Mount and run consistency check of file system's btrees.
+
+ro                      Mount filesystem read only.
+
+debugcheck              Log errors containing at debug area and exit without
+                        mounting a filesystem.
+
+tiny                    Mount filesystem with support of tiny files.
+
+tinysmall               Mount filesystem with support of tiny and small files.
+
+stripped                Mount a stripped image (don't check equality of image
+                        size written at superblock and real image size).
+
+fmask=value             Apply given value to all created regular files modes.
+                        The value is given in octal.
+
+dmask=value             Apply given value to all created directories modes.
+                        The value is given in octal.
+
+count=value             Count. Used for debug purpose.
+
+
+3. VDFS4 layout
+==============
+
+VDFS4 on-disk layout overview
+----------------------------
+
+  The vdfs4 on-disk layout consists of: superblocks, debug area, otp  area, meta
+area, tables area, small area and user data. On-disk location of the debug
+area, otp  area, meta area, tables area, small area is pointed by a extents
+which is stored at superblock. A block of the vdfs4 file system is 4K and it is
+fixed.
+
+  The [superblocks] contains information about a vdfs4 volume. If superblocks is
+present and correct than a volume is VDFS4 volume. A location of the vdfs4
+superblocks is fixed. The superblocks is located in two first blocks of  a
+vdfs4 volume.
+
+  The [debug area] contains information about errors. If vdfs4 file driver
+realizes that it can not continue to work (critical run-time error has
+happened) than it can write information about error into debug area for future
+analysis. A location of the debug area is fixed. The debug area is located in
+3 and 4 blocks of a vdfs4 volume.
+
+  The [otp] (One-Time-Programming) area is optional. The otp area is full filled
+with a vdfs4 volume image. If mount is failed to mount a vdfs4 volume and a otp
+area is present than the vdfs4.mkfs utility can restore vdfs4 volume from otp
+area.
+
+   [Meta area] contains vdfs4 meta data:
+	[blocks bitmap] contains information about volume block status: free or
+	allocated, one bit per one block. A volume block can be occupied by meta
+	data or user data;
+
+	[inode bitmap] contains information about occupied inodes numbers, one
+	bit per one inode number. Index in bitmap is inode number, if bit set
+	to 1 than number is  occupied;
+
+	[small area bitmap] contains information about small area chunks state.
+	The small area is divided into chunks. The chunk size is less than file
+	system block. vdfs4 file driver uses small area to gather together
+	several files into one file system block;
+
+	[catalog btree] contains information about files, folders, links and etc.
+
+	[extents overflow btree] contains information about blocks allocated for
+	fragmented files in terms of extents. Any file has a fork. The fork is
+	massive of 9 extents. The file fork is stored in catalog btree. If file
+	is fragmented more than 9 pieces an extra extents is stored in extents
+	overflow btree;
+
+	[hard links btree] contains information about hard links inodes.
+	In case a of file a dentry and inode is stored in catalog btree. In
+	the case hard link a dentry is stored in catalog btree and inode is 
+	stored in hard link btree;
+
+	[extended attributes btree] contains extended attributes for file
+	system objects.
+
+
+  [small area] If a file size is less than small area chunk than file data is
+stored in small area
+
+  [tables area] is used by Copy-on-Write meta data updating algorithm to locate
+meta data in meta data area. Tables area contains translation tables. The vdfs4
+file driver walk through translation tables in tables area to locate meta data
+location.
+
+Meta data location resolution algorithm
+---------------------------------------
+
+vdfs4 file driver uses translation tables from tables area to store information
+about meta data location in meta area. Each vdfs4 meta data type has a fixed
+index in translation tables:
+
+index    meta data type
+1           catalog tree
+2           block bitmap
+3           extents overflow tree
+4           inode bitmap
+5           hard links tree
+6           extended attributes tree
+7           small area bitmap
+The translation tables is storied at volume in following on-disk layout
+structure:
+
+struct vdfs4_base_table {
+	/* descriptor: signature, mount count, sync count and checksumm
+	 * offset*/
+	 struct vdfs4_snapshot_descriptor descriptor;
+	/* last metadata iblock number */
+	__le64 last_page_index[VDFS4_SF_NR];
+	/* offset into translation tables for
+	/* special files */
+	__le32 translation_table_offsets[VDFS4_SF_NR];
+} __packed;
+
+  The vdfs4 file driver loads the tables from volume to memory during mount.
+  vdfs4 file driver performs performs the following steps to locate meta data:
+
+	-- get translation table using meta data type index and
+	translation_table_offsets; the translation_table_offsets[index] is
+	offset from beginning of a vdfs4_base_table to index - meta data type;
+
+	--get meta area logical block number for given meta data logical block
+	number; the vdfs4 meta data can be only two types: btree and bitmap.
+	The bitmaps is divided in 4K logical blocks. The trees is divided
+	into 16K logical blocks. The given meta data logical block is used as
+	index in found translation table;
+
+	--match found meta area logical block number with meta area physical
+	block number by walk through meta area extents.
+
+Meta data updating algorithm
+----------------------------
+
+  In order to improve performance the on-disk layout translation tables is
+divided into “base tables” and “extended tables”. The base table is full
+translation tables and contains information for all vdfs4 volume meta data.
+The extended table contains information about difference between previous
+meta data state and current meta data state. Each table has a
+version = ( mount count  << 32) | sync count. Maximum size of the extended
+table is fixed and limited to 4K.
+
+Updating translation tables
+---------------------------
+
+  if meta data is changed (new file is created, moved and etc):
+	--base table is updated: allocated a free block in meta area,
+	a translation table in base table is updated by meta area logical
+	block number;
+
+	--extended table is updated: added record about meta block new location.
+	If extended table size limit is exceeded (can not add a new record)
+	extended table is not used.
+
+Updating on-disk layout
+-----------------------
+  VDFS4 Filesystem always updating on-disk layout in data ordered mode. Before
+update on-disk medata the associated data blocks are written first.
+
+	-write user data for dirty meta data on disk
+	-write meta data on disk
+	-write base table or extended table. If extended tables count more
+	than 8 or size of extended table more than 4K than base table it
+	written on disk.
+
+Load a latest translation tables on mount
+-----------------------------------------
+
+  --load a base table: load a fist and a second base tables. The first base table
+is located from tables area start, the second base table is located in the 
+middle of the tables area. Versions of a first and a second base tables
+is compared. An older version of a base table is chosen as latest;
+  --loading and processing extended tables, update base table. Version of
+each extended table is compared with base table version. If the version of the
+extended table is older than base table version than base tables is updated by
+extended table.
+
+4. File-based decompression
+===========================
+VDFS4 does not support compression on-the-fly, only decompression. Transparently
+decompressed files are read-only. To create compressed file use:
+
+	$ tune.vdfs4 --compress <algorithm> <path_to_file> -o <resulting file>
+
+Algorithms lzo, zlib and gzip are supported now. You may choose any. File can be
+created anywhere.
+
+Compressed file is read from volume as is, until transparent decompression is
+not enabled. On enabling, filesystem drops cache for this file, and will
+decompress on-the-fly on next read access. To enable decompression run:
+
+	# tune.vdfs4 -t ON <path_to_file>
+
+Image creating
+--------------
+Files can be automatically put compressed into resulting vdfs4-image during image
+creation. User has to put file name of the file needed to be compressed in the
+config file which will be passed to mkfs.vdfs4. Config example:
+
+	/b.txt compress=<compress type>
+
+where compress type is gzip, zlib, or lzo.
+Then run:
+	# mkfs.vdfs4 -i vdfs4.img -z 1G -r vdfs4-root -q config.vdfs4 \
+					--compression ZLIB
+
+
+Compressed file format
+-----------------------
+
+The vdfs4 compressed file format consists of:
+
+     | 1.uncompressed  |2.compressed |3.chunks  |4.hash    |5.descriptor|
+     | chunks          |  chunks     | table    | table    |            |
+     |                 |             |          |(optional)|            |
+
+The file-based compression on-disk layout consists of:
+
+1. Uncompressed chunks
+  If a chunk compression rate is less then COMPRESS_RATIO constant then chunk
+  is placed in output file as it is. The COMPRESS_RATIO is defined in the
+  vdfs4-tools Makefile. Also, if a file size is less then 8K then it also will be
+  keep uncompressed
+2. Compressed chunks
+  The chunks size is variable, it can be set up via -b command line parameter
+  for tune.vdfs4 and mkfs.vdfs4 utilities
+
+3. Chunk describes where each chunk starts inside the file, and how long is it.
+  Each chunk is described by extent:
+
+	struct vdfs4_comp_extent {
+		__le64 start_byte;
+		__le32 len_bytes;
+		__le16 flags;
+		__le16 pad;
+	};
+
+   Currently field flags is responsible for only one flag - indicating that
+   current chunk is not compressed.
+
+4. Hash table (optional)
+  If authentication feature is enabled for a file then the file has hash
+  table. The hash table contains SHA1 hashes for each chunk and one encrypted
+  by RSA2048 file metadata SHA1 hash
+
+5. Descriptor
+The very last 32 bytes of file is occupied by descriptor:
+
+struct vdfs4_comp_file_descr {
+	char magic[4];
+	__le16 extents_num;
+	__le16 layout_version;
+	__le64 unpacked_size;
+	__le32 crc;
+	__le32 log_chunk_size;
+	__le64 pad2; /* Alignment to vdfs4_comp_extent size */
+};
+
+table_blocks_num - how many blocks are occupied by chunks table
+extents_num - how many extents are there in the table (each extent describes one
+		chunk in the file)
+unpacked_size - inode->isize of the unpacked file
+full_crc - checksum of the whole file
+log_chunk_size - a file chunk size
+crc - checksum of the chunk table.
+
+Enabling-disabling on-the-fly decompression
+--------------------------------------------
+To enable or disable feature for one file:
+	# tune.vdfs4 --decompression <ON|OFF> <path_to_file
+Utility tune.vdfs4 calls special ioctl, with parameter '1' for enabling or
+'0' to disable on-the-fly decompression. Inside ioctl driver checks if specified
+file is opened. For opened files driver returns -EBUSY.
+Then it writes all dirty pages belonging to this file and drops all file's
+pages in the pagecache. If every step is finished ok, mode of the file is
+changed to specified one.
+
+
+Read page
+---------
+Step 1. Driver needs to obtain extent, describing chunk containing
+requested page.
+
+Index of the chunk can be clearly calculated using formula:
+	chunk_n = uncomp_page_idx / (CHUNK_SIZE / PAGE_SIZE)
+
+Then VDFS4 has to read one page from chunks table, containing this particular
+extent. Page index of this page will be:
+	table_page_idx = chunk_n / COMPR_EXTENTS_PER_PAGE
+
+This page is read using block device pagecache or if file is encrypted,
+decryption function. So next access to this page will be cached. The details of
+working with encrypted pages are in chapter "5. File-based decryption."
+
+Step 2. Driver gets whole chunk and then allocates 32 pages
+from destination file mapping, and unpacks this chunk into those pages.
+This means that access to the neighborhood pages of the file will be cached.
+
+Write protection
+----------------
+If file-base-decompression is enabled for particular file, this file simply does
+not have callbacks, responsible for writing.
+
+Also truncate and open callbacks with any mode, assuming file changing,
+will return -ENOPERM.
+
+
+CRC check
+---------
+There are two kinds of crc protect inside each compressed file.
+
+1) Always enabled. Protects only chunks table.
+2) Enabled in debug mode. Protects whole file.
+
+Both checks are performed during initialization of the feature for the file.
+
+5. 64-bits support
+==================
+
+  Linux kernel on 32-bit and 64-bit systems uses different types and alignment
+in data structures. For in-memory data structures it's not a problem if code
+uses right specially defined types (pgoff_t, sector_t, size_t/ssize_t, loff_t).
+On-disk data structures must stay exactly the same independently on used target
+platform and used compiler. The main problem is alignment of 64-bit integers:
+on 32-bit they are aligned to 32-bit boundary, and 64-bit boundary for 64-bit
+systems. Compiler inserts padding bytes before field, plus whole structure is
+padded at the end to the biggest alignment of their fields (required for arrays)
+
+  Architecture-independent data structure must contains only types with fixed
+size (no 'long' and 'unsigned long'). Alignment padding might be disabled by
+__attribute__((packed)) (but unaligned memory access little bit slower on some
+architectures) It's better if all fields are pre-aligned by design and all
+required padding bytes are hard-coded.
+
+  In vdfs43 all data structures were redesigned with 64-bit alignment in the
+mind. All 'packed' attributes were removed. For catching possible problems
+there was added compile-time check which verifies size of all 'on-disk' data
+structures. (see function vdfs4_check_layout) It aborts compilation if size of
+any data structure is chandged unexpectedly.
+
+  Exactly the same problem with data types and their alignment exists in ioctl
+interface: 64-bit kernels usually has 'compat' layer for 32-bit applications,
+kernel must 'understand' ioctls with 32-bit and 64-bit data structure layout.
+
+6. WRITE_FLUSH_FUA support
+==========================
+
+  Many storage devices has volatile writeback caches, they report write request
+completion before data actually hits persistent non-volatile storage. Starting
+from version 2.6.37 Linux kernel provides FUA/FLUSH interface for controlling
+caching behaviour (see Documentation/block/writeback_cache_control.txt).
+
+  REQ_FLUSH flag pushes all previously cached data to the disk before starting
+I/O operation. REQ_FUA (Forced Unit Access) flag tells that request completion
+must be signaled only after committing data to the non-volatile storage.
+
+  VDFS4 submits requests which commit translation table and actually commit
+transaction with both of these flags. So all previously written data will be
+surely committed to the storage before publishing new state of translation
+tables, and all tables themselves will be written before returning from
+syscall sync/fsync.
+
+
+7. VDFS4 ro-images installation
+==============================
+
+ In order to remove the loop-back mount overhead the vdfs4 supports read-only
+vdfs4 image persistent installation. Installation means that a contents of the
+installed image is accessible via installation point. Installation point is a
+directory on vdfs4 file system, a name of the directory is specified as a
+parameter for tune.vdfs4 utility during installation.
+
+Installation sequence
+---------------------
+1. image creation (if you have an image you can skip this step)
+mkfs.vdfs4 -i image_name -r source_dir_name
+
+On this step we have a read-only stripped image with image_name and it
+contains all objects(files, directories, hardlinks and etc) from
+source_dir_name directory.
+
+2. The image must be placed on vdfs4 file system volume.
+
+3. image installaion
+tune.vdfs4 -i image_name installation_point
+
+On this step the vdfs4 file system driver creates installation_point directory,
+sets immutable flag on image file.
+
+Installation details
+--------------------
+The installation is divided into two parts: user space (tune.vdfs4 utility) and
+kernel space (the tune.vdfs4 performs ioctl call). The tune.vdfs4 checks input
+image file, fill full ioctl input parameters and calls ioctl
+VDFS4_RO_IMAGE_INSTALL. The vdfs4 file driver sets immutable flag on image file
+creates a special record in catalog bree: struct vdfs4_image_insert_point{}.
+The record contains: image file key (if the vdfs4 file driver has a
+installation point record it is able to get image file record from catalog
+tree), logical offsets to image trees (catalog tree, extents overflow tree,
+extended attribute tree) and offset to image small area.
+
+Reading user data from installed vdfs4 ro image
+----------------------------------------------
+In order to read data from installed image the VFS must create a file inode
+with vdfs4_lookup(). The vdfs4 file driver needs the catalog tree, catalog tree
+and extended attribute trees in memory in order to create and read data from
+image inode. The VFS pass a source directory as a parameter to
+vdfs4_lookup(). If the source directory has a type VDFS4_CATALOG_RO_IMAGE_ROOT
+and the trees does not present in memory the vdfs4 file drivers creates the
+trees from image file. If the the source directory inode has non-null pointer
+installed_btrees in struct vdfs4_inode_info it means that vdfs4_lookup create
+an inode from image and must use installed btrees.
+
+Uninstallation sequence
+-----------------------
+To perform uninstallation call tune.vdfs4 utility with -u flag and installation
+point directory:
+tune.vdfs4 -u installation_point
+The vdfs4 file driver on uninstallation unset immutable flag from source image
+and remove installation point directory. The uninstallation may fail if an
+installed image has opened file.
+
+
+8. NO_EXEC for installed VDFS4 ro-images
+=======================================
+
+  VDFS4 ro-image optionally might be installed as non-executable, this will
+prevent direct execution of any binaries or loading shared libraries from it.
+This option is enabled by parameter '--noexec' of tune.vdfs4 tool during
+installation of image. State is stored in installation point entry.
+
+tune.vdfs4 --noexec --install image_name installation_point
+
+For changing state image should be uninstalled and installed back.
+
+
+9. Datalinks objects in VDFS4 ro-images
+=======================================
+
+  In read-only mode VDFS4 supports datalink file objects to produce more
+compact read-only images. When VDFS4 ro-image is created, all files with size
+less than CHUNK (128K) are packed to datalink file one after another without
+zero spaces between them. Each file is described by structure
+vdfs4_catalog_dlink_record:
+
+	struct vdfs4_catalog_dlink_record {
+		struct vdfs4_catalog_folder_record common;
+		__le64 data_inode;
+		__le64 data_offset;
+		__le64 data_length;
+	}, where
+
+	data_inode - inode number of common datalink file, where current file is
+packed, data_offset and data_length are current file's data offset from
+beginning of the datalink file and length of current file's data accordingly.
+Datalink file is invisible for user file which parent_id is equal to object_id.
+
+Read-only image can have from 0 to 3 datalink files according to mkfs config
+
+files:
+	datalink_compress_file - compressed file which contains files with size
+less than CHUNK that must be compressed according to mkfs config file
+(COMPRESS=zlib file)
+
+	datalink_encrypt_file - encrypted file which contains files with size
+less than CHUNK that must be compressed according to mkfs config file
+(ENCRYPT file)
+
+	datalink_compress_encrypt_file - compressed and encrypted file which
+contains files with size less than CHUNK that must be compressed and encrypted
+according to mkfs config file (COMPRESS=zlib,ENCRYPT file)
+
+	datalink_file - file which contains files wih size less than CHUNK that
+were not noticed in mkfs config file

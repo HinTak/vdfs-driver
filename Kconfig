@@ -1,0 +1,217 @@
+config VDFS4_FS
+	tristate "Samsung VDFS4 file system support (EXPERIMENTAL)"
+	depends on BLOCK
+	select NLS
+	select CRC32
+	default n
+	help
+	  If you say Y here, you will be able to mount format
+	  VDFS4-formatted hard drive partitions with full read-write access.
+
+	  To compile this code as a module, choose M here: the module will be
+	  called vdfs4.
+
+	  If unsure, say N.
+
+config VDFS4_POSIX_ACL
+	bool "Support of Posix ACL"
+	depends on VDFS4_FS
+	select FS_POSIX_ACL
+	help
+	  POSIX Access Control Lists (ACLs) support permissions for users and
+	  groups beyond the owner/group/world scheme. See man 5 acl for details.
+
+config VDFS4_DEBUG
+	bool "Debug VDFS4"
+	depends on VDFS4_FS
+	help
+	  If you say Y here, you can use the 'debug' mount option to enable
+	  debugging output from the driver.
+
+	  If unsure, say N.
+
+config VDFS4_PANIC_ON_ERROR
+	bool "Force kernel panic after fatal errors"
+	depends on VDFS4_FS
+	default y
+	help
+	  If you say Y here first disk error or metadata corruption will cause
+	  kernel panic. This mode should be used in release builds.
+
+	  Otherwise filesystem will be automatically remounted into read-only
+	  mode for preventing further corruption, after that it hopefully can
+	  be unmounted without crashing whole kernel. All unwritten data will
+	  be lost. This mode is useful for testing.
+
+config VDFS4_NOOPTIMIZE
+	bool "Disable build optimization for VDFS4"
+	depends on VDFS4_FS
+	help
+	  If you say Y here, VDFS4 will be built with -O0 opt. Useful for
+	  gdb debug;
+
+	  If unsure, say N.
+
+config VDFS4_UMOUNT_STATISTIC
+	bool "Umount statistic"
+	depends on VDFS4_FS
+	help
+	  This feature allows to count amount of data writen to block
+	  device during umount operation. At the end of umount, it
+	  displays a message with appropriate value.
+
+	  If unsure, say N.
+
+config VDFS4_CRC_CHECK
+	bool "VDFS4 CRC check"
+	depends on VDFS4_FS
+	help
+		Enables CRC check for VDFS4 metadata
+
+		If unsure, say N.
+
+config VDFS4_META_SANITY_CHECK
+        bool "VDFS4 metadata sanity check"
+        depends on VDFS4_FS
+        help
+                This feature adds additional checks for VDFS4 metadata,
+		to find metadata corruption on early stage, and prevent
+		writing incorrect data to flash.
+
+                If unsure, say N.
+
+config VDFS4_DECRYPTION_SUPPORT
+	depends on VDFS4_FS
+	bool "Enable support for encrypted files." if VDFS4_SW_DECRYPTION || VDFS4_HW_DECRYPTION
+	help
+		When enabled driver supports decryption of tuned files.
+		Please don't enable this option manually.
+	default n
+
+config VDFS4_AES_DEBUG_KEY
+	depends on VDFS4_FS
+	bool "Use debug AES decryption key compiled into kernel" if VDFS4_SW_DECRYPTION || VDFS4_AES_DEBUG_KEY_FOR_HW
+	help
+		You can change decryption key in crypto_debug_key.c
+		Please don't enable this option manually.
+	default n
+
+config VDFS4_AES_DEBUG_KEY_FOR_HW
+	depends on VDFS4_FS
+	select VDFS4_AES_DEBUG_KEY
+	bool "Use debug AES key for hardware decryption" if VDFS4_HW_DECRYPTION
+	help
+		If selected then AES debug key will be used for decryption done by hardware.
+		Otherwise a hardware embedded key will be used.
+		You can change decryption key in crypto_debug_key.c
+	default n
+
+config VDFS4_SW_DECRYPTION
+	depends on VDFS4_FS
+	select VDFS4_DECRYPTION_SUPPORT
+	select VDFS4_AES_DEBUG_KEY
+	select CRYPTO_BLKCIPHER
+	select CRYPTO_AES
+	select CRYPTO_CTR
+	select CRYPTO_SEQIV
+	select CRYPTO_RNG
+	bool "CryptoAPI AES Decryption support in SW path for tuned files"
+	help
+		Option allows to use software routines for AES decryption via
+		Crypto-API.
+	default n
+
+config VDFS4_HW_DECOMPRESS_SUPPORT
+	bool "Use HW API to decompress user data from compressed files"
+	depends on HW_DECOMPRESSOR
+	depends on VDFS4_FS
+	depends on MMC
+
+	help
+	  Utilize hardware decompressor to decompress packed user data from
+	  compressed vdfs files.
+
+config VDFS4_USE_HW2_DECOMPRESS
+	bool "Use HW2 API to decompress user data from compressed files"
+	help
+	  Use embedded into block layer decompression, whenever is possible
+	depends on HW_DECOMP_BLK_MMC_SUBSYSTEM
+	depends on VDFS4_HW_DECOMPRESS_SUPPORT
+	depends on VDFS4_FS
+	depends on MMC
+
+	help
+	  Utilize hardware decompressor to decompress embedded into the MMC
+	  layer.
+
+config VDFS4_HW_DECRYPTION
+	depends on VDFS4_FS
+	select VDFS4_DECRYPTION_SUPPORT
+	bool "HW AES Decryption support in Hw2 path for tuned files" if VDFS4_USE_HW2_DECOMPRESS
+	help
+		When selected then hardware decryption will be available if
+		supported in platform.
+	default n
+
+config VDFS4_RETRY
+	bool "Enable/disable retry decompression and authentication"
+	depends on VDFS4_FS
+	help
+		In case of unsuccessfull decompresssion/authentication retry to
+		decompress/authenticate	data 3 times till successfull result;
+
+		If unsure, say N.
+
+config VDFS4_DATA_AUTHENTICATION
+	bool "User data and vdfs4 meta authentication"
+	depends on VDFS4_FS
+	select MPILIB
+	help
+		Protect the vdfs4 superblock, file-based meta data and compressed chunks
+		by digital signature. The VDFS4 uses SHA1+RSA2048 algorithms to
+		calculate the digital signatures;
+
+config VDFS4_EXEC_ONLY_AUTHENTICATED
+	bool "Execute and read only signed binaries and files"
+	depends on VDFS4_FS
+	depends on VDFS4_DATA_AUTHENTICATION
+	help
+		If the option is set only authenticated binary can be run. The vdfs4
+		checks for inode flag, if the flag is set it allows to do mmap with
+		VM_EXEC bit set and do not clear VM_MAYEXEC on vma
+
+config VDFS4_DEBUG_AUTHENTICAION
+	depends on VDFS4_DATA_AUTHENTICATION
+	bool "if enable - do not return an error if authenticaion is failed."
+	help
+		if enable - if authentication is enabled do not return an error
+		and print error message. Use public key of "debug, perf".
+		if disable - if return an error if authenticaion is failed. Use
+		public key of "product"
+	default n
+
+config VDFS4_ALLOW_LEGACY_SIGN
+	depends on VDFS4_DATA_AUTHENTICATION
+	bool "if enable - allow mounting of partitions with RSA1024 signature"
+	default y
+
+config VDFS4_PRINT_DIRTY_FILES
+       bool "Show path to dirty files at power-off"
+       depends on PRINT_DIRTY_PAGES
+       help
+         If you want to get a list of dirty files on power off, select this
+         item.
+
+config VDFS4_SQUEEZE
+	bool "vdfs-squeeze"
+	default n
+
+config VDFS4_SQUEEZE_PROFILING
+	bool "perform profiling"
+	default n
+
+config VDFS4_SQUEEZE_PROFILING_PARTITION
+	depends on VDFS4_SQUEEZE_PROFILING
+	string "profiled partition"
+	default "mmcblk0p18"
+
