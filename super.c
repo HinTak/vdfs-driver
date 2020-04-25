@@ -48,10 +48,15 @@
 #include "cattree.h"
 #include "exttree.h"
 #include "xattrtree.h"
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 #include <crypto/crypto_wrapper.h>
 #include "public_key.h"
 #endif
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/vdfs4.h>
+#include <linux/vdfs_trace.h>	/* FlashFS : vdfs-trace */
+#include "lock_trace.h"
 
 static inline void vdfs4_check_layout(void)
 {
@@ -63,12 +68,9 @@ static inline void vdfs4_check_layout(void)
 	BUILD_BUG_ON(sizeof(struct vdfs4_fork) != 29 * 8);
 	BUILD_BUG_ON(sizeof(struct vdfs4_catalog_file_record) != 39 * 8);
 
-	BUILD_BUG_ON(sizeof(struct vdfs4_translation_record) != 16);
 	BUILD_BUG_ON(sizeof(struct vdfs4_snapshot_descriptor) != 24);
 	BUILD_BUG_ON(sizeof(struct vdfs4_base_table) != 24 + VDFS4_SF_NR * 16);
 	BUILD_BUG_ON(sizeof(struct vdfs4_extended_table) != 24 + 8);
-	BUILD_BUG_ON(sizeof(struct vdfs4_debug_record) != 64);
-	BUILD_BUG_ON(sizeof(struct vdfs4_debug_descriptor) != 12);
 
 	BUILD_BUG_ON(sizeof(struct vdfs4_super_block) != 512);
 	BUILD_BUG_ON(sizeof(struct vdfs4_volume_begins) != 512);
@@ -79,7 +81,7 @@ static inline void vdfs4_check_layout(void)
 
 	BUILD_BUG_ON(sizeof(struct vdfs4_catalog_hlink_record) != 1 * 8);
 	BUILD_BUG_ON(sizeof(struct vdfs4_comp_extent) != 2 * 8);
-	BUILD_BUG_ON(sizeof(struct vdfs4_comp_file_descr) != 4 * 8);
+	BUILD_BUG_ON(sizeof(struct vdfs4_comp_file_descr) != 5 * 8);
 }
 
 static struct lock_class_key catalog_tree_lock_key;
@@ -87,6 +89,36 @@ static struct lock_class_key extents_tree_lock_key;
 static struct lock_class_key xattr_tree_lock_key;
 
 static struct kset *vdfs4_kset;
+
+static const char * const supported_layouts[] = {
+	/* current layout */
+	VDFS4_LAYOUT_VERSION_2007,
+	/* with RSA1024 hardcoded */
+	VDFS4_LAYOUT_VERSION_2006,
+};
+
+#define VDFS4_NUM_OF_SUPPORTED_LAYOUTS ARRAY_SIZE(supported_layouts)
+
+enum sign_type get_sign_type_from_sb(struct vdfs4_super_block *sb)
+{
+	enum sign_type type;
+
+#ifdef CONFIG_VDFS4_ALLOW_LEGACY_SIGN
+	if (!memcmp(sb->layout_version, VDFS4_LAYOUT_VERSION_2006,
+			strlen(VDFS4_LAYOUT_VERSION_2006)))
+		return VDFS4_SIGN_RSA1024;
+#endif
+
+	if (sb->sign_type < VDFS4_SIGN_MAX) {
+		type = sb->sign_type;
+#ifndef CONFIG_VDFS4_ALLOW_LEGACY_SIGN
+		if (type == VDFS4_SIGN_RSA1024)
+			return VDFS4_SIGN_NONE;
+#endif
+	} else
+		type = VDFS4_SIGN_NONE;
+	return type;
+}
 
 /**
  * @brief			B-tree destructor.
@@ -100,10 +132,10 @@ void vdfs4_put_btree(struct vdfs4_btree *btree, int iput_inode)
 	vdfs4_put_bnode(btree->head_bnode);
 
 	for (i = 0; i < VDFS4_BNODE_HASH_SIZE; i++)
-		VDFS4_BUG_ON(!hlist_empty(btree->hash_table + i));
+		VDFS4_BUG_ON(!hlist_empty(btree->hash_table + i), btree->sbi);
 
 	vdfs4_destroy_free_bnode_bitmap(btree->bitmap);
-	VDFS4_BUG_ON(!btree->head_bnode);
+	VDFS4_BUG_ON(!btree->head_bnode, btree->sbi);
 	if (iput_inode)
 		iput(btree->inode);
 	kfree(btree->split_buff);
@@ -148,6 +180,14 @@ void vdfs4_init_inode(struct vdfs4_inode_info *inode)
 
 	inode->flags = 0;
 	inode->fbc = NULL;
+#ifdef CONFIG_VDFS4_SQUEEZE
+	inode->sci = NULL;
+	INIT_LIST_HEAD(&inode->to_read_list);
+	spin_lock_init(&inode->to_read_lock);
+#endif
+#ifdef CONFIG_VDFS4_TRACE
+	inode->write_size = 0;
+#endif
 
 	INIT_LIST_HEAD(&inode->orphan_list);
 	inode->next_orphan_id = (u64)(-1);
@@ -160,6 +200,8 @@ void vdfs4_init_inode(struct vdfs4_inode_info *inode)
 static struct inode *vdfs4_alloc_inode(struct super_block *sb)
 {
 	struct vdfs4_inode_info *inode;
+
+	trace_vdfs4_alloc_inode(sb);
 
 	inode = kmem_cache_alloc(vdfs4_inode_cachep, GFP_NOFS);
 	if (!inode)
@@ -187,67 +229,49 @@ static void vdfs4_destroy_inode(struct inode *inode)
 {
 	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
 
+	trace_vdfs4_destroy_inode(inode);
+
 	kfree(inode_info->name);
 	kfree(inode_info->fbc);
+#ifdef CONFIG_VDFS4_SQUEEZE
+	kfree(inode_info->sci);
+#endif
 
 	call_rcu(&inode->i_rcu, vdfs4_i_callback);
 }
 
 /**
- * @brief		Sync starting superblock.
+ * @brief		Sync superblock.
  * @param [in]	sb	Superblock information
+ * @param [in]	no	0:first / 1:second super block
  * @return		Returns error code
  */
-int vdfs4_sync_first_super(struct vdfs4_sb_info *sbi)
-{
-	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
-	struct vdfs4_extended_super_block *exsb = &l_sb->exsb;
-	__u32 checksum;
-	int ret = 0;
 
-	lock_page(sbi->superblocks);
-
-	exsb->files_count = cpu_to_le64(sbi->files_count);
-	exsb->folders_count = cpu_to_le64(sbi->folders_count);
-	checksum = crc32(0, exsb, sizeof(*exsb) - sizeof(exsb->checksum));
-	exsb->checksum = cpu_to_le32(checksum);
-	set_page_writeback(sbi->superblocks);
-	ret = vdfs4_write_page(sbi, sbi->superblocks, VDFS4_EXSB_OFFSET,
-		VDFS4_EXSB_SIZE_SECTORS, 3 * SB_SIZE_IN_SECTOR * SECTOR_SIZE, 1);
-#ifdef CONFIG_VDFS4_STATISTIC
-	sbi->umount_written_bytes += (VDFS4_EXSB_SIZE_SECTORS
-			<< SECTOR_SIZE_SHIFT);
-#endif
-	unlock_page(sbi->superblocks);
-
-	return ret;
-}
-
-/**
- * @brief		Sync finalizing superblock.
- * @param [in]	sb	Superblock information
- * @return		Returns error code
- */
-int vdfs4_sync_second_super(struct vdfs4_sb_info *sbi)
+int vdfs4_sync_exsb(struct vdfs4_sb_info *sbi, int no)
 {
 	int ret = 0;
 	__u32 checksum;
 	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
 	struct vdfs4_extended_super_block *exsb = &l_sb->exsb;
+	struct vdfs4_snapshot_info *snapshot = sbi->snapshot_info;
+	int offset;
 
 	lock_page(sbi->superblocks);
-	set_page_writeback(sbi->superblocks);
-		/* Update cheksum */
 	exsb->files_count = cpu_to_le64(sbi->files_count);
 	exsb->folders_count = cpu_to_le64(sbi->folders_count);
+	exsb->sync_counter = cpu_to_le32(snapshot->sync_count);
+	/* Update cheksum */
 	checksum = crc32(0, exsb, sizeof(*exsb) - sizeof(exsb->checksum));
 	exsb->checksum = cpu_to_le32(checksum);
-	ret = vdfs4_write_page(sbi, sbi->superblocks, VDFS4_EXSB_COPY_OFFSET,
-		VDFS4_EXSB_SIZE_SECTORS, 3 * SB_SIZE_IN_SECTOR * SECTOR_SIZE, 1);
-#ifdef CONFIG_VDFS4_STATISTIC
-	sbi->umount_written_bytes += (VDFS4_EXSB_SIZE_SECTORS
-			<< SECTOR_SIZE_SHIFT);
-#endif
+	if (no == 0)
+		offset = VDFS4_1ST_EXSB_ADDR;
+	else
+		offset = VDFS4_2ND_EXSB_ADDR;
+
+	set_page_writeback(sbi->superblocks);
+	ret = vdfs4_write_page(sbi, offset, sbi->superblocks,
+			       SECTOR_TO_BYTE(VDFS4_EXSB_OFFSET),
+			       SECTOR_TO_BYTE(VDFS4_EXSB_SIZE), 1);
 	unlock_page(sbi->superblocks);
 
 	return ret;
@@ -265,6 +289,11 @@ int vdfs4_sync_fs(struct super_block *sb, int wait)
 	struct vdfs4_sb_info *sbi = sb->s_fs_info;
 	struct vdfs4_snapshot_info *si = sbi->snapshot_info;
 	int ret = 0;
+
+	VT_PREPARE_PARAM(vt_data);
+
+	VT_SBOPS_START(vt_data, vdfs_trace_sb_sync_fs, sb, NULL, 0, 0);
+	trace_vdfs4_sync_fs_enter(sb, wait);
 
 	if (wait) {
 		int *transaction_count = (int *)&current->journal_info;
@@ -287,12 +316,10 @@ int vdfs4_sync_fs(struct super_block *sb, int wait)
 				if ((S_ISREG(inode->i_mode) ||
 					S_ISLNK(inode->i_mode)) &&
 					(inode_i->vfs_inode.i_ino != 1)) {
-					mutex_w_lock(sbi->catalog_tree->
-							rw_tree_lock);
+					vdfs4_cattree_w_lock(sbi);
 			/* an error is handled in __vdfs4_write_inode */
 					__vdfs4_write_inode(sbi, inode);
-					mutex_w_unlock(sbi->catalog_tree->
-							rw_tree_lock);
+					vdfs4_cattree_w_unlock(sbi);
 				}
 		}
 
@@ -303,6 +330,9 @@ int vdfs4_sync_fs(struct super_block *sb, int wait)
 		(*transaction_count)--;
 		up_write(&si->transaction_lock);
 	}
+
+	trace_vdfs4_sync_fs_exit(sb, ret);
+	VT_FINISH(vt_data);
 
 	return ret;
 }
@@ -322,112 +352,54 @@ static void vdfs4_delayed_commit(struct work_struct *work)
 	}
 }
 
-#ifdef CONFIG_VDFS4_DEBUG
-static void vdfs4_save_debug_area(struct vdfs4_sb_info *sbi)
-{
-	struct page **debug_pages;
-	int count;
-	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
-	unsigned int debug_area_start =
-			(unsigned int)l_sb->exsb.debug_area.begin;
-	unsigned int debug_page_count =
-			(unsigned int)l_sb->exsb.debug_area.length;
-
-	void *debug_area = NULL;
-	int is_not_debug_area;
-	int ret;
-
-	debug_pages = kzalloc(sizeof(struct page *) * debug_page_count,
-			GFP_NOFS);
-
-	if (!debug_pages)
-		return;
-
-	for (count = 0; count < (int)debug_page_count; count++) {
-		debug_pages[count] = alloc_page(GFP_NOFS | __GFP_ZERO);
-		if (!debug_pages[count]) {
-			count--;
-			for (; count >= 0; count--) {
-				unlock_page(debug_pages[count]);
-				__free_page(debug_pages[count]);
-			}
-			kfree(debug_pages);
-			return;
-		}
-		lock_page(debug_pages[count]);
-	}
-
-	ret = vdfs4_read_pages(sbi->sb->s_bdev, debug_pages,
-			debug_area_start << (PAGE_CACHE_SHIFT -
-				SECTOR_SIZE_SHIFT), debug_page_count);
-
-	for (count = 0; count < (int)debug_page_count; count++) {
-		unlock_page(debug_pages[count]);
-		if (!PageUptodate(debug_pages[count]))
-			ret = -EIO;
-	}
-	if (ret)
-		goto exit_free_page;
-
-	debug_area = vdfs4_vmap(debug_pages, debug_page_count, VM_MAP, PAGE_KERNEL);
-	if (!debug_area)
-		goto exit_free_page;
-
-	is_not_debug_area = (strncmp(debug_area, VDFS4_OOPS_MAGIC,
-			sizeof(VDFS4_OOPS_MAGIC) - 1));
-
-	if (*(int *)debug_area && is_not_debug_area) {
-		const char name[] = "dump_debug_area.dump";
-		/* we have something in the debug area */
-		vdfs4_dump_chunk_to_disk(debug_area,
-			debug_page_count << PAGE_SHIFT, name, strlen(name));
-		memset(debug_area, 0x0, debug_page_count << PAGE_SHIFT);
-
-		for (count = 0; count < (int)debug_page_count; count++) {
-			sector_t sector_to_write;
-			sector_to_write = (sector_t)(debug_area_start <<
-					(PAGE_CACHE_SHIFT - SECTOR_SIZE_SHIFT));
-			sector_to_write += (sector_t)(count
-						<< (PAGE_CACHE_SHIFT
-							- SECTOR_SIZE_SHIFT));
-
-			lock_page(debug_pages[count]);
-			set_page_writeback(debug_pages[count]);
-			ret = vdfs4_write_page(sbi, debug_pages[count],
-				sector_to_write, 8, 0, 1);
-			unlock_page(debug_pages[count]);
-			if (ret)
-				goto exit_unmap_page;
-		}
-	}
-
-exit_unmap_page:
-	vunmap(debug_area);
-
-exit_free_page:
-	for (count = 0; count < (int)debug_page_count; count++)
-		__free_page(debug_pages[count]);
-
-	kfree(debug_pages);
-}
-#endif
-
-#ifdef CONFIG_VDFS4_DEBUG
-static void vdfs4_delayed_save_debug_area(struct work_struct *work)
+#ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
+static void vdfs4_delayed_prof_write(struct work_struct *work)
 {
 	struct vdfs4_sb_info *sbi = container_of(to_delayed_work(work),
 					struct vdfs4_sb_info,
-					delayed_check_debug_area);
+					prof_task);
 	struct super_block *sb = sbi->sb;
+
 	if (down_read_trylock(&sb->s_umount)) {
-		vdfs4_save_debug_area(sbi);
+		if (IS_ERR(sbi->prof_file)) {
+			const char path[] = "/prof.bin";
+
+			VDFS4_DEBUG_TMP("opening profiling file %s", path);
+
+			sbi->prof_file = filp_open((const char *)path, O_CREAT |
+					O_WRONLY | O_TRUNC, S_IRWXU);
+			if (IS_ERR(sbi->prof_file))
+				VDFS4_DEBUG_TMP("fail %p", sbi->prof_file);
+		}
+
+		if (!IS_ERR(sbi->prof_file)) {
+			loff_t pos;
+			ssize_t written;
+			struct vdfs4_prof_data prof_data;
+			u32 size;
+
+			do {
+				size = kfifo_out(&sbi->prof_fifo, &prof_data,
+							sizeof(prof_data));
+				if (size) {
+					mm_segment_t fs = get_fs();
+
+					set_fs(KERNEL_DS);
+					pos = sbi->prof_file->f_path.dentry->d_inode->i_size;
+					written = vfs_write(sbi->prof_file, (char *)&prof_data,
+								size, &pos);
+					if (written < 0)
+						VDFS4_ERR("cannot write to file err:%zd", written);
+					set_fs(fs);
+				}
+			} while (size);
+		}
 		up_read(&sb->s_umount);
-	} else if (sb->s_flags & MS_ACTIVE) {
-		/* Try again later */
-		mod_delayed_work(system_wq, &sbi->delayed_check_debug_area, HZ);
 	}
+	mod_delayed_work(system_wq, &sbi->prof_task, HZ);
 }
 #endif
+
 
 
 /**
@@ -449,6 +421,9 @@ static void destroy_super(struct vdfs4_sb_info *sbi)
 		kunmap(sbi->superblocks_copy);
 		__free_pages(sbi->superblocks_copy, 0);
 	}
+
+	if (sbi->raw_meta_hashtable)
+		vfree(sbi->raw_meta_hashtable);
 }
 
 /**
@@ -460,10 +435,9 @@ static void vdfs4_put_super(struct super_block *sb)
 {
 	struct vdfs4_sb_info *sbi = sb->s_fs_info;
 
-#ifdef CONFIG_VDFS4_DEBUG
-	cancel_delayed_work_sync(&sbi->delayed_check_debug_area);
-#endif
+	VT_PREPARE_PARAM(vt_data);
 
+	VT_SBOPS_START(vt_data, vdfs_trace_sb_put_super, sb, NULL, 0, 0);
 	cancel_delayed_work_sync(&sbi->delayed_commit);
 	sbi->umount_time = 1;
 	vdfs4_put_btree(sbi->catalog_tree, 1);
@@ -478,9 +452,13 @@ static void vdfs4_put_super(struct super_block *sb)
 
 	if (sbi->fsm_info)
 		vdfs4_fsm_destroy_management(sb);
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 	if (sbi->rsa_key)
 		destroy_rsa_key(sbi->rsa_key);
+#ifdef CONFIG_VDFS4_ALLOW_LEGACY_SIGN
+	if (sbi->rsa_key_legacy)
+		destroy_rsa_key(sbi->rsa_key_legacy);
+#endif
 #endif
 /*	if (VDFS4_DEBUG_PAGES(sbi))
 		vdfs4_free_debug_area(sb);*/
@@ -494,13 +472,9 @@ static void vdfs4_put_super(struct super_block *sb)
 
 	destroy_super(sbi);
 
-#ifdef CONFIG_VDFS4_STATISTIC
-	VDFS4_DEBUG_TMP("Bytes written during umount : %lld\n",
-			sbi->umount_written_bytes);
-#endif
-
 	kfree(sbi);
 	VDFS4_DEBUG_SB("finished");
+	VT_FINISH(vt_data);
 }
 
 /**
@@ -508,14 +482,8 @@ static void vdfs4_put_super(struct super_block *sb)
  * @param [in,out]	sb	Pointer to a superblock
  * @return		void
  */
-static void vdfs4_umount_begin(struct super_block *sb)
-{
-#ifdef CONFIG_VDFS4_STATISTIC
-	struct vdfs4_sb_info *sbi = sb->s_fs_info;
-	/* reset the page counter */
-	sbi->umount_written_bytes = 0;
-#endif
-}
+static void vdfs4_umount_begin(struct super_block *sb) {}
+
 /**
  * @brief			Force FS into a consistency state and
  *				lock it (for LVM).
@@ -528,6 +496,7 @@ static int vdfs4_freeze(struct super_block *sb)
 	/* d.voytik-TODO-29-12-2011-17-24-00: [vdfs4_freeze]
 	 * implement vdfs4_freeze() */
 	int ret = 0;
+
 	VDFS4_DEBUG_SB("finished (ret = %d)", ret);
 	return ret;
 }
@@ -563,14 +532,13 @@ static int vdfs4_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct super_block	*sb = dentry->d_sb;
 	struct vdfs4_sb_info	*sbi = sb->s_fs_info;
 	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
-#ifdef CONFIG_VDFS4_CHECK_FRAGMENTATION
-	int count;
-#endif
+	struct vdfs4_fsm_info	*fsm = sbi->fsm_info;
 
 	buf->f_type = (long) VDFS4_SB_SIGNATURE;
 	buf->f_bsize = (long int)sbi->block_size;
 	buf->f_blocks = sbi->volume_blocks_count;
-	buf->f_bavail = buf->f_bfree = sbi->free_blocks_count;
+	buf->f_bavail = buf->f_bfree =
+		sbi->free_blocks_count + ((fsm) ? fsm->next_free_blocks : 0);
 	buf->f_files = sbi->files_count + sbi->folders_count + 0xfefefe;
 	memcpy((void *)&buf->f_fsid.val[0], l_sb->exsb.volume_uuid,
 			sizeof(int));
@@ -595,6 +563,12 @@ static void vdfs4_evict_inode(struct inode *inode)
 	int error = 0;
 	sector_t freed_runtime_iblocks;
 
+	VT_PREPARE_PARAM(vt_data);
+
+	VT_SBOPS_START(vt_data, vdfs_trace_sb_evict_inode, inode->i_sb,
+			inode, 0, 0);
+	trace_vdfs4_evict_inode_enter(inode);
+
 	VDFS4_DEBUG_INO("evict inode %lu nlink\t%u",
 			inode->i_ino, inode->i_nlink);
 
@@ -607,12 +581,9 @@ static void vdfs4_evict_inode(struct inode *inode)
 
 	if (VDFS4_I(inode)->record_type == VDFS4_CATALOG_UNPACK_INODE) {
 		inode->i_state = I_FREEING | I_CLEAR;
+		trace_vdfs4_evict_inode_exit(inode, 1);
+		VT_FINISH(vt_data);
 		return;
-	}
-
-	if (is_dlink(inode)) {
-		iput(VDFS4_I(inode)->data_link.inode);
-		VDFS4_I(inode)->data_link.inode = NULL;
 	}
 
 	if ((S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode))) {
@@ -631,6 +602,8 @@ static void vdfs4_evict_inode(struct inode *inode)
 		vdfs4_fatal_error(sbi,
 			"cannot clear xattrs for ino#%lu: %d",
 			inode->i_ino, error);
+		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_EVICT,
+			inode->i_ino, 0, "fail xattrs ino", NULL, 0);
 		goto out_trans;
 	}
 
@@ -640,12 +613,14 @@ static void vdfs4_evict_inode(struct inode *inode)
 			vdfs4_fatal_error(sbi,
 					"cannot truncate ino#%lu blocks: %d",
 					inode->i_ino, error);
+			vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_EVICT,
+					inode->i_ino, 0, "fail truncate ino", NULL, 0);
 			goto out_trans;
 		}
 		inode->i_size = 0;
 	}
 
-	mutex_w_lock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_lock(sbi);
 
 	if (is_vdfs4_inode_flag_set(inode, HARD_LINK))
 		error = vdfs4_cattree_remove(sbi->catalog_tree, inode->i_ino,
@@ -660,6 +635,8 @@ static void vdfs4_evict_inode(struct inode *inode)
 	if (error) {
 		vdfs4_fatal_error(sbi, "cannot remove inode ino#%lu: %d",
 				inode->i_ino, error);
+		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_EVICT,
+				inode->i_ino, 0, "fail cattree ino", NULL, 0);
 		goto out_unlock;
 	}
 
@@ -667,7 +644,7 @@ static void vdfs4_evict_inode(struct inode *inode)
 	error = 0;
 
 out_unlock:
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 
 	if (!error) {
 		vdfs4_free_inode_n(sbi, inode->i_ino, 1);
@@ -683,9 +660,9 @@ out_trans:
 
 no_delete:
 	clear_inode(inode);
+	trace_vdfs4_evict_inode_exit(inode, 0);
+	VT_FINISH(vt_data);
 }
-
-int vdfs4_remount_fs(struct super_block *sb, int *flags, char *data);
 
 /*
  * Structure of the eMMCFS super block operations
@@ -716,22 +693,26 @@ static int vdfs4_verify_sb(struct vdfs4_super_block *esb, char *str_sb_type,
 				struct vdfs4_sb_info *sbi)
 {
 	__le32 checksum;
+	int i, supported = 0;
 	/* check magic number */
 	if (memcmp(esb->signature, VDFS4_SB_SIGNATURE,
 				strlen(VDFS4_SB_SIGNATURE))) {
 		if (!silent || vdfs4_debug_mask & VDFS4_DBG_SB)
-#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
-			VDFS4_DEBUG_TMP("%s: bad signature - %.8s, expected - %.8s",
+			VDFS4_WARNING("%s: bad signature - %.8s, expected - %.8s",
 				str_sb_type, esb->signature, VDFS4_SB_SIGNATURE);
-#else
-			VDFS4_ERR("%s: bad signature - %.8s, expected - %.8s",
-				str_sb_type, esb->signature, VDFS4_SB_SIGNATURE);
-#endif
 		return -EINVAL;
 	}
 
-	if (memcmp(esb->layout_version, VDFS4_LAYOUT_VERSION,
-		strlen(VDFS4_LAYOUT_VERSION))) {
+	for (i = 0; i < VDFS4_NUM_OF_SUPPORTED_LAYOUTS; i++) {
+		const char *layout_version = supported_layouts[i];
+
+		if (!memcmp(esb->layout_version, layout_version,
+				strlen(layout_version))) {
+			supported = 1;
+			break;
+		}
+	}
+	if (!supported) {
 		VDFS4_ERR("Invalid mkfs layout version: %.4s,\n"
 			"driver uses %.4s version\n", esb->layout_version,
 			VDFS4_LAYOUT_VERSION);
@@ -746,15 +727,43 @@ static int vdfs4_verify_sb(struct vdfs4_super_block *esb, char *str_sb_type,
 		return -EINVAL;
 	}
 
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 	/* check the superblock rsa signature */
-	if (check_signature && vdfs4_verify_superblock_rsa_signature(esb->hash_type,
-		(unsigned char *)esb, sizeof(*esb) - sizeof(esb->checksum)
-			- sizeof(esb->sb_hash), esb->sb_hash, sbi->rsa_key)) {
-		VDFS4_ERR("bad superblock hash!!!");
-#ifndef	CONFIG_VDFS4_DEBUG_AUTHENTICAION
-		return -EINVAL;
+	if (check_signature) {
+		enum sign_type type = get_sign_type_from_sb(esb);
+		int sign_length = get_sign_length(type);
+		rsakey_t *rsa_key = get_rsa_key_by_type(sbi, type);
+		__u8 *hash_ptr = esb->sb_hash;
+
+		if (sign_length <= 0) {
+			VDFS4_ERR("Cannot check signature. Bad superblock"
+				" or unknown signature type %d", type);
+#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+			return -EINVAL;
 #endif
+		}
+
+		if (!rsa_key) {
+			VDFS4_ERR("Cannot check signature."
+				" No matching public key found");
+#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+			return -EINVAL;
+#endif
+		}
+
+#ifdef CONFIG_VDFS4_ALLOW_LEGACY_SIGN
+		if (type == VDFS4_SIGN_RSA1024)
+			hash_ptr += (VDFS4_MAX_CRYPTED_HASH_LEN - sign_length);
+#endif
+
+		if (vdfs4_verify_superblock_rsa_signature(esb->hash_type, type,
+		(unsigned char *)esb, sizeof(*esb) - sizeof(esb->checksum)
+			- sign_length, hash_ptr, rsa_key)) {
+			VDFS4_ERR("bad superblock hash!!!");
+#ifndef	CONFIG_VDFS4_DEBUG_AUTHENTICAION
+			return -EINVAL;
+#endif
+		}
 	}
 #endif
 	return 0;
@@ -773,15 +782,7 @@ static int fill_runtime_superblock(struct vdfs4_super_block *esb,
 	struct vdfs4_sb_info *sbi = sb->s_fs_info;
 
 	/* check total block count in SB */
-	if ((esb->mkfs_git_branch[0] || esb->mkfs_git_branch[1] ||
-		esb->mkfs_git_branch[2]  || esb->mkfs_git_branch[3]) &&
-		(esb->mkfs_git_hash[0] || esb->mkfs_git_hash[1] ||
-		esb->mkfs_git_hash[2] || esb->mkfs_git_hash[3])) {
-		VDFS4_MOUNT_INFO("mkfs git branch is \"%s\"\n",
-				esb->mkfs_git_branch);
-		VDFS4_MOUNT_INFO("mkfs git revhash \"%.40s\"\n",
-				esb->mkfs_git_hash);
-	}
+	VDFS4_NOTICE("volume mkfs version \"%s\"\n", esb->mkfs_version);
 
 	/* check if block size is supported and set it */
 	blck_size = (unsigned long)(1 << esb->log_block_size);
@@ -825,10 +826,9 @@ static int fill_runtime_superblock(struct vdfs4_super_block *esb,
 	sbi->log_blocks_in_leb = (unsigned int)(
 			esb->log_super_page_size - esb->log_block_size);
 	sbi->btree_node_size_blks =
-		(unsigned long)(1 << sbi->log_blocks_in_leb);
+		(unsigned long)(1lu << sbi->log_blocks_in_leb);
 
 	if (esb->case_insensitive)
-
 		set_option(sbi, CASE_INSENSITIVE);
 
 err_exit:
@@ -873,32 +873,28 @@ static void add_reformat_record(struct vdfs4_sb_info *sbi, void *buffer)
 			sizeof(oldest_item->driver_version));
 	memset(oldest_item->mkfs_version, 0,
 			sizeof(oldest_item->driver_version));
-
-#if defined(VDFS4_GIT_BRANCH)
-	memcpy(oldest_item->driver_version, VDFS4_GIT_BRANCH + 6,
-			sizeof(oldest_item->driver_version));
-#endif
-	memcpy(oldest_item->mkfs_version, sb->superblock.mkfs_git_branch + 6,
+	memcpy(oldest_item->mkfs_version, sb->superblock.mkfs_version,
 			sizeof(oldest_item->mkfs_version));
-
 }
-
 
 void destroy_layout(struct vdfs4_sb_info *sbi)
 {
 	if (test_option(sbi, DESTROY_LAYOUT)) {
 		int ret = 0;
+
 		VDFS4_DEBUG_TMP("Destroying layout");
 		lock_page(sbi->superblocks);
 		add_reformat_record(sbi, sbi->raw_superblock);
 		set_page_writeback(sbi->superblocks);
-		ret = vdfs4_write_page(sbi, sbi->superblocks, 0, 2, 0, 1);
+		ret = vdfs4_write_page(sbi, VDFS4_1ST_BASE, sbi->superblocks,
+				       0, SECTOR_TO_BYTE(2), 1);
 		if (ret) {
 			VDFS4_ERR("Failed to read first page from disk");
 			goto err_exit;
 		}
 		set_page_writeback(sbi->superblocks);
-		ret = vdfs4_write_page(sbi, sbi->superblocks, 8, 2, 0, 1);
+		ret = vdfs4_write_page(sbi, VDFS4_2ND_BASE, sbi->superblocks,
+				       0, SECTOR_TO_BYTE(2), 1);
 		if (ret)
 			VDFS4_ERR("Failed to read first page from disk");
 err_exit:
@@ -945,16 +941,15 @@ void vdfs4_fatal_error(struct vdfs4_sb_info *sbi, const char *fmt, ...)
 	va_start(args, fmt);
 	vaf.fmt = fmt;
 	vaf.va = &args;
-	pr_emerg("VDFS4(%s): error in %pf, %pV\n", device,
+	VDFS4_ERR("VDFS4(%s): error in %pf, %pV\n", device,
 			__builtin_return_address(0), &vaf);
 	va_end(args);
-
 
 #ifdef CONFIG_VDFS4_PANIC_ON_ERROR
 	panic("VDFS4(%s): forced kernel panic after fatal error\n", device);
 #else
 	if (!(sbi->sb->s_flags & MS_RDONLY)) {
-		pr_emerg("VDFS4(%s): remount to read-only mode\n", device);
+		VDFS4_WARNING("VDFS4(%s): remount to read-only mode\n", device);
 		sbi->sb->s_flags |= MS_RDONLY;
 	}
 #endif
@@ -980,8 +975,8 @@ static int vdfs4_volume_check(struct super_block *sb)
 
 	lock_page(superblocks);
 	/* size of the VDFS4 superblock is fixed = 4K or 8 sectors */
-	ret = vdfs4_read_page(sb->s_bdev, superblocks, VDFS4_SB_ADDR,
-		PAGE_TO_SECTORS(1), 0);
+	ret = vdfs4_read_page(sb->s_bdev, superblocks,
+			      VDFS4_1ST_BASE, PAGE_TO_SECTORS(1), 0);
 	unlock_page(superblocks);
 
 	if (ret)
@@ -997,6 +992,7 @@ static int vdfs4_volume_check(struct super_block *sb)
 		goto error_exit;
 
 	sbi->superblocks = superblocks;
+
 	return 0;
 error_exit:
 	sbi->superblocks = NULL;
@@ -1005,7 +1001,6 @@ error_exit:
 	__free_page(superblocks);
 	return ret;
 }
-
 
 /**
  * @brief		Reads and checks and recovers eMMCFS super blocks.
@@ -1040,14 +1035,10 @@ static int vdfs4_sb_read(struct super_block *sb, int silent)
 		ret = -ENOMEM;
 		goto error_exit;
 	}
-	/* read super block and extended super block from volume */
-	/*  0    1    2    3      8    9   10   11     15   */
-	/*  | SB | SB | SB |ESB   | SB | SB | SB |ESB   |   */
-	/*  |    superblocks      |   superblocks_copy  |   */
 
 	lock_page(superblocks_copy);
-	ret = vdfs4_read_page(sb->s_bdev, superblocks_copy, VDFS4_SB_COPY_ADDR,
-			PAGE_TO_SECTORS(1), 0);
+	ret = vdfs4_read_page(sb->s_bdev, superblocks_copy,
+			      VDFS4_2ND_BASE, PAGE_TO_SECTORS(1), 0);
 	unlock_page(superblocks_copy);
 
 	if (ret)
@@ -1058,17 +1049,27 @@ static int vdfs4_sb_read(struct super_block *sb, int silent)
 		ret = -ENOMEM;
 		goto err_superblock_copy;
 	}
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 	if (is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN))
 		check_signature = 0;
 	else {
-		sbi->rsa_key = create_rsa_key(pubkey_n, pubkey_e,
-						VDFS4_CRYPTED_HASH_LEN, 3);
+		sbi->rsa_key = create_rsa_key(pubkey_n_2048, pubkey_e,
+						VDFS4_RSA2048_SIGN_LEN, 3);
 		if (!sbi->rsa_key) {
 			VDFS4_ERR("can't create rsa key");
 			ret = -EINVAL;
 			goto err_superblock_copy_unmap;
 		}
+#ifdef CONFIG_VDFS4_ALLOW_LEGACY_SIGN
+		sbi->rsa_key_legacy = create_rsa_key(pubkey_n_1024, pubkey_e,
+						VDFS4_RSA1024_SIGN_LEN, 3);
+		if (!sbi->rsa_key_legacy) {
+			VDFS4_ERR("can't create legacy rsa key");
+			ret = -EINVAL;
+			goto err_superblock_copy_unmap;
+		}
+
+#endif
 
 	}
 #endif
@@ -1092,8 +1093,9 @@ static int vdfs4_sb_read(struct super_block *sb, int silent)
 		/* write superblock COPY to disk */
 		lock_page(superblocks_copy);
 		set_page_writeback(superblocks_copy);
-		ret = vdfs4_write_page(sbi, superblocks_copy,
-				VDFS4_SB_COPY_OFFSET, 2, SB_SIZE * 2, 1);
+		ret = vdfs4_write_page(sbi, VDFS4_2ND_SB_ADDR, superblocks_copy,
+				       SECTOR_TO_BYTE(VDFS4_SB_OFFSET),
+				       SECTOR_TO_BYTE(VDFS4_SB_SIZE), 1);
 		unlock_page(superblocks_copy);
 	} else if (check_sb && (!check_sb_copy)) {
 		/*first superblock is corrupted, recovery*/
@@ -1101,8 +1103,9 @@ static int vdfs4_sb_read(struct super_block *sb, int silent)
 		/* write superblock to disk */
 		lock_page(superblocks);
 		set_page_writeback(superblocks);
-		ret = vdfs4_write_page(sbi, superblocks,
-				VDFS4_SB_OFFSET, 2, SB_SIZE * 2, 1);
+		ret = vdfs4_write_page(sbi, VDFS4_1ST_SB_ADDR, superblocks,
+				       SECTOR_TO_BYTE(VDFS4_SB_OFFSET),
+				       SECTOR_TO_BYTE(VDFS4_SB_SIZE), 1);
 		unlock_page(superblocks);
 	}
 
@@ -1117,13 +1120,13 @@ static int vdfs4_sb_read(struct super_block *sb, int silent)
 	sbi->superblocks_copy = superblocks_copy;
 
 	sbi->log_erase_block_size = esb->log_erase_block_size;
-	sbi->erase_block_size = 1lu << sbi->log_erase_block_size;
+	sbi->erase_block_size = 1 << sbi->log_erase_block_size;
 	sbi->erase_block_size_in_blocks = sbi->erase_block_size >>
 			sbi->block_size_shift;
 	sbi->log_erase_block_size_in_blocks = (u8)(sbi->log_erase_block_size -
 			sbi->block_size_shift);
 	sbi->orig_ro = esb->read_only;
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 	if (check_signature)
 		set_sbi_flag(sbi, VOLUME_AUTH);
 #endif
@@ -1148,24 +1151,41 @@ error_exit:
  * @param [in]	exsb	The eMMCFS super block
  * @return		Returns 0 on success, errno on failure
  */
-static int vdfs4_verify_exsb(struct vdfs4_extended_super_block *exsb)
+static int vdfs4_verify_exsb(struct vdfs4_sb_info *sbi,
+			struct vdfs4_extended_super_block *exsb)
 {
+	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
+	struct vdfs4_super_block *sb = &l_sb->sb;
 	__le32 checksum;
 
 	if (!VDFS4_EXSB_VERSION(exsb)) {
-		VDFS4_ERR("Bad version of extended super block");
+		VDFS4_NOTICE("Bad version of extended super block");
 		return -EINVAL;
 	}
 
 	/* check crc32 */
 	checksum = crc32(0, exsb, sizeof(*exsb) - sizeof(exsb->checksum));
 
-	if (exsb->checksum != checksum) {
-		VDFS4_ERR("bad checksum of extended super block - 0x%x, "\
-				"must be 0x%x\n", exsb->checksum, checksum);
-		return -EINVAL;
-	} else
-		return 0;
+	if (is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN)) {
+		if (checksum == exsb->checksum)
+			return 0;
+		else
+			goto fail;
+	}
+
+	if (checksum != sb->exsb_checksum) {
+#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
+		VDFS4_NOTICE("extended superblock crc is updated - (org_sb:0x%x,"
+			"org:%x,calc:%x)\n", sb->exsb_checksum, exsb->checksum, checksum);
+#else
+		goto fail;
+#endif
+	}
+	return 0;
+fail:
+	VDFS4_NOTICE("bad checksum of extended super block - (org_sb:0x%x,"
+		"org:%x,calc:%x)\n", sb->exsb_checksum, exsb->checksum, checksum);
+	return -EINVAL;
 }
 
 /**
@@ -1184,36 +1204,49 @@ static int vdfs4_extended_sb_read(struct super_block *sb)
 	int check_exsb;
 	int check_exsb_copy;
 
-	check_exsb = vdfs4_verify_exsb(exsb);
-	check_exsb_copy = vdfs4_verify_exsb(exsb_copy);
+	check_exsb = vdfs4_verify_exsb(sbi, exsb);
+	check_exsb_copy = vdfs4_verify_exsb(sbi, exsb_copy);
 
 	if (check_exsb && check_exsb_copy) {
-		VDFS4_ERR("Extended superblocks are corrupted");
-		ret = check_exsb;
-		return ret;
+		VDFS4_ERR("Extended superblocks are corrupted(%d,%d)", check_exsb, check_exsb_copy);
+		VDFS4_MDUMP("dump exsb :",
+			    (void *)exsb, sizeof(*exsb));
+		VDFS4_MDUMP("dump exsb_copy :",
+			    (void *)exsb_copy,sizeof(*exsb_copy));
+		ret = -EINVAL;
 	} else if ((!check_exsb) && check_exsb_copy) {
 		/* extended superblock copy are corrupted, recovery */
-		lock_page(sbi->superblocks);
+		lock_page(sbi->superblocks_copy);
 		memcpy(exsb_copy, exsb, sizeof(*exsb_copy));
-		set_page_writeback(sbi->superblocks);
-		ret = vdfs4_write_page(sbi, sbi->superblocks,
-			VDFS4_EXSB_COPY_OFFSET, VDFS4_EXSB_SIZE_SECTORS,
-			(SB_SIZE_IN_SECTOR * 3) * SECTOR_SIZE, 1);
-		unlock_page(sbi->superblocks);
+		set_page_writeback(sbi->superblocks_copy);
+		ret = vdfs4_write_page(sbi, VDFS4_2ND_EXSB_ADDR,
+				       sbi->superblocks_copy,
+				       SECTOR_TO_BYTE(VDFS4_EXSB_OFFSET),
+				       SECTOR_TO_BYTE(VDFS4_EXSB_SIZE), 1);
+		unlock_page(sbi->superblocks_copy);
 	} else if (check_exsb && (!check_exsb_copy)) {
 		/* main extended superblock are corrupted, recovery */
-		lock_page(sbi->superblocks_copy);
+		lock_page(sbi->superblocks);
 		memcpy(exsb, exsb_copy, sizeof(*exsb));
-		set_page_writeback(sbi->superblocks_copy);
-		ret = vdfs4_write_page(sbi, sbi->superblocks_copy,
-				VDFS4_EXSB_OFFSET, VDFS4_EXSB_SIZE_SECTORS,
-				(SB_SIZE_IN_SECTOR * 3) * SECTOR_SIZE, 1);
-		unlock_page(sbi->superblocks_copy);
+		set_page_writeback(sbi->superblocks);
+		ret = vdfs4_write_page(sbi, VDFS4_1ST_EXSB_ADDR,
+				       sbi->superblocks,
+				       SECTOR_TO_BYTE(VDFS4_EXSB_OFFSET),
+				       SECTOR_TO_BYTE(VDFS4_EXSB_SIZE), 1);
+		unlock_page(sbi->superblocks);
 	}
 
 	if (!ret) {
 		sbi->files_count = le64_to_cpu(exsb->files_count);
 		sbi->folders_count = le64_to_cpu(exsb->folders_count);
+
+		/* For write statistics */
+		if (sb->s_bdev->bd_part)
+			sbi->sectors_written_start =
+				(u64)part_stat_read(sb->s_bdev->bd_part, sectors[1]);
+
+		sbi->kbytes_written =
+			le64_to_cpu(exsb->kbytes_written);
 	}
 
 
@@ -1265,6 +1298,115 @@ static int vdfs4_check_resize_volume(struct super_block *sb)
 	return 0;
 }
 
+static int get_hashtable_size(struct vdfs4_sb_info *sbi,
+		      sector_t iblock, __u64 *size) {
+
+	struct page *page;
+	struct vdfs4_meta_hashtable *table = NULL;
+	int ret = 0;
+	sector_t start_sector;
+
+	ret = vdfs4_get_table_sector(sbi, iblock, &start_sector);
+	if (ret)
+		return ret;
+
+	page = alloc_page(GFP_NOFS | __GFP_ZERO);
+	if (!page)
+		return -ENOMEM;
+
+	ret = vdfs4_read_page(sbi->sb->s_bdev, page, start_sector, 8, 0);
+	if (ret)
+		goto exit;
+
+	table = kmap_atomic(page);
+	if (!table) {
+		ret = -ENOMEM;
+		goto exit;
+	}
+	/* size of the meta hash table */
+	*size = le64_to_cpu(table->size);
+	kunmap_atomic(table);
+
+exit:
+	__free_page(page);
+	return ret;
+}
+
+/**
+ * @brief			load meta hash table check
+ * @param [in]		sb	VFS superblock info stucture
+ * @return			Returns 0 on success, errno on failure
+ *
+ */
+static int load_meta_hashtable(struct super_block *sb)
+{
+	struct vdfs4_sb_info *sbi = sb->s_fs_info;
+	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
+	struct vdfs4_super_block *esb = &l_sb->sb;
+	struct vdfs4_extended_super_block *exsb = &l_sb->exsb;
+	struct vdfs4_meta_hashtable *hashtable;
+	__u64 table_tbc, table_start;
+	__u64 hashtable_size_in_bytes;
+	__u32 on_disk_checksum, checksum;
+	int is_not_hashtable, ret;
+
+	sbi->raw_meta_hashtable = NULL;
+	table_tbc = le64_to_cpu(exsb->tables.length);
+	table_start = (sector_t)table_tbc >> 1;
+
+	/* Meta hashtable for R/O partition is placed in second base table */
+	ret = get_hashtable_size(sbi, table_start,
+				 &hashtable_size_in_bytes);
+
+	hashtable = vdfs4_vmalloc((unsigned long int)(DIV_ROUND_UP(
+				   hashtable_size_in_bytes,
+				   (__u64)PAGE_SIZE) << PAGE_SHIFT));
+	if (!hashtable)
+		return -ENOMEM;
+
+	ret = vdfs4_table_IO(sbi, hashtable, hashtable_size_in_bytes,
+			     READ | REQ_META | REQ_PRIO, &table_start);
+
+	if (ret) {
+		VDFS4_WARNING("Failed to meta hash table IO.");
+		vfree(hashtable);
+		return ret;
+	}
+
+	/* from superblock */
+	on_disk_checksum = esb->meta_hashtable_checksum;
+
+	is_not_hashtable = strncmp(hashtable->signature,
+				    VDFS4_META_HASHTABLE,
+				    sizeof(VDFS4_META_HASHTABLE) - 1);
+	/* signature not match */
+	if (is_not_hashtable) {
+		VDFS4_WARNING("wrong meta hashtable signature(%#x)",
+			  *(u32 *)hashtable->signature);
+		goto fail;
+	}
+
+	if (le32_to_cpu(hashtable->size) > 4096 * PAGE_SIZE) {
+		VDFS4_WARNING("wrong hashtable size (%llx)", hashtable->size);
+		goto fail;
+	}
+
+	checksum = crc32(0, hashtable, le32_to_cpu(hashtable->size));
+
+	if (checksum != on_disk_checksum) {
+		VDFS4_WARNING("meta hashtable crc mismatch.(org:%#x,calc:%#x)",
+			  on_disk_checksum, checksum);
+		goto fail;
+	}
+
+	sbi->raw_meta_hashtable = hashtable;
+
+	return 0;
+fail:
+	vfree(hashtable);
+	return -EINVAL;
+}
+
 /**
  * @brief		The eMMCFS B-tree common constructor.
  * @param [in]	sbi	The eMMCFS superblock info
@@ -1284,7 +1426,7 @@ int vdfs4_fill_btree(struct vdfs4_sb_info *sbi,
 
 	btree->sbi = sbi;
 	btree->inode = inode;
-	btree->pages_per_node = 1lu << (sbi->log_blocks_in_leb +
+	btree->pages_per_node = 1 << (sbi->log_blocks_in_leb +
 			sbi->block_size_shift - PAGE_SHIFT);
 	btree->log_pages_per_node = sbi->log_blocks_in_leb +
 			sbi->block_size_shift - PAGE_SHIFT;
@@ -1363,7 +1505,8 @@ free_mem:
 
 static void tree_remount(struct vdfs4_btree *btree, int flags)
 {
-	if ((flags & MS_RDONLY) || btree->btree_type >= VDFS4_BTREE_INST_CATALOG)
+	if ((flags & MS_RDONLY) ||
+			btree->btree_type >= VDFS4_BTREE_INST_CATALOG)
 		btree->head_bnode->mode = VDFS4_BNODE_MODE_RO;
 	else
 		btree->head_bnode->mode = VDFS4_BNODE_MODE_RW;
@@ -1394,6 +1537,7 @@ static int vdfs4_fill_cat_tree(struct vdfs4_sb_info *sbi)
 	inode = vdfs4_special_iget(sbi->sb, VDFS4_CAT_TREE_INO);
 	if (IS_ERR(inode)) {
 		int ret = PTR_ERR(inode);
+
 		kfree(cat_tree);
 		return ret;
 	}
@@ -1443,6 +1587,7 @@ static int vdfs4_fill_ext_tree(struct vdfs4_sb_info *sbi)
 	inode = vdfs4_special_iget(sbi->sb, VDFS4_EXTENTS_TREE_INO);
 	if (IS_ERR(inode)) {
 		int ret;
+
 		kfree(ext_tree);
 		ret = PTR_ERR(inode);
 		return ret;
@@ -1491,6 +1636,7 @@ static int vdsf_fill_xattr_tree(struct vdfs4_sb_info *sbi)
 	inode = vdfs4_special_iget(sbi->sb, VDFS4_XATTR_TREE_INO);
 	if (IS_ERR(inode)) {
 		int ret;
+
 		kfree(xattr_tree);
 		ret = PTR_ERR(inode);
 		return ret;
@@ -1540,12 +1686,16 @@ int vdfs4_remount_fs(struct super_block *sb, int *flags, char *data)
 	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
 	struct vdfs4_extended_super_block *exsb = &l_sb->exsb;
 
+	VT_PREPARE_PARAM(vt_data);
+
 	if ((sb->s_flags & MS_RDONLY) == (*flags & MS_RDONLY))
 		return 0;
 
+	VT_SBOPS_START(vt_data, vdfs_trace_sb_remount_fs, sb, NULL, 0, 0);
 	if (!(*flags & MS_RDONLY)) {
 		if ((sb->s_flags & MS_RDONLY) && sbi->orig_ro) {
-			return -EROFS;
+			ret = -EROFS;
+			goto exit;
 		} else {
 
 			/*ret = vdfs4_load_debug_area(sb);
@@ -1575,9 +1725,10 @@ int vdfs4_remount_fs(struct super_block *sb, int *flags, char *data)
 	} else {
 		/* prohibit ro and dncs together*/
 		if (is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN)) {
-			VDFS4_MOUNT_INFO("cannot remount readonly cause of "\
+			VDFS4_WARNING("cannot remount readonly cause of "
 							"dncs flag set\n");
-			return -EINVAL;
+			ret = -EINVAL;
+			goto exit;
 		}
 process_orphan_inodes_error:
 		tree_remount(sbi->catalog_tree, MS_RDONLY);
@@ -1589,7 +1740,8 @@ build_free_inode_bitmap_error:
 		vdfs4_fsm_destroy_management(sb);
 	}
 vdfs4_fsm_create_error:
-
+exit:
+	VT_FINISH(vt_data);
 	return ret;
 }
 static struct inode *vdfs4_nfs_get_inode(struct super_block *sb,
@@ -1619,15 +1771,17 @@ static struct dentry *vdfs4_get_parent(struct dentry *child)
 	return d_obtain_alias(vdfs4_iget(sbi, (ino_t)ino));
 }
 
-static struct dentry *vdfs4_fh_to_dentry(struct super_block *sb, struct fid *fid,
-					int fh_len, int fh_type)
+static struct dentry *vdfs4_fh_to_dentry(struct super_block *sb,
+					 struct fid *fid, int fh_len,
+					 int fh_type)
 {
 	return generic_fh_to_dentry(sb, fid, fh_len, fh_type,
 				vdfs4_nfs_get_inode);
 }
 
-static struct dentry *vdfs4_fh_to_parent(struct super_block *sb, struct fid *fid,
-					int fh_len, int fh_type)
+static struct dentry *vdfs4_fh_to_parent(struct super_block *sb,
+					 struct fid *fid, int fh_len,
+					 int fh_type)
 {
 	return generic_fh_to_parent(sb, fid, fh_len, fh_type,
 				vdfs4_nfs_get_inode);
@@ -1654,19 +1808,45 @@ void vdfs4_dirty_super(struct vdfs4_sb_info *sbi)
 
 static ssize_t vdfs4_info(struct vdfs4_sb_info *sbi, char *buf)
 {
+	struct vdfs4_fsm_info *fsm = sbi->fsm_info;
 	ssize_t ret = 0;
-	u64 meta_size = calc_special_files_size(sbi) <<
-			(sbi->block_size_shift - 10);
-	u64 data_size = (sbi->volume_blocks_count - sbi->free_blocks_count -
-			calc_special_files_size(sbi))
-			<< (sbi->block_size_shift - 10);
+	u64 meta_blocks, data_blocks;
+
+	meta_blocks = calc_special_files_size(sbi);
+	data_blocks = sbi->volume_blocks_count
+		- sbi->free_blocks_count - calc_special_files_size(sbi)
+		- ((fsm) ? fsm->next_free_blocks : 0);
 
 	ret = snprintf(buf, PAGE_SIZE, "Meta: %lluKB\tData: %lluKB\n",
-			meta_size, data_size);
-
+			meta_blocks << (sbi->block_size_shift - 10),
+			data_blocks << (sbi->block_size_shift - 10));
 	return ret;
 }
 
+static ssize_t vdfs4_err_count(struct vdfs4_sb_info *sbi, char *buf)
+{
+	int rtn = 0;
+	uint32_t err_count = 0;
+
+	if (!sbi)
+		return snprintf(buf, PAGE_SIZE, "%d", -EINVAL);
+	rtn = vdfs4_debug_get_err_count(sbi, &err_count);
+	if (rtn)
+		return snprintf(buf, PAGE_SIZE, "%d", rtn);
+	return snprintf(buf, PAGE_SIZE, "%u", err_count);
+}
+
+static ssize_t vdfs4_lifetime_write_kbytes(struct vdfs4_sb_info *sbi, char *buf)
+{
+	struct super_block *sb = sbi->sb;
+
+	if (!sb->s_bdev->bd_part)
+		return snprintf(buf, PAGE_SIZE, "0\n");
+
+	return snprintf(buf, PAGE_SIZE, "%llu\n",
+			(unsigned long long)(sbi->kbytes_written +
+					     BD_PART_WRITTEN(sbi)));
+}
 
 static ssize_t vdfs4_attr_show(struct kobject *kobj,
 			      struct attribute *attr, char *buf)
@@ -1674,6 +1854,7 @@ static ssize_t vdfs4_attr_show(struct kobject *kobj,
 	struct vdfs4_sb_info *sbi = container_of(kobj, struct vdfs4_sb_info,
 			s_kobj);
 	struct vdfs4_attr *a = container_of(attr, struct vdfs4_attr, attr);
+
 	return a->show ? a->show(sbi, buf) : 0;
 }
 
@@ -1684,6 +1865,7 @@ static ssize_t vdfs4_attr_store(struct kobject *kobj,
 	struct vdfs4_sb_info *sbi = container_of(kobj, struct vdfs4_sb_info,
 						s_kobj);
 	struct vdfs4_attr *a = container_of(attr, struct vdfs4_attr, attr);
+
 	return a->store ? a->store(sbi, buf, len) : 0;
 }
 
@@ -1695,9 +1877,13 @@ static const struct sysfs_ops vdfs4_attr_ops = {
 static struct vdfs4_attr vdfs4_attr_##name = __ATTR(name, mode, show, store)
 
 VDFS4_ATTR(info, 0444, vdfs4_info, NULL);
+VDFS4_ATTR(lifetime_write_kbytes, 0444, vdfs4_lifetime_write_kbytes, NULL);
+VDFS4_ATTR(err_count, 0444, vdfs4_err_count, NULL);
 
 static struct attribute *vdfs4_attrs[] = {
 	&vdfs4_attr_info.attr,
+	&vdfs4_attr_lifetime_write_kbytes.attr,
+	&vdfs4_attr_err_count.attr,
 	NULL,
 };
 static void vdfs4_sb_release(struct kobject *kobj)
@@ -1731,21 +1917,11 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	char bdev_name[BDEVNAME_SIZE];
 	struct vdfs4_layout_sb *l_sb = NULL;
 	struct vdfs4_extended_super_block *exsb = NULL;
+	struct timespec ts;
+
 #ifdef CONFIG_VDFS4_PRINT_MOUNT_TIME
 	unsigned long mount_start = jiffies;
 #endif
-
-#if defined(VDFS4_GIT_BRANCH) && defined(VDFS4_GIT_REV_HASH) && \
-		defined(VDFS4_VERSION)
-	VDFS4_MOUNT_INFO("%.5s\n", VDFS4_VERSION);
-	VDFS4_MOUNT_INFO("version is \"%s\"\n", VDFS4_VERSION);
-	VDFS4_MOUNT_INFO("git branch is \"%s\"\n", VDFS4_GIT_BRANCH);
-	VDFS4_MOUNT_INFO("git revhash \"%.40s\"\n", VDFS4_GIT_REV_HASH);
-#endif
-#ifdef CONFIG_VDFS4_NOOPTIMIZE
-	VDFS4_MOUNT_INFO("Build optimization is switched off\n");
-#endif
-
 	if (!sb)
 		return -ENXIO;
 	if (!sb->s_bdev)
@@ -1753,27 +1929,30 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	if (!sb->s_bdev->bd_part)
 		return -ENXIO;
 
-	VDFS4_MOUNT_INFO("mounting %s\n", bdevname(sb->s_bdev, bdev_name));
+	VDFS4_NOTICE("mount \"%s\" (%s)\n",
+		VDFS4_VERSION, bdevname(sb->s_bdev, bdev_name));
+
 	sbi = kzalloc(sizeof(*sbi), GFP_NOFS);
 	if (!sbi)
 		return -ENOMEM;
 
 	sb->s_fs_info = sbi;
 	sbi->sb = sb;
-#ifdef CONFIG_VDFS4_USE_HW2_DECOMPRESS
+#ifdef CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT
 	/* Check support of hw decompression by block device */
 	if (sb->s_bdev->bd_disk) {
 		const struct block_device_operations *ops;
+
 		ops = sb->s_bdev->bd_disk->fops;
 		if (ops->hw_decompress_vec) {
 			sbi->use_hw_decompressor = 1;
-			VDFS4_MOUNT_INFO("hw decompression enabled\n");
+			VDFS4_INFO("hw decompression enabled\n");
 		}
 	}
 #endif
 	INIT_LIST_HEAD(&sbi->packtree_images.list);
 	mutex_init(&sbi->packtree_images.lock_pactree_list);
-#ifdef CONFIG_VDFS4_DEBUG
+#ifdef VDFS4_DEBUG_DUMP
 	mutex_init(&sbi->dump_meta);
 #endif
 	sb->s_maxbytes = VDFS4_MAX_FILE_SIZE_IN_BYTES;
@@ -1783,103 +1962,151 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 
 	ret = vdfs4_parse_options(sb, data);
 	if (ret) {
-		VDFS4_ERR("unable to parse mount options\n");
+		VDFS4_ERR("unable to parse mount options(%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		ret = -EINVAL;
 		goto vdfs4_parse_options_error;
 	}
 
 	ret = vdfs4_volume_check(sb);
-	if (ret)
+	if (ret) {
+		VDFS4_DEBUG_TMP("volume check error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		goto not_vdfs4_volume;
-
-	vdfs4_print_reformat_history(sbi);
+	}
 
 	ret = vdfs4_sb_read(sb, silent);
-	if (ret)
+	if (ret) {
+		VDFS4_ERR("sb read error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		goto vdfs4_sb_read_error;
+	}
 
 	ret = vdfs4_extended_sb_read(sb);
-	if (ret)
+	if (ret) {
+		VDFS4_ERR("extended sb read error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		goto vdfs4_extended_sb_read_error;
+	}
+
+	/* check reformat history after sb verification */
+	vdfs4_print_reformat_history(sbi);
+
+	/* check debug area after sb/exsb verification */
+	ret = vdfs4_debugarea_check(sbi);
+	if (ret) {
+		VDFS4_ERR("debug area check error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
+		goto vdfs4_extended_sb_read_error;
+	}
 
 	ret = vdfs4_check_resize_volume(sb);
-	if (ret)
+	if (ret) {
+		VDFS4_ERR("check resize volume error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		goto vdfs4_extended_sb_read_error;
+	}
 
-/*	if (!(VDFS4_IS_READONLY(sb))) {
-		ret = vdfs4_load_debug_area(sb);
-		if (ret)
-			goto vdfs4_extended_sb_read_error;
-	}*/
 	l_sb = sbi->raw_superblock;
 	exsb = &l_sb->exsb;
 
-#ifdef CONFIG_VDFS4_CRC_CHECK
+#ifdef CONFIG_VDFS4_META_SANITY_CHECK
 	if (exsb->crc == CRC_ENABLED)
 		set_sbi_flag(sbi, VDFS4_META_CRC);
 	else {
-		VDFS4_MOUNT_INFO("Driver supports only signed volumes\n");
+		VDFS4_WARNING("Driver supports only signed volumes\n");
 		ret  = -1;
 		goto vdfs4_extended_sb_read_error;
+	}
+
+	if (!is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN)) {
+		ret = load_meta_hashtable(sb);
+		if (ret) {
+#if !defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
+			VDFS4_ERR("meta hashtable read error (%s,ret:%d)\n",
+				  bdevname(sb->s_bdev, bdev_name), ret);
+			goto vdfs4_extended_sb_read_error;
+#endif
+		}
 	}
 #else
 	/* if the image is signed reset the signed flag */
 	if (exsb->crc == CRC_ENABLED)
 		exsb->crc = CRC_DISABLED;
 #endif
-	VDFS4_MOUNT_INFO("mounted %d times\n", exsb->mount_counter);
 
-	/*vdfs4_debug_print_sb(sbi)*/;
+	VDFS4_INFO("mounted %d times\n", exsb->mount_counter);
 
 	sb->s_op = &vdfs4_sops;
 	sb->s_export_op = &vdfs4_export_ops;
 
-	#ifdef CONFIG_VDFS4_POSIX_ACL
+#ifdef CONFIG_VDFS4_POSIX_ACL
 	sb->s_flags |= MS_POSIXACL;
 #endif
 	/* s_magic is 4 bytes on 32-bit; system */
-	memcpy(&sb->s_magic, VDFS4_SB_SIGNATURE, sizeof(VDFS4_SB_SIGNATURE) - 1);
+	memcpy(&sb->s_magic, VDFS4_SB_SIGNATURE,
+		sizeof(VDFS4_SB_SIGNATURE) - 1);
 
 	sbi->max_cattree_height = 5;
 	ret = vdfs4_build_snapshot_manager(sbi);
-	if (ret)
+	if (ret) {
+		VDFS4_ERR("snapshot build error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		goto vdfs4_build_snapshot_manager_error;
+	}
 
 	if (!(VDFS4_IS_READONLY(sb))) {
 		ret = vdfs4_fsm_build_management(sb);
-		if (ret)
+		if (ret) {
+			VDFS4_ERR("fsm build error (%s,ret:%d)\n",
+						bdevname(sb->s_bdev, bdev_name), ret);
 			goto vdfs4_fsm_create_error;
+		}
 	}
 
 	ret = vdfs4_fill_ext_tree(sbi);
-	if (ret)
+	if (ret) {
+		VDFS4_ERR("ext tree fill error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		goto vdfs4_fill_ext_tree_error;
+	}
 
 	ret = vdfs4_fill_cat_tree(sbi);
-	if (ret)
+	if (ret) {
+		VDFS4_ERR("cat tree fill error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		goto vdfs4_fill_cat_tree_error;
+	}
 
 	ret = vdsf_fill_xattr_tree(sbi);
-	if (ret)
+	if (ret) {
+		VDFS4_ERR("xattr tree fill error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		goto vdfs4_fill_xattr_tree_error;
+	}
 
 	if (!(VDFS4_IS_READONLY(sb))) {
 		ret = build_free_inode_bitmap(sbi);
-		if (ret)
+		if (ret) {
+			VDFS4_ERR("inode bitmap build error (%s,ret:%d)\n",
+						bdevname(sb->s_bdev, bdev_name), ret);
 			goto build_free_inode_bitmap_error;
+		}
 	}
 
 	/* allocate root directory */
 	root_inode = vdfs4_get_root_inode(sbi->catalog_tree);
 	if (IS_ERR(root_inode)) {
-		VDFS4_ERR("failed to load root directory\n");
+		VDFS4_ERR("failed to load root directory(%s)\n",
+					bdevname(sb->s_bdev, bdev_name));
 		ret = PTR_ERR(root_inode);
 		goto vdfs4_iget_err;
 	}
 
 	sb->s_root = d_make_root(root_inode);
 	if (!sb->s_root) {
-		VDFS4_ERR("unable to get root inode\n");
+		VDFS4_ERR("unable to get root inode(%s)\n",
+					bdevname(sb->s_bdev, bdev_name));
 		ret = -EINVAL;
 		goto d_alloc_root_err;
 	}
@@ -1894,12 +2121,6 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	else
 		VDFS4_DEBUG_TMP("Date resolution in nanoseconds is disabled\n");
 
-#ifdef CONFIG_VDFS4_CHECK_FRAGMENTATION
-	for (count = 0; count < VDFS4_EXTENTS_COUNT_IN_FORK; count++)
-		sbi->in_fork[count] = 0;
-	sbi->in_extents_overflow = 0;
-#endif
-
 	if (!(VDFS4_IS_READONLY(sb))) {
 		if (!(exsb->mount_counter))
 			generate_random_uuid(exsb->volume_uuid);
@@ -1913,6 +2134,8 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 
 		ret = vdfs4_process_orphan_inodes(sbi);
 		if (ret) {
+			VDFS4_ERR("process orphan inodes error (%s,ret:%d)\n",
+				  bdevname(sb->s_bdev, bdev_name), ret);
 			destroy_layout(sbi);
 			goto process_orphan_inodes_error;
 		}
@@ -1920,33 +2143,54 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 
 	/* print uuid if the volue already has it */
 	if (le32_to_cpu(exsb->mount_counter) != 1)
-		VDFS4_MOUNT_INFO("volume uuid: %pU\n",
+		VDFS4_INFO("volume uuid: %pU\n",
 				exsb->volume_uuid);
-
-
-#ifdef CONFIG_VDFS4_PRINT_MOUNT_TIME
-	{
-		unsigned long result = jiffies - mount_start;
-		VDFS4_DEBUG_TMP("Mount time %lu ms\n", result * 1000 / HZ);
-	}
-#endif
 
 	sbi->s_kobj.kset = vdfs4_kset;
 	init_completion(&sbi->s_kobj_unregister);
 	ret = kobject_init_and_add(&sbi->s_kobj, &vdfs4_ktype, NULL,
 				   "%s", sb->s_id);
-	if (ret)
+	if (ret) {
+		VDFS4_ERR("kobject init/add error (%s,ret:%d)\n",
+					bdevname(sb->s_bdev, bdev_name), ret);
 		goto process_orphan_inodes_error;
+	}
 
-
-#ifdef CONFIG_VDFS4_DEBUG
-	INIT_DELAYED_WORK(&sbi->delayed_check_debug_area,
-			  vdfs4_delayed_save_debug_area);
-	if (!(VDFS4_IS_READONLY(sb)))
-		mod_delayed_work(system_wq, &sbi->delayed_check_debug_area, HZ);
-#endif
 	set_sbi_flag(sbi, IS_MOUNT_FINISHED);
-	VDFS4_DEBUG_SB("finished ok");
+#ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
+	if (!(VDFS4_IS_READONLY(sb)) &&
+		(!strncmp(sbi->sb->s_id,
+				CONFIG_VDFS4_SQUEEZE_PROFILING_PARTITION,
+				strlen(CONFIG_VDFS4_SQUEEZE_PROFILING_PARTITION)))) {
+			spin_lock_init(&sbi->prof_lock);
+			if (kfifo_alloc(&sbi->prof_fifo, 128*1024, GFP_KERNEL)) {
+				ret = -ENOMEM;
+				goto process_orphan_inodes_error;
+			}
+
+		sbi->prof_file = ERR_PTR(-EINVAL);
+
+		/* same as 'echo 0 > /sys/class/block/mmcblk0/queue/read_ahead_kb'
+		but we need to do this before finishing mount */
+		sb->s_bdi->ra_pages = 0;
+
+		INIT_DELAYED_WORK(&sbi->prof_task,
+			  vdfs4_delayed_prof_write);
+		mod_delayed_work(system_wq, &sbi->prof_task, HZ);
+	}
+#endif
+#ifdef CONFIG_VDFS4_PRINT_MOUNT_TIME
+	{
+		unsigned long result = jiffies - mount_start;
+
+		VDFS4_DEBUG_TMP("Mount time %lu ms\n", result * 1000 / HZ);
+	}
+#endif
+
+	getnstimeofday(&ts);
+	sbi->mount_time = ts.tv_sec;
+	atomic_set(&sbi->running_errcnt, 0);
+	VDFS4_NOTICE("mounted %s\n",  bdevname(sb->s_bdev, bdev_name));
 	return 0;
 
 	kobject_del(&sbi->s_kobj);
@@ -1982,14 +2226,17 @@ vdfs4_fsm_create_error:
 vdfs4_build_snapshot_manager_error:
 /*	if (!(VDFS4_IS_READONLY(sb)))
 		vdfs4_free_debug_area(sb);*/
-
 vdfs4_extended_sb_read_error:
 vdfs4_sb_read_error:
 vdfs4_parse_options_error:
 not_vdfs4_volume:
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 	if (sbi->rsa_key)
 		destroy_rsa_key(sbi->rsa_key);
+#ifdef CONFIG_VDFS4_ALLOW_LEGACY_SIGN
+	if (sbi->rsa_key_legacy)
+		destroy_rsa_key(sbi->rsa_key_legacy);
+#endif
 #endif
 	destroy_super(sbi);
 
@@ -2013,7 +2260,13 @@ not_vdfs4_volume:
 static struct dentry *vdfs4_mount(struct file_system_type *fs_type, int flags,
 				const char *device_name, void *data)
 {
-	return mount_bdev(fs_type, flags, device_name, data, vdfs4_fill_super);
+	struct dentry *ret;
+
+	VT_PREPARE_PARAM(vt_data);
+	VT_FSTYPE_START(vt_data, vdfs_trace_fstype_mount, (char *)device_name);
+	ret = mount_bdev(fs_type, flags, device_name, data, vdfs4_fill_super);
+	VT_FINISH(vt_data);
+	return ret;
 }
 
 static void vdfs4_kill_block_super(struct super_block *sb)
@@ -2026,7 +2279,7 @@ static void vdfs4_kill_block_super(struct super_block *sb)
  */
 static struct file_system_type vdfs4_fs_type = {
 	.owner		= THIS_MODULE,
-	.name		= "vdfs4",
+	.name		= VDFS4_NAME,
 	.mount		= vdfs4_mount,
 	.kill_sb	= vdfs4_kill_block_super,
 	.fs_flags	= FS_REQUIRES_DEV,
@@ -2046,117 +2299,6 @@ static void vdfs4_init_inode_once(void *generic_inode)
 	INIT_LIST_HEAD(&inode->runtime_extents);
 }
 
-#ifdef CONFIG_VDFS4_USE_HW1_DECOMPRESS
-#define HW_BUF_COUNT 2
-#define HW_PAGES_SHIFT  5
-#define HW_PAGES_PER_CHUNK (1 << HW_PAGES_SHIFT)
-
-static struct page *hw_buf_pages1[HW_PAGES_PER_CHUNK];
-static struct page *hw_buf_pages2[HW_PAGES_PER_CHUNK];
-static unsigned long hw_buf_addr1;
-static unsigned long hw_buf_addr2;
-
-static spinlock_t hw_buffers_lock;
-
-static void init_hw_buffer(struct page **pages, struct inode *inode,
-		pgoff_t start_index, int pages_count)
-{
-	int count;
-	sector_t page_idx;
-	for (count = 0; count < pages_count; count++) {
-		lock_page(pages[count]);
-		ClearPageUptodate(pages[count]);
-
-		vdfs4_get_block_file_based(inode, start_index + (pgoff_t)count,
-						&page_idx);
-		pages[count]->index = (pgoff_t)page_idx;
-		pages[count]->mapping =
-			inode->i_sb->s_bdev->bd_inode->i_mapping;
-	}
-}
-
-struct page **vdfs4_get_hw_buffer(struct inode *inode, pgoff_t start_index,
-		void **buffer, int pages_count)
-{
-	struct page **pages = NULL;
-
-	spin_lock(&hw_buffers_lock);
-	if (hw_buf_pages1[0] != NULL && hw_buf_pages1[0]->mapping == 0) {
-		pages = hw_buf_pages1;
-		*buffer = (void *)hw_buf_addr1;
-		hw_buf_pages1[0]->mapping = (void *)1;
-		goto exit;
-	}
-
-	if (hw_buf_pages2[0] != NULL && hw_buf_pages2[0]->mapping == 0) {
-		pages = hw_buf_pages2;
-		*buffer = (void *)hw_buf_addr2;
-		hw_buf_pages2[0]->mapping = (void *)1;
-	}
-exit:
-
-	spin_unlock(&hw_buffers_lock);
-	if (pages)
-		init_hw_buffer(pages, inode, start_index, pages_count);
-	return pages;
-}
-
-void vdfs4_put_hw_buffer(struct page **pages)
-{
-	spin_lock(&hw_buffers_lock);
-	pages[0]->mapping = NULL;
-	spin_unlock(&hw_buffers_lock);
-}
-
-
-static int allocate_hw_input_buffers(void)
-{
-	unsigned long count;
-	spin_lock_init(&hw_buffers_lock);
-
-	hw_buf_addr1 = __get_free_pages(GFP_NOFS, HW_PAGES_SHIFT);
-	if (!hw_buf_addr1) {
-		VDFS4_ERR("Cannot allocate first input buffer for HW1");
-		hw_buf_pages1[0] = NULL;
-		hw_buf_pages2[0] = NULL;
-		return 0;
-	}
-
-	for (count = 0; count < HW_PAGES_PER_CHUNK; count++) {
-		hw_buf_pages1[count] = virt_to_page(hw_buf_addr1 +
-				PAGE_SIZE * count);
-		hw_buf_pages1[count]->mapping = NULL;
-	}
-
-	hw_buf_addr2 = __get_free_pages(GFP_NOFS, HW_PAGES_SHIFT);
-	if (!hw_buf_addr2) {
-		VDFS4_ERR("Cannot allocate second input buffer for HW1");
-		hw_buf_pages2[0] = NULL;
-		return 0;
-	}
-
-	for (count = 0; count < HW_PAGES_PER_CHUNK; count++) {
-		hw_buf_pages2[count] = virt_to_page(hw_buf_addr2 +
-				PAGE_SIZE * count);
-		hw_buf_pages2[count]->mapping = NULL;
-	}
-
-	return 0;
-}
-
-static void destroy_hw_input_buffers(void)
-{
-	free_pages((long unsigned)hw_buf_addr1, HW_PAGES_SHIFT);
-	free_pages((long unsigned)hw_buf_addr2, HW_PAGES_SHIFT);
-}
-#endif
-
-#ifdef CONFIG_VDFS4_PRINT_DIRTY_FILES
-#include <linux/syscore_ops.h>
-struct syscore_ops vdfs4_sys_ops = {
-	.shutdown = print_dirty_file,
-};
-#endif
 /**
  * @brief	Initialization of the eMMCFS module.
  * @return	Returns 0 on success, errno on failure
@@ -2166,10 +2308,6 @@ static int __init init_vdfs4_fs(void)
 	int ret;
 
 	vdfs4_check_layout();
-
-#ifdef CONFIG_VDFS4_PRINT_DIRTY_FILES
-	register_syscore_ops(&vdfs4_sys_ops);
-#endif
 
 	vdfs4_inode_cachep = kmem_cache_create("vdfs4_icache",
 				sizeof(struct vdfs4_inode_info), 0,
@@ -2202,12 +2340,6 @@ static int __init init_vdfs4_fs(void)
 	if (ret)
 		goto failed_register_fs;
 
-
-#ifdef CONFIG_VDFS4_USE_HW1_DECOMPRESS
-	ret = allocate_hw_input_buffers();
-	if (ret)
-		goto failed_register_fs;
-#endif
 	return 0;
 
 failed_register_fs:
@@ -2235,18 +2367,17 @@ static void __exit exit_vdfs4_fs(void)
 	vdfs4_exttree_cache_destroy();
 	vdfs4_destroy_btree_caches();
 	kset_unregister(vdfs4_kset);
-#ifdef CONFIG_VDFS4_USE_HW1_DECOMPRESS
-	destroy_hw_input_buffers();
-#endif
 }
 
 module_init(init_vdfs4_fs)
 module_exit(exit_vdfs4_fs)
 
 module_param(vdfs4_debug_mask, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(vdfs4_debug_mask, "Debug mask (1 - print debug for superblock ops,"\
+MODULE_PARM_DESC(vdfs4_debug_mask, "Debug mask "
+				"(1 - print debug for superblock ops,"
 				" 2 - print debug for inode ops)");
-MODULE_AUTHOR("Samsung R&D Russia - System Software Lab - VD Software Group");
+MODULE_AUTHOR("Samsung R&D Russia - System Software Lab"
+				"- VD Software Group");
 MODULE_VERSION(__stringify(VDFS4_VERSION));
 MODULE_DESCRIPTION("Vertically Deliberate improved performance File System");
 MODULE_LICENSE("GPL");

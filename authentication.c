@@ -24,12 +24,12 @@
 #include <linux/vmalloc.h>
 #include <crypto/crypto_wrapper.h>
 
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 static void print_path_to_object(struct vdfs4_sb_info *sbi, ino_t start_ino)
 {
 	struct inode *inode;
 	char *buffer, *new_buffer = NULL;
-	int buffer_len = 1;
+	size_t buffer_len = 1;
 	const char *device = sbi->sb->s_id;
 
 	buffer = kzalloc(1, GFP_NOFS);
@@ -70,27 +70,32 @@ static void print_path_to_object(struct vdfs4_sb_info *sbi, ino_t start_ino)
 		inode = vdfs4_iget(sbi, next_ino);
 	} while (!IS_ERR(inode));
 
-	VDFS4_ERR("VDFS4(%s) path : %s", device, buffer);
+	VDFS4_WARNING("VDFS4(%s) path : %s", device, buffer);
 
 	kfree(buffer);
 }
 
 int vdfs4_verify_rsa_signature(struct vdfs4_inode_info *inode_i,
-		void *buf, size_t buf_len, void *signature)
+		void *buf, size_t buf_len, void *signature, enum sign_type sign_type)
 {
+	struct vdfs4_sb_info *sbi = VDFS4_SB(inode_i->vfs_inode.i_sb);
 	int ret = 0;
-	rsakey_t *pkey = (VDFS4_SB(inode_i->vfs_inode.i_sb))->rsa_key;
-	void *hash = kzalloc(inode_i->fbc->hash_len, GFP_NOFS);
+	rsakey_t *pkey = get_rsa_key_by_type(sbi, sign_type);
+	void *hash;
+
+	if (!pkey)
+		return -EINVAL;
+
+	hash = kzalloc(inode_i->fbc->hash_len, GFP_NOFS);
 	if (!hash)
 		return -ENOMEM;
-
 
 	ret = inode_i->fbc->hash_fn(buf, buf_len, hash);
 	if (ret)
 		goto exit;
 
-	ret = rsa_check_signature(pkey, signature, VDFS4_CRYPTED_HASH_LEN,
-			hash, inode_i->fbc->hash_len, RSA_PADDING_PKCS1_TYPE1);
+	ret = rsa_check_signature(pkey, signature, get_sign_length(sign_type),
+			hash, (uint32_t)inode_i->fbc->hash_len, RSA_PADDING_PKCS1_TYPE1);
 
 exit:
 	kfree(hash);
@@ -98,30 +103,35 @@ exit:
 }
 
 int vdfs4_verify_superblock_rsa_signature(enum hash_type hash_type,
+		enum sign_type sign_type,
 		void *buf, size_t buf_len,
 		void *signature, rsakey_t *pkey)
 {
 	int ret = 0;
 	uint32_t hash_len = 0;
+	int sign_len = get_sign_length(sign_type);
 	void *hash = NULL;
+
+	if (sign_len <= 0)
+		return -EINVAL;
 
 	switch (hash_type) {
 
-	case (VDFS4_HASH_SHA1) :
+	case VDFS4_HASH_SHA1:
 		hash_len = VDFS4_SHA1_HASH_LEN;
 		hash = kzalloc(hash_len, GFP_NOFS);
 		if (!hash)
 			return -ENOMEM;
 		ret = calculate_sw_hash_sha1(buf, buf_len, hash);
 		break;
-	case (VDFS4_HASH_SHA256) :
+	case VDFS4_HASH_SHA256:
 		hash_len = VDFS4_SHA256_HASH_LEN;
 		hash = kzalloc(hash_len, GFP_NOFS);
 		if (!hash)
 			return -ENOMEM;
 		ret = calculate_sw_hash_sha256(buf, buf_len, hash);
 		break;
-	case (VDFS4_HASH_MD5) :
+	case VDFS4_HASH_MD5:
 		hash_len = VDFS4_MD5_HASH_LEN;
 		hash = kzalloc(hash_len, GFP_NOFS);
 		if (!hash)
@@ -135,7 +145,8 @@ int vdfs4_verify_superblock_rsa_signature(enum hash_type hash_type,
 
 	if (ret)
 		goto exit;
-	ret = rsa_check_signature(pkey, signature, VDFS4_CRYPTED_HASH_LEN,
+
+	ret = rsa_check_signature(pkey, signature, (uint32_t)sign_len,
 		hash, hash_len, RSA_PADDING_PKCS1_TYPE1);
 exit:
 	kfree(hash);
@@ -143,8 +154,9 @@ exit:
 
 }
 
-static int vdfs4_get_and_cmp_hash(struct vdfs4_inode_info *inode_i, size_t chunk_idx,
-		size_t comp_chunks_count, void *hash_calc, size_t hash_len)
+static int vdfs4_get_and_cmp_hash(struct vdfs4_inode_info *inode_i,
+		size_t chunk_idx, size_t comp_chunks_count, void *hash_calc,
+		size_t hash_len)
 {
 	void *data;
 	pgoff_t page_idx;
@@ -153,7 +165,8 @@ static int vdfs4_get_and_cmp_hash(struct vdfs4_inode_info *inode_i, size_t chunk
 	int ret = 0;
 	struct page *pages[2] = {0};
 	void *hash_orig = kzalloc(hash_len, GFP_NOFS);
-	if(!hash_orig)
+
+	if (!hash_orig)
 		return -ENOMEM;
 
 	hash_offset = inode_i->fbc->comp_table_start_offset +
@@ -172,7 +185,7 @@ static int vdfs4_get_and_cmp_hash(struct vdfs4_inode_info *inode_i, size_t chunk
 		data = vdfs4_vmap(pages, 2, VM_MAP, PAGE_KERNEL);
 		if (data) {
 			memcpy(hash_orig, (char *)data + pos,
-					inode_i->fbc->hash_len);
+			       inode_i->fbc->hash_len);
 			vunmap(data);
 		} else {
 			ret = -ENOMEM;
@@ -180,7 +193,7 @@ static int vdfs4_get_and_cmp_hash(struct vdfs4_inode_info *inode_i, size_t chunk
 		}
 	} else {
 		ret = vdfs4_read_comp_pages(&inode_i->vfs_inode, page_idx,
-			1, pages, VDFS4_FBASED_READ_M);
+					    1, pages, VDFS4_FBASED_READ_M);
 		if (ret)
 			goto err_read;
 		data = kmap_atomic(pages[0]);
@@ -188,23 +201,26 @@ static int vdfs4_get_and_cmp_hash(struct vdfs4_inode_info *inode_i, size_t chunk
 		kunmap_atomic(data);
 	}
 
-	if(memcmp(hash_orig, hash_calc, hash_len)) {
-		struct vdfs4_sb_info *sbi = inode_i->vfs_inode.i_sb->s_fs_info;
+	if (memcmp(hash_orig, hash_calc, hash_len)) {
+		struct vdfs4_sb_info *sbi = VDFS4_SB(inode_i->vfs_inode.i_sb);
+
+		if (inode_i->parent_id != 1)
+			print_path_to_object(sbi, inode_i->parent_id);
+
 		VDFS4_ERR("File based decompression - hash mismatch"
-				" for inode - %lu, file name - %s, chunk - %d",
+				" for inode - %lu, file name - %s, chunk - %zu",
 				inode_i->vfs_inode.i_ino, INODEI_NAME(inode_i), chunk_idx);
 		VDFS4_MDUMP("Original hash:",
 				hash_orig, hash_len);
 		VDFS4_MDUMP("Calculated hash:",
 				hash_calc, hash_len);
-		if (inode_i->parent_id != 1)
-			print_path_to_object(sbi, inode_i->parent_id);
+		vdfs4_print_volume_verification(sbi);
 		ret = -EINVAL;
 	}
 err:
 	for (page_idx = 0; page_idx < 2; page_idx++) {
-		if(pages[page_idx]) {
-			if(ret) {
+		if (pages[page_idx]) {
+			if (ret) {
 				lock_page(pages[page_idx]);
 				ClearPageChecked(pages[page_idx]);
 				unlock_page(pages[page_idx]);
@@ -231,8 +247,13 @@ int vdfs4_check_hash_chunk(struct vdfs4_inode_info *inode_i,
 	if (ret)
 		goto exit;
 
-	ret = vdfs4_get_and_cmp_hash(inode_i, extent_idx, inode_i->fbc->comp_extents_n,
+	ret = vdfs4_get_and_cmp_hash(inode_i, extent_idx,
+			inode_i->fbc->comp_extents_n,
 			hash_calc, inode_i->fbc->hash_len);
+#ifdef VDFS4_DEBUG_DUMP
+	if (ret == -EINVAL)
+		VDFS4_MDUMP("sw path decompression", buffer, length);
+#endif
 exit:
 	kfree(hash_calc);
 	return ret;
@@ -241,7 +262,8 @@ exit:
 int vdfs4_check_hash_chunk_no_calc(struct vdfs4_inode_info *inode_i,
 		size_t extent_idx, void *hash_calc)
 {
-	return vdfs4_get_and_cmp_hash(inode_i, extent_idx, inode_i->fbc->comp_extents_n,
+	return vdfs4_get_and_cmp_hash(inode_i, extent_idx,
+			inode_i->fbc->comp_extents_n,
 			hash_calc, inode_i->fbc->hash_len);
 }
 
@@ -249,25 +271,55 @@ int vdfs4_check_hash_meta(struct vdfs4_inode_info *inode_i,
 		struct vdfs4_comp_file_descr *descr)
 {
 	void *hash_calc = kzalloc(inode_i->fbc->hash_len, GFP_NOFS);
+	__le32 stored_crc = 0;
 	int ret;
+
 	if (!hash_calc)
 		return -ENOMEM;
 
-	ret = inode_i->fbc->hash_fn((unsigned char *)descr,
-			(size_t)((char *)&descr->crc -
-			(char *)&descr->magic), hash_calc);
+	switch (le16_to_cpu(descr->layout_version)) {
+	case VDFS4_COMPR_LAYOUT_VER_06:
+		/* hash in mkfs is calculated before crc, need to zero it */
+		stored_crc = descr->crc;
+
+		descr->crc = 0;
+		ret = inode_i->fbc->hash_fn((unsigned char *)descr,
+				(size_t)VDFS4_COMPR_FILE_DESC_LEN, hash_calc);
+		descr->crc = stored_crc;
+		break;
+	case VDFS4_COMPR_LAYOUT_VER_05:
+		/* for old layout, hash is from magic till crc */
+		ret = inode_i->fbc->hash_fn((void *)&descr->magic,
+				(size_t)((char *)&descr->crc -
+					(char *)&descr->magic), hash_calc);
+		break;
+	default:
+		VDFS4_ERR("Unsupported layout ver %d (ino %ld)",
+				le16_to_cpu(descr->layout_version),
+				inode_i->vfs_inode.i_ino);
+		ret = -EINVAL;
+		break;
+	}
 	if (ret)
 		goto exit;
 
-	ret = vdfs4_get_and_cmp_hash(inode_i, (int)le16_to_cpu(descr->extents_num),
+	ret = vdfs4_get_and_cmp_hash(inode_i,
+			(int)le16_to_cpu(descr->extents_num),
 			(int)le16_to_cpu(descr->extents_num),
 			hash_calc, inode_i->fbc->hash_len);
+
+#ifdef VDFS4_DEBUG_DUMP
+	if (ret == -EINVAL)
+		/* it cover COMPR_LAYOUT_VER_05 as well */
+		VDFS4_MDUMP("hash meta mismatch", descr, VDFS4_COMPR_FILE_DESC_LEN);
+#endif
 exit:
 	kfree(hash_calc);
 	return ret;
 }
 
-int vdfs4_verify_file_signature(struct vdfs4_inode_info *inode_i, void *data)
+int vdfs4_verify_file_signature(struct vdfs4_inode_info *inode_i,
+		enum sign_type sign_type, void *data)
 {
 	int ret = 0;
 	loff_t start_offset = inode_i->fbc->comp_table_start_offset;
@@ -280,7 +332,8 @@ int vdfs4_verify_file_signature(struct vdfs4_inode_info *inode_i, void *data)
 			(char *)data +
 			(start_offset & (PAGE_SIZE - 1)) + extents_num *
 			(sizeof(struct vdfs4_comp_extent)) +
-			(extents_num + 1) * inode_i->fbc->hash_len);
+			(extents_num + 1) * inode_i->fbc->hash_len,
+			sign_type);
 
 	if (ret) {
 		VDFS4_ERR("File based decompression RSA signature mismatch."
@@ -293,19 +346,12 @@ int vdfs4_verify_file_signature(struct vdfs4_inode_info *inode_i, void *data)
 
 
 #else
-
-int vdfs4_verify_file_signature(struct vdfs4_inode_info *inode_i, void *data)
-{
-	return 0;
-};
+int vdfs4_verify_file_signature(struct vdfs4_inode_info *inode_i,
+	enum sign_type sign_type, void *data) {	return 0; }
 int vdfs4_check_hash_meta(struct vdfs4_inode_info *inode_i,
-		struct vdfs4_comp_file_descr *descr)
-{
-	return 0;
-};
+	struct vdfs4_comp_file_descr *descr) { return 0; }
 int vdfs4_check_hash_chunk(struct vdfs4_inode_info *inode_i,
-		void *buffer, size_t length, size_t extent_idx) {return 0;};
-
+	void *buffer, size_t length, size_t extent_idx) { return 0; }
 int vdfs4_check_hash_chunk_no_calc(struct vdfs4_inode_info *inode_i,
-		size_t extent_idx, void *hash_calc) {return 0;};
+	size_t extent_idx, void *hash_calc) { return 0; }
 #endif

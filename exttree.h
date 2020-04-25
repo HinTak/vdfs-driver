@@ -37,8 +37,8 @@ struct vdfs4_exttree_record {
 };
 
 struct vdfs4_exttree_record *vdfs4_extent_find(struct vdfs4_sb_info *sbi,
-		__u64 object_id, sector_t iblock, enum vdfs4_get_bnode_mode
-		mode);
+		__u64 object_id, sector_t iblock,
+		enum vdfs4_get_bnode_mode mode);
 
 int vdfs4_exttree_get_next_record(struct vdfs4_exttree_record *record);
 

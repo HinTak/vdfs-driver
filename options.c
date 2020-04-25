@@ -79,7 +79,7 @@ int vdfs4_parse_options(struct super_block *sb, char *input)
 
 		case option_count:
 			if (match_int(&args[0], &option))
-				BUG();
+				VDFS4_BUG(NULL);
 
 			VDFS4_DEBUG_TMP("counter %d", option);
 			VDFS4_SB(sb)->bugon_count = (int)option;
@@ -113,7 +113,7 @@ int vdfs4_parse_options(struct super_block *sb, char *input)
 			break;
 		case option_do_not_check_sign:
 			if (sb->s_flags & MS_RDONLY) {
-				VDFS4_MOUNT_INFO("dncs cannot be used with ro\n");
+				VDFS4_WARNING("dncs cannot be used with ro\n");
 				return -EINVAL;
 			}
 

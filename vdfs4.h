@@ -35,19 +35,26 @@
 #include <linux/list.h>
 #include <linux/crypto.h>
 #include <linux/xattr.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/kfifo.h>
 
 #include "vdfs4_layout.h"
 #include "btree.h"
 #include "cattree.h"
 #include "debug.h"
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#include "lock_trace.h"
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 #include <crypto/internal/hash.h>
 #include <crypto/md5.h>
 #include <linux/mpi.h>
 #include <crypto/crypto_wrapper.h>
 #endif
 
+#define VDFS4_NAME "vdfs"
+
 #define UUL_MAX_LEN 20
+#define VDFS4_DEBUG_DUMP /* enable meta dump in memory */
 
 /*
  * Dump out the contents of some memory nicely...
@@ -71,6 +78,20 @@ struct vdfs4_packtree_meta_common {
 	__u32 inodes_cnt; /* number of inodes in the squashfs image */
 };
 
+struct vdfs4_ioc_file_info {
+	int open_count;
+	int compressed_status;
+	int compressed_type;
+	int authenticated_status;
+	int encryption_status;			/* remain it for compatilbilty */
+	int extents_num;
+	unsigned long long size;
+	unsigned long long compressed_size;	/* If compressed type */
+	int chunk_cnt;				/* If compressed type */
+	int compressed_chunk_cnt;		/* If compressed type */
+	int uncompressed_chunk_cnt;		/* If compressed type */
+};
+
 #define VDFS4_Z_NEED_DICT_ERR	-7
 #define HW_DECOMPRESSOR_PAGES_NUM	32
 #define SQUASHFS_COMPR_NR 6
@@ -84,7 +105,6 @@ enum compr_type {
 	VDFS4_COMPR_XZ,
 	VDFS4_COMPR_LZMA,
 	VDFS4_COMPR_GZIP,
-	VDFS4_COMPR_ZHW,
 	VDFS4_COMPR_NR,
 };
 
@@ -105,27 +125,25 @@ enum vdfs4_read_type {
 	VDFS4_READ_NR,
 };
 
-
-struct ioctl_data_link {
-	__u64 data_offset;
-	__u64 data_length;
-	int data_inode_fd;
-	char name[VDFS4_FILE_NAME_LEN + 1];
-};
-
 /* Enabels additional print at mount - how long mount is */
 /* #define CONFIG_VDFS4_PRINT_MOUNT_TIME */
 
-#define VDFS4_BUG() do { BUG(); } while (0)
+#define VDFS4_BUG(sbi) do { \
+	vdfs4_record_err_dump_disk((sbi), VDFS4_DEBUG_ERR_BUG, 0, 0, __func__, \
+					NULL, 0); \
+	BUG(); \
+} while (0)
 
-#define VDFS4_BUG_ON(cond) do { \
-	BUG_ON((cond)); \
+#define VDFS4_BUG_ON(cond, sbi) do { \
+	if ((cond)) { \
+		vdfs4_record_err_dump_disk((sbi), VDFS4_DEBUG_ERR_BUG_ON, \
+						0, 0, __func__, NULL, 0); \
+		BUG(); \
+	} \
 } while (0)
 
 #ifdef CONFIG_VDFS4_DEBUG
-#define VDFS4_DEBUG_BUG_ON(cond) do { \
-	BUG_ON((cond)); \
-} while (0)
+#define VDFS4_DEBUG_BUG_ON(cond) BUG_ON((cond))
 #else
 #define VDFS4_DEBUG_BUG_ON(cond) do { \
 	if (cond) \
@@ -137,9 +155,6 @@ struct ioctl_data_link {
 
 extern unsigned int file_prealloc;
 extern unsigned int cattree_prealloc;
-
-#define EMMMCFS_VOLUME_START	4
-
 
 #define VDFS4_LINK_MAX 32
 
@@ -155,7 +170,7 @@ extern unsigned int cattree_prealloc;
 #define IS_MOUNT_FINISHED	2
 #define VDFS4_META_CRC		3
 #define DO_NOT_CHECK_SIGN	4
-#define VOLUME_AUTH		5
+#define VOLUME_AUTH			5
 
 /** The VDFS4 inode flags */
 #define HAS_BLOCKS_IN_EXTTREE	1
@@ -163,10 +178,11 @@ extern unsigned int cattree_prealloc;
 #define HARD_LINK		10
 #define ORPHAN_INODE		12
 #define VDFS4_COMPRESSED_FILE	13
-#define SIGNED_DLINK		14
+/* UNUSED:						14 */
 #define VDFS4_AUTH_FILE		15
 #define VDFS4_READ_ONLY_AUTH	16
-
+/* UNUSED:						17 */
+#define VDFS4_PROFILED_FILE		18
 
 /* Macros for calculating catalog tree expand step size.
  * x - total blocks count on volume
@@ -177,7 +193,9 @@ extern unsigned int cattree_prealloc;
 /* Preallocation blocks amount */
 #define FSM_PREALLOC_DELTA	0
 
-#define VDFS4_META_REREAD	0
+/* Meta/Bnode re-read count
+ * Set -1 if you want to disable */
+#define VDFS4_META_REREAD	2
 #define VDFS4_META_REREAD_BNODE 2
 
 /**
@@ -206,8 +224,8 @@ static inline int cmp_2_le64(__le64 a, __le64 b)
 #define VDFS4_IOC_GET_DECODE_STATUS	_IOR('I', 1, int)
 #define VDFS4_IOC_GET_COMPR_TYPE		_IOR('J', 1, int)
 #define VDFS4_IOC_IS_AUTHENTICATED	_IOR('K', 1, int)
-
-#define VDFS4_IOC_DATA_LINK	_IOR('Q', 3, struct ioctl_data_link)
+#define VDFS4_IOC_GET_FILE_INFORMATION	\
+			_IOR('M', 1, struct vdfs4_ioc_file_info *)
 
 #define vdfs4_vmalloc(...) ({				\
 	unsigned noio_flags = memalloc_noio_save();	\
@@ -253,13 +271,15 @@ struct vdfs4_sb_info {
 	struct page *superblocks;
 	/** The page that contains superblocks copy */
 	struct page *superblocks_copy;
-	/** The eMMCFS mapped raw superblock data */
+	/** The VDFS mapped raw superblock data */
 	void *raw_superblock;
-	/** The eMMCFS mapped raw superblock copy data */
+	/** The VDFS mapped raw superblock copy data */
 	void *raw_superblock_copy;
-	/** The page that contains debug area */
+	/** The VDFS mapped meta hashtable for R/O */
+	void *raw_meta_hashtable;
+	/** The page that contains debug area (not used)*/
 	struct page **debug_pages;
-	/** Mapped debug area */
+	/** Mapped debug area (not used)*/
 	void *debug_area;
 	/** The eMMCFS flags */
 	unsigned long flags;
@@ -310,6 +330,9 @@ struct vdfs4_sb_info {
 	u8 log_erase_block_size;
 	u8 log_block_size;
 	char umount_time;
+	time_t mount_time;
+
+	atomic_t running_errcnt;
 
 	u32 *erase_blocks_counters;
 	u32 nr_erase_blocks_counters;
@@ -332,15 +355,9 @@ struct vdfs4_sb_info {
 	wait_queue_head_t meta_bio_wait;
 	atomic_t meta_bio_count;
 
-	/* check the debug area in background */
-	struct delayed_work delayed_check_debug_area;
-
 	/** log flash superpage size */
 	unsigned int log_super_page_size;
-#ifdef CONFIG_VDFS4_STATISTIC
-	/** Number of written pages */
-	__le64	umount_written_bytes;
-#endif
+
 	int bugon_count;
 	/* opened packtree list */
 	struct packtrees_list packtree_images;
@@ -361,15 +378,44 @@ struct vdfs4_sb_info {
 	/* under catalog_tree->rw_tree_lock */
 	struct list_head orphan_inodes;
 
-#ifdef CONFIG_VDFS4_DEBUG
+#ifdef VDFS4_DEBUG_DUMP
 	struct mutex dump_meta;
 #endif
-	__u64 dump_meta_file_offset;
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 	rsakey_t *rsa_key;
+	rsakey_t *rsa_key_legacy;
 #endif
+	enum sign_type sign_type;
 
+#ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
+	struct file *prof_file;
+	struct kfifo prof_fifo;
+	spinlock_t prof_lock;
+	struct delayed_work prof_task;
+#endif
+	/* For write statistics */
+	u64 sectors_written_start;
+	u64 kbytes_written;
+#ifdef CONFIG_VDFS4_LOCK_TRACE
+	struct vdfs4_lock_info lock_info[VDFS4_LOCK_MAX];
+#endif
 };
+
+/* For write statistics. Suppose sector size is 512 bytes,
+ * and the return value is in kbytes. s is of struct vdfs_sb_info.
+ */
+#define BD_PART_WRITTEN(s)					\
+(((u64)part_stat_read(s->sb->s_bdev->bd_part, sectors[1]) -	\
+	s->sectors_written_start) >> 1)
+
+#ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
+struct vdfs4_prof_data {
+	struct vdfs4_timespec stamp;
+	__u32 ino;
+	__u32 block;
+	__u32 count;
+};
+#endif
 
 /** @brief	Current extent information.
  */
@@ -423,11 +469,6 @@ struct vdfs4_fork_info {
  */
 # define VDFS4_FSM_MAX_FREE_NODES	20480
 
-/*
- * Upper limit of tracked next-free area extents
- */
-# define VDFS4_FSM_MAX_NEXT_NODES	10240
-
 /** @brief	Maintains free space management info.
  */
 struct vdfs4_fsm_info {
@@ -480,6 +521,15 @@ struct vdfs4_comp_extent_info {
 	int len_bytes;
 	int blocks_n;
 	__u16 flags;
+#ifdef CONFIG_VDFS4_SQUEEZE
+	__u16 profiled_prio;
+#endif
+};
+
+enum {
+	FORCE_NONE = 0,
+	FORCE_SW,
+	FORCE_HW,
 };
 
 /** @brief	Maintains file-based decompression info
@@ -493,10 +543,14 @@ struct vdfs4_file_based_info {
 	size_t log_chunk_size;
 	/* compressed extents count */
 	__u32 comp_extents_n;
+	/* force readpage path (SW/HW) for this file */
+	int force_path;
 	/* compression type */
 	enum compr_type compr_type;
 	/* hash type */
 	enum hash_type hash_type;
+	/* signature type */
+	enum sign_type sign_type;
 	/* hash length */
 	size_t hash_len;
 	/* decompression function */
@@ -510,6 +564,14 @@ struct vdfs4_file_based_info {
 	int informed_about_fail_read;
 };
 
+#ifdef CONFIG_VDFS4_SQUEEZE
+struct vdfs4_squeeze_chunk_info {
+	__u16 order;
+	struct list_head list;
+};
+#endif
+
+
 /** @brief	Maintains private inode info.
  */
 struct vdfs4_inode_info {
@@ -517,15 +579,8 @@ struct vdfs4_inode_info {
 	struct inode	vfs_inode;
 	/* record type */
 	__u8 record_type;
-
 	/** The inode fork information */
-	union {
-		struct vdfs4_fork_info fork;
-		struct {
-			struct inode *inode;
-			__u64 offset;
-		} data_link;
-	};
+	struct vdfs4_fork_info fork;
 	/* file-based decompression info */
 	struct vdfs4_file_based_info *fbc;
 	/* runtime fork */
@@ -539,7 +594,7 @@ struct vdfs4_inode_info {
 	/** Parent ID */
 	__u64 parent_id;
 	/** Inode flags */
-	long unsigned int flags;
+	unsigned long int flags;
 
 	/* for vdfs4_sb_info->orphan_inodes */
 	struct list_head orphan_list;
@@ -549,6 +604,15 @@ struct vdfs4_inode_info {
 	atomic_t open_count;
 #ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
 	int informed_about_fail_read;
+#endif
+#ifdef CONFIG_VDFS4_SQUEEZE
+	struct list_head to_read_list;
+	spinlock_t to_read_lock;
+	struct vdfs4_squeeze_chunk_info *sci;
+#endif
+#ifdef CONFIG_VDFS4_TRACE
+	/* size of data that doesn't be written to disk */
+	unsigned int write_size;
 #endif
 };
 
@@ -608,6 +672,20 @@ struct vdfs4_attr {
 	ssize_t (*store)(struct vdfs4_sb_info *, const char *, size_t);
 };
 
+static inline int is_vdfs4(struct super_block *sb)
+{
+	if (!sb->s_type)
+		return 0;
+
+	if (!sb->s_type->name)
+		return 0;
+
+	if (memcmp(sb->s_type->name, VDFS4_NAME, sizeof(VDFS4_NAME)))
+		return 0;
+	else
+		return 1;
+}
+
 /**
  * @brief		Get eMMCFS inode info structure from
  *			encapsulated inode.
@@ -633,7 +711,7 @@ static inline struct vdfs4_sb_info *VDFS4_SB(struct super_block *sb)
 static inline int vdfs4_produce_err(struct vdfs4_sb_info *sbi)
 {
 	if (sbi->bugon_count <= 0) {
-		BUG_ON(sbi->bugon_count < 0);
+		VDFS4_BUG_ON(sbi->bugon_count < 0, sbi);
 		sbi->bugon_count--;
 		return -ERANGE;
 	}
@@ -646,7 +724,7 @@ static inline int vdfs4_produce_err(struct vdfs4_sb_info *sbi)
  * @brief	save function name and error code to oops area (first 1K of
  * a volume).
  */
-int vdfs4_log_error(struct vdfs4_sb_info *sbi, unsigned int ,
+int vdfs4_log_error(struct vdfs4_sb_info *sbi, unsigned int,
 		const char *name, int err);
 
 /**
@@ -670,20 +748,29 @@ static inline int is_fork_valid(const struct vdfs4_fork *fork,
 		struct vdfs4_sb_info *sbi)
 {
 	int ext;
+
 	if (!fork)
 		goto ERR;
 
-	if (fork->total_blocks_count > sbi->volume_blocks_count)
+	if (fork->total_blocks_count > sbi->volume_blocks_count) {
+		VDFS4_ERR("total blks is invalid(%llu)\n",
+			  fork->total_blocks_count);
 		goto ERR;
+	}
 	for (ext = 0; ext < VDFS4_EXTENTS_COUNT_IN_FORK; ext++) {
 		if ((fork->extents[ext].extent.begin +
 				fork->extents[ext].extent.length) >
-				sbi->volume_blocks_count)
+				sbi->volume_blocks_count) {
+			VDFS4_ERR("begin&length is invalid(%llu, %llu)\n",
+				  fork->extents[ext].extent.begin,
+				  fork->extents[ext].extent.length);
 			goto ERR;
+		}
 	}
 	return 1;
 ERR:
-	VDFS4_ERR("fork is invalid\n");
+	VDFS4_ERR("%s(%llu) fork is invalid\n",
+		  sbi->sb->s_id, sbi->volume_blocks_count);
 	return 0;
 }
 
@@ -747,6 +834,7 @@ static inline struct inode *INODE(struct kiocb *iocb)
 static inline int is_vdfs4_inode_flag_set(struct inode *inode, int flag)
 {
 	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
+
 	return test_bit(flag, &inode_info->flags);
 }
 
@@ -804,18 +892,70 @@ static inline struct timespec vdfs4_current_time(struct inode *inode)
 		current_fs_time(inode->i_sb) : CURRENT_TIME_SEC;
 }
 
+static inline int get_sign_length(enum sign_type type)
+{
+	switch (type) {
+	case VDFS4_SIGN_RSA1024:
+		return 128;
+	case VDFS4_SIGN_RSA2048:
+		return 256;
+	case VDFS4_SIGN_NONE:
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+#ifdef CONFIG_VDFS4_AUTHENTICATION
+static inline rsakey_t *get_rsa_key_by_type(struct vdfs4_sb_info *sbi,
+								enum sign_type type)
+{
+	switch (type) {
+#ifdef	CONFIG_VDFS4_ALLOW_LEGACY_SIGN
+	case VDFS4_SIGN_RSA1024:
+		return sbi->rsa_key_legacy;
+#endif
+	case VDFS4_SIGN_RSA2048:
+		return sbi->rsa_key;
+	default:
+		return NULL;
+	}
+}
+#endif
+
+static inline void *correct_addr_and_bit_unaligned(int *bit, void *addr)
+{
+#if BITS_PER_LONG == 64
+	*bit += ((unsigned long) addr & 7UL) << 3;
+	addr = (void *) ((unsigned long) addr & ~7UL);
+#elif BITS_PER_LONG == 32
+	*bit += ((unsigned long) addr & 3UL) << 3;
+	addr = (void *) ((unsigned long) addr & ~3UL);
+#else
+#error "how many bits you are?!"
+#endif
+	return addr;
+}
+
+static inline int vdfs4_test_and_set_bit(int bit, void *addr)
+{
+	addr = correct_addr_and_bit_unaligned(&bit, addr);
+	return test_and_set_bit(bit, addr);
+}
+
+static inline int vdfs4_test_and_clear_bit(int bit, void *addr)
+{
+	addr = correct_addr_and_bit_unaligned(&bit, addr);
+	return test_and_clear_bit(bit, addr);
+}
+
 /* super.c */
 
 int vdfs4_sync_fs(struct super_block *sb, int wait);
-int vdfs4_sync_first_super(struct vdfs4_sb_info *sbi);
-int vdfs4_sync_second_super(struct vdfs4_sb_info *sbi);
+int vdfs4_sync_exsb(struct vdfs4_sb_info *sbi, int no);
 void vdfs4_dirty_super(struct vdfs4_sb_info *sbi);
 void vdfs4_init_inode(struct vdfs4_inode_info *inode);
-
-
-struct page **vdfs4_get_hw_buffer(struct inode *inode, pgoff_t start_index,
-		void **buffer, int pages_count);
-void vdfs4_put_hw_buffer(struct page **pages);
+int vdfs4_remount_fs(struct super_block *sb, int *flags, char *data);
 
 /** todo move to btree.c ?
  * @brief	The eMMCFS B-tree common constructor.
@@ -829,9 +969,7 @@ int vdfs4_fill_btree(struct vdfs4_sb_info *sbi,
 void vdfs4_remove_sb_from_wbt(struct super_block *sb);
 
 /* inode.c */
-int vdfs4_is_tree_alive(struct inode *inode);
-struct inode *vdfs4_get_image_inode(struct vdfs4_sb_info *sbi,
-		__u64 parent_id, __u8 *name, size_t name_len);
+int __vdfs4_write_inode(struct vdfs4_sb_info *sbi, struct inode *inode);
 int vdfs4_prepare_compressed_file_inode(struct vdfs4_inode_info *inode_i);
 int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug);
 int vdfs4_disable_file_decompression(struct vdfs4_inode_info *inode_i);
@@ -855,11 +993,6 @@ int vdfs4_get_block_da(struct inode *inode, sector_t iblock,
 	struct buffer_head *bh_result, int create);
 int vdfs4_get_int_block(struct inode *inode, sector_t iblock,
 	struct buffer_head *bh_result, int create, int fsm_flags);
-/**
- * @brief	TODO Check it!!! Find old block in snapshots.
- */
-sector_t vdfs4_find_old_block(struct vdfs4_inode_info *inode_info,
-				sector_t iblock,  __u32 *max_blocks);
 
 /**
  * @brief	Get free inode index[es].
@@ -886,9 +1019,6 @@ void vdfs4_get_vfs_inode_flags(struct inode *inode);
  */
 void vdfs4_set_vfs_inode_flags(struct inode *inode);
 
-int vdfs4_data_link_create(struct dentry *parent, const char *name,
-		struct inode *data_inode, __u64 data_offset, __u64 data_length);
-
 /**
  * @brief		Method to look up an entry in a directory.
  */
@@ -905,13 +1035,9 @@ struct inode *vdfs4_special_iget(struct super_block *sb, unsigned long ino);
 struct inode *vdfs4_get_root_inode(struct vdfs4_btree *tree);
 int vdfs4_get_iblock_extent(struct inode *inode, sector_t iblock,
 		struct vdfs4_extent_info *result, sector_t *hint_block);
-ssize_t vdfs4_gen_file_aio_write(struct kiocb *iocb,
-		const struct iovec *iov, unsigned long nr_segs, loff_t pos);
 void vdfs4_free_reserved_space(struct inode *inode, sector_t iblocks_count);
 /* options.c */
 
-int get_chunk_extent(struct vdfs4_inode_info *inode_i, pgoff_t chunk_idx,
-		struct vdfs4_comp_extent_info *cext);
 /**
  * @brief	Parse eMMCFS options.
  */
@@ -931,16 +1057,12 @@ void *__vdfs4_get_next_btree_record(struct vdfs4_bnode **__bnode, int *index);
  */
 int vdfs4_verify_btree(struct vdfs4_btree *btree);
 
+#ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
+void vdfs4_save_profiling_log(struct vdfs4_sb_info *sbi,
+		ino_t ino, sector_t iblock, u32 blk_cnt);
+#endif
+
 /* bnode.c */
-
-/**
- * @brief	Get from cache or create page and buffers for it.
- */
-struct page *vdfs4_alloc_new_page(struct address_space *, pgoff_t);
-
-struct page *vdfs4_alloc_new_signed_page(struct address_space *mapping,
-					     pgoff_t page_index);
-long vdfs4_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 /**
  * @brief	Build free bnode bitmap runtime structure
  */
@@ -948,7 +1070,7 @@ struct vdfs4_bnode_bitmap *vdfs4_build_free_bnode_bitmap(void *data,
 		__u32 start_bnode_id, __u64 size_in_bytes,
 		struct vdfs4_bnode *host_bnode);
 
-#if defined(CONFIG_VDFS4_META_SANITY_CHECK)
+#ifdef CONFIG_VDFS4_META_SANITY_CHECK
 void vdfs4_bnode_sanity_check(struct vdfs4_bnode *bnode);
 void vdfs4_meta_sanity_check_bnode(void *bnode_data, struct vdfs4_btree *btree,
 		pgoff_t index);
@@ -1004,7 +1126,7 @@ void vdfs4_put_exttree_key(struct vdfs4_exttree_key *key);
 int vdfs4_runtime_extent_add(sector_t iblock, sector_t alloc_hint,
 		struct list_head *list);
 int vdfs4_runtime_extent_del(sector_t iblock,
-		struct list_head *list) ;
+		struct list_head *list);
 u32 vdfs4_runtime_extent_count(struct list_head *list);
 sector_t vdfs4_truncate_runtime_blocks(sector_t new_size_iblocks,
 		struct list_head *list);
@@ -1015,18 +1137,6 @@ u32 vdfs4_runtime_extent_exists(sector_t iblock, struct list_head *list);
 int vdfs4_exttree_add(struct vdfs4_sb_info *sbi, unsigned long object_id,
 		struct vdfs4_extent_info *extent, int force_insert);
 
-
-/**
- * @brief	Expand file in extents overflow area.
- */
-sector_t vdfs4_exttree_add_block(struct vdfs4_inode_info *inode_info,
-				  sector_t iblock, int cnt);
-/**
- * @brief	Logical to physical block numbers translation for blocks
- *		which placed in extents overflow.
- */
-sector_t vdfs4_exttree_get_block(struct vdfs4_inode_info *inode_info,
-				  sector_t iblock, __u32 *max_blocks);
 /**
  * @brief	Extents tree key compare function.
  */
@@ -1037,7 +1147,7 @@ int vdfs4_exttree_cmpfn(struct vdfs4_generic_key *__key1,
 
 #define VDFS4_FSM_ALLOC_DELAYED		0x01	/* for dalayed-allocation */
 #define VDFS4_FSM_ALLOC_ALIGNED		0x02	/* align to superpage */
-#define VDFS4_FSM_ALLOC_METADATA		0x04	/* transaction table locked */
+#define VDFS4_FSM_ALLOC_METADATA	0x04	/* transaction table locked */
 #define VDFS4_FSM_FREE_UNUSED		0x10	/* never linked to inode */
 #define VDFS4_FSM_FREE_RESERVE		0x20	/* put back to reserve */
 
@@ -1056,7 +1166,7 @@ void vdfs4_fsm_destroy_management(struct super_block *);
  *		space manager bitmap.
  */
 __u64 vdfs4_fsm_get_free_block(struct vdfs4_sb_info *sbi, __u64 block_offset,
-		__u32 *length_in_blocks, int fsm_flags);
+		__u32 *length_in_blocks, unsigned int min_blk_count, int fsm_flags);
 /**
  * @brief	Function is the fsm_free_block_chunk wrapper. Pust free space
  *		chunk to tree and updates free space manager bitmap.
@@ -1071,15 +1181,6 @@ int vdfs4_fsm_put_free_block(struct vdfs4_inode_info *inode_info,
 void vdfs4_fsm_discard_preallocation(struct vdfs4_inode_info *inode_info);
 
 void vdfs4_commit_free_space(struct vdfs4_sb_info *sbi);
-
-/**
- * @brief	Function is the fsm_free_block_chunk wrapper.
- *		It is called during evict inode or process orphan inodes
- *		processes (inode already doesn't exist, but exttree inode blocks
- *		still where).
- */
-int vdfs4_fsm_free_exttree_extent(struct vdfs4_sb_info *sbi,
-	__u64 offset, __u32 length);
 
 /**
  * @brief	Initialize the eMMCFS FSM B-tree cache.
@@ -1101,14 +1202,6 @@ void vdfs4_fsm_cache_destroy(void);
  *		size in blocks, internal fork is also truncated.
  */
 int vdfs4_truncate_blocks(struct inode *inode, loff_t new_size);
-
-/**
- * @brief	This function is called during inode delete/evict VFS call.
- *		Inode internal fork extents have been already cleared, it's
- *		time to clear exttree extents for this inode and, finally,
- *		remove exttree orphan inode list record for this inode.
- */
-int vdfs4_fsm_free_exttree(struct vdfs4_sb_info *sbi, __u64 ino);
 
 /* snapshot.c */
 
@@ -1139,18 +1232,19 @@ int vdfs4_check_page_offset(struct vdfs4_sb_info *sbi, struct inode *inode,
 		pgoff_t page_index, char *is_new, int force_insert);
 int vdfs4_is_enospc(struct vdfs4_sb_info *sbi, int threshold);
 int vdfs4_check_meta_space(struct vdfs4_sb_info *sbi);
-__u64 validate_base_table(struct vdfs4_base_table *table);
-
+__u64 validate_base_table(struct vdfs4_sb_info *sbi,
+			struct vdfs4_base_table *table);
 
 /* data.c */
 int vdfs4__read(struct inode *inode, int type, struct page **pages,
 		unsigned int page_count, sector_t start_block);
-int vdfs4_dump_chunk_to_disk(void *mapped_chunk, size_t chunk_length,
-		const char *name, unsigned int length);
-int vdfs4_read_page(struct block_device *, struct page *, sector_t ,
-			unsigned int , unsigned int);
-int vdfs4_write_page(struct vdfs4_sb_info *, struct page *, sector_t ,
-			unsigned int , unsigned int, int);
+int vdfs4_dump_to_disk(void *mapped_chunk, size_t chunk_length,
+		const char *name);
+int vdfs4_read_page(struct block_device *, struct page *, sector_t,
+			unsigned int, unsigned int);
+int vdfs4_write_page(struct vdfs4_sb_info *sbi,
+		     sector_t dest_sector, struct page *src_page,
+		     unsigned int offset_in_src, unsigned int len, int is_sync);
 struct page *vdfs4_read_create_page(struct inode *inode, pgoff_t page_index);
 
 struct bio *allocate_new_bio(struct block_device *bdev,
@@ -1184,9 +1278,6 @@ int vdfs4_clear_bits(char *buff, int buff_size, unsigned int offset,
 		unsigned int count, unsigned int magic_len,
 		unsigned int block_size);
 
-ssize_t vdfs4_gen_file_buff_write(struct kiocb *iocb,
-		const struct iovec *iov, unsigned long nr_segs, loff_t pos);
-
 int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi);
 
 int vdfs4_table_IO(struct vdfs4_sb_info *sbi, void *buffer,
@@ -1203,13 +1294,13 @@ int vdfs4_get_table_sector(struct vdfs4_sb_info *sbi, sector_t iblock,
 		sector_t *result);
 struct vdfs4_base_table_record *vdfs4_get_table(struct vdfs4_sb_info *sbi,
 		ino_t ino);
+unsigned int *vdfs4_get_meta_hashtable(struct vdfs4_sb_info *sbi,
+		ino_t ino);
 int vdfs4_read_chunk(struct page *page, struct page **chunk_pages,
 	struct vdfs4_comp_extent_info *cext);
-int vdfs4_auth_decompress(struct inode *inode, struct page **chunk_pages,
+int vdfs4_auth_decompress_sw(struct inode *inode, struct page **chunk_pages,
 		pgoff_t index, struct vdfs4_comp_extent_info *cext,
 		struct page *page);
-int vdfs4_auth_decompress_hw(struct inode *inode, struct page *page);
-int vdfs4_auth_decompress_hw1(struct inode *inode, struct page *page);
 int vdfs4_auth_decompress_hw2(struct inode *inode, struct page *page);
 void *vdfs_get_hwdec_fn(struct vdfs4_inode_info *inode_i);
 
@@ -1217,7 +1308,6 @@ void *vdfs_get_hwdec_fn(struct vdfs4_inode_info *inode_i);
 int vdfs4_add_to_orphan(struct vdfs4_sb_info *sbi, struct inode *inode);
 void vdfs4_del_from_orphan(struct vdfs4_sb_info *sbi, struct inode *inode);
 int vdfs4_process_orphan_inodes(struct vdfs4_sb_info *sbi);
-int __vdfs4_write_inode(struct vdfs4_sb_info *sbi, struct inode *inode);
 
 /* ioctl.c */
 
@@ -1245,16 +1335,12 @@ ssize_t vdfs4_listxattr(struct dentry *dentry, char *buffer, size_t size);
 int vdfs4_xattrtree_remove_all(struct vdfs4_btree *tree, u64 object_id);
 
 struct posix_acl *vdfs4_get_acl(struct inode *inode, int type);
+int vdfs4_set_acl(struct inode *inode, struct posix_acl *acl, int type);
 int vdfs4_init_acl(struct inode *inode, struct inode *dir);
-int vdfs4_chmod_acl(struct inode *inode);
 int vdfs4_init_security_xattrs(struct inode *inode,
 		const struct xattr *xattr_array, void *fs_data);
 
-/* packtree_inode.c */
-
-int vdfs4_read_packtree_inode(struct inode *inode,
-		struct vdfs4_cattree_key *key);
-
+/* decompress.c */
 int vdfs4_unpack_chunk_zlib(void *src, void *dst, size_t offset,
 		size_t len_bytes, size_t chunk_length);
 int vdfs4_unpack_chunk_gzip(void *src, void *dst, size_t offset,
@@ -1275,7 +1361,8 @@ static inline unsigned is_tree(ino_t object_type)
 }
 
 /* authenticaion.c */
-int vdfs4_verify_file_signature(struct vdfs4_inode_info *inode_i, void *data);
+int vdfs4_verify_file_signature(struct vdfs4_inode_info *inode_i,
+		enum sign_type sign_type, void *data);
 int vdfs4_check_hash_meta(struct vdfs4_inode_info *inode_i,
 		struct vdfs4_comp_file_descr *descr);
 int vdfs4_check_hash_chunk(struct vdfs4_inode_info *inode_i,
@@ -1285,18 +1372,15 @@ int vdfs4_check_hash_meta(struct vdfs4_inode_info *inode_i,
 
 int vdfs4_verify_rsa_md5_signature(unsigned char *buf, size_t buf_len,
 		unsigned char *signature);
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 int vdfs4_verify_superblock_rsa_signature(enum hash_type hash_type,
+		enum sign_type sign_type,
 		void *buf, size_t buf_len,
 		void *signature, rsakey_t *pkey);
 #endif
 int vdfs4_check_hash_chunk_no_calc(struct vdfs4_inode_info *inode_i,
 		size_t extent_idx, void *hash_calc);
-/* procfs.c */
-int vdfs4_dir_init(void);
-void vdfs4_dir_exit(void);
-int vdfs4_build_proc_entry(struct vdfs4_sb_info *sbi);
-void vdfs4_destroy_proc_entry(struct vdfs4_sb_info *sbi);
+
 /* macros */
 # define IFTODT(mode)	(((mode) & 0170000) >> 12)
 # define DTTOIF(dirtype)	((dirtype) << 12)
@@ -1317,21 +1401,8 @@ void vdfs4_destroy_proc_entry(struct vdfs4_sb_info *sbi);
 #define VDFS4_BLK_INDEX_IN_LEB(sbi, blk) \
 		(blk & ((1 << sbi->log_blocks_in_leb) - 1))
 
-#define VDFS4_ESB_OFFSET		(2 * SB_SIZE)
-
-#define VDFS4_RAW_SB(sbi)	((struct vdfs4_super_block *) \
-				((char *)sbi->raw_superblock + 1 * SB_SIZE))
-
-#define VDFS4_RAW_EXSB_COPY(sbi) ((struct vdfs4_extended_super_block *) \
-				(sbi->raw_superblock_copy + 3 * SB_SIZE))
-
-#define VDFS4_LAST_EXTENDED_SB(sbi) ((struct vdfs4_extended_super_block *) \
-			(sbi->raw_superblock + 3 * SB_SIZE))
-#define VDFS4_DEBUG_AREA_START(sbi) le64_to_cpu(VDFS4_LAST_EXTENDED_SB(sbi)-> \
-		debug_area.begin)
-
 #define VDFS4_DEBUG_AREA_LENGTH_BLOCK(sbi) le32_to_cpu( \
-			(VDFS4_RAW_EXSB(sbi))->debug_area.length)
+		(VDFS4_RAW_EXSB(sbi))->debug_area.length)
 
 #define VDFS4_DEBUG_AREA(sbi) (sbi->debug_area)
 #define VDFS4_DEBUG_PAGES(sbi) (sbi->debug_pages)
@@ -1343,28 +1414,28 @@ void vdfs4_destroy_proc_entry(struct vdfs4_sb_info *sbi);
 		>> PAGE_CACHE_SHIFT)
 
 #define DEBUG_AREA_CRC_OFFSET(sbi) (VDFS4_DEBUG_AREA_LENGTH_BYTES(sbi) \
-			- sizeof(unsigned int))
+		- sizeof(unsigned int))
 
 #define VDFS4_LOG_DEBUG_AREA(sbi, err) \
-	vdfs4_log_error(sbi, __LINE__, __func__, err);
+		vdfs4_log_error(sbi, __LINE__, __func__, err)
 
 #define VDFS4_SNAPSHOT_VERSION(x) (((__u64)le32_to_cpu(x->descriptor.\
 		mount_count) << 32) | (le32_to_cpu(x->descriptor.sync_count)))
 
 #define VDFS4_IS_COW_TABLE(table) (!strncmp(table->descriptor.signature, \
-	VDFS4_SNAPSHOT_BASE_TABLE,\
-	sizeof(VDFS4_SNAPSHOT_BASE_TABLE) - 1))
+		VDFS4_SNAPSHOT_BASE_TABLE,\
+		sizeof(VDFS4_SNAPSHOT_BASE_TABLE) - 1))
 
 #define VDFS4_EXSB_VERSION(exsb) (((__u64)le32_to_cpu(exsb->mount_counter)\
 		<< 32) | (le32_to_cpu(exsb->sync_counter)))
 
 #define VDFS4_GET_TABLE_OFFSET(sbi, x) (le32_to_cpu( \
-	((struct vdfs4_base_table *)sbi->snapshot_info->base_t)-> \
+		((struct vdfs4_base_table *)sbi->snapshot_info->base_t)-> \
 		translation_table_offsets[VDFS4_SF_INDEX(x)]))
 
 #define VDFS4_LAST_TABLE_INDEX(sbi, x) (le64_to_cpu( \
-	((struct vdfs4_base_table *)sbi->snapshot_info->base_t)-> \
-	last_page_index[VDFS4_SF_INDEX(x)]))
+		((struct vdfs4_base_table *)sbi->snapshot_info->base_t)-> \
+		last_page_index[VDFS4_SF_INDEX(x)]))
 
 #define GET_TABLE_INDEX(sbi, ino_no, page_offset) \
 		(is_tree(ino_no) ? page_offset \
@@ -1373,41 +1444,8 @@ void vdfs4_destroy_proc_entry(struct vdfs4_sb_info *sbi);
 
 #define PAGE_TO_SECTORS(x) (x * ((1 << (PAGE_CACHE_SHIFT - SECTOR_SIZE_SHIFT))))
 
-#define is_dlink(inode) (VDFS4_I(inode)->record_type == \
-		VDFS4_CATALOG_DLINK_RECORD)
-
 #define INODEI_NAME(inode_i) ((inode_i == NULL) ? "<null inodei>" :\
-								((inode_i->name == NULL) ? "<noname>" : inode_i->name))
-#ifdef CONFIG_SMP
-
-/*
- * These macros iterate all files on all CPUs for a given superblock.
- * files_lglock must be held globally.
- */
-#define do_file_list_for_each_entry(__sb, __file)		\
-{								\
-	int i;							\
-	for_each_possible_cpu(i) {				\
-		struct list_head *list;				\
-		list = per_cpu_ptr((__sb)->s_files, i);		\
-		list_for_each_entry((__file), list, f_u.fu_list)
-
-#define while_file_list_for_each_entry				\
-	}							\
-}
-
-#else
-
-#define do_file_list_for_each_entry(__sb, __file)		\
-{								\
-	struct list_head *list;					\
-	list = &(sb)->s_files;					\
-	list_for_each_entry((__file), list, f_u.fu_list)
-
-#define while_file_list_for_each_entry				\
-}
-
-#endif
+		((inode_i->name == NULL) ? "<noname>" : inode_i->name))
 
 /* VDFS4 mount options */
 enum vdfs4_mount_options {
@@ -1422,14 +1460,13 @@ enum vdfs4_mount_options {
 };
 
 #define clear_option(sbi, option)	(sbi->mount_options &= \
-						~(1 << VDFS4_MOUNT_##option))
+					~(1 << VDFS4_MOUNT_##option))
 #define set_option(sbi, option)		(sbi->mount_options |= \
-						(1 << VDFS4_MOUNT_##option))
+					(1 << VDFS4_MOUNT_##option))
 #define test_option(sbi, option)	(sbi->mount_options & \
-						(1 << VDFS4_MOUNT_##option))
+					(1 << VDFS4_MOUNT_##option))
 
 #ifdef CONFIG_VDFS4_DEBUG
-
 /* check for active transaction or writeback */
 static inline void vdfs4_assert_transaction(struct vdfs4_sb_info *sbi)
 {
@@ -1455,7 +1492,7 @@ static inline void vdfs4_assert_btree_write(struct vdfs4_btree *btree)
 		lockdep_assert_held(&btree->rw_tree_lock);
 		if (WARN_ON(down_read_trylock(&btree->rw_tree_lock))) {
 			up_read(&btree->rw_tree_lock);
-			BUG();
+			VDFS4_BUG(btree->sbi);
 		}
 	}
 }
@@ -1465,9 +1502,7 @@ static inline void vdfs4_assert_i_mutex(struct inode *inode)
 	lockdep_assert_held(&inode->i_mutex);
 }
 
-
 #else /* CONFIG_VDFS4_DEBUG */
-
 static inline void vdfs4_assert_transaction(struct vdfs4_sb_info *sbi) { }
 static inline void vdfs4_assert_btree_lock(struct vdfs4_btree *btree) { }
 static inline void vdfs4_assert_btree_write(struct vdfs4_btree *btree) { }

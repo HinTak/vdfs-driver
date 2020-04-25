@@ -61,16 +61,9 @@ void vdfs4_fill_cattree_value(struct inode *inode, void *value_area)
 	comm_rec->generation = cpu_to_le32(inode->i_generation);
 	comm_rec->next_orphan_id = cpu_to_le64(VDFS4_I(inode)->next_orphan_id);
 
-	if (is_dlink(inode)) {
-		struct vdfs4_catalog_dlink_record *dlink = value_area;
-
-		dlink->data_inode =
-			cpu_to_le64(VDFS4_I(inode)->data_link.inode->i_ino);
-		dlink->data_offset =
-			cpu_to_le64(VDFS4_I(inode)->data_link.offset);
-		dlink->data_length = cpu_to_le64(inode->i_size);
-	} else if (S_ISLNK(inode->i_mode) || S_ISREG(inode->i_mode)) {
+	if (S_ISLNK(inode->i_mode) || S_ISREG(inode->i_mode)) {
 		struct vdfs4_catalog_file_record *file_rec = value_area;
+
 		vdfs4_form_fork(&file_rec->data_fork, inode);
 	}
 }

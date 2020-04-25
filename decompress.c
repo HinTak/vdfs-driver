@@ -25,12 +25,7 @@
 #include <linux/vmalloc.h>
 #include "vdfs4.h"
 #include "debug.h"
-#ifdef CONFIG_VDFS4_HW2_SUPPORT
-#include <mach/hw_decompress.h>
-#include <linux/blkdev.h>
-#endif
 #include <linux/lzo.h>
-
 
 #define list_to_page(head) (list_entry((head)->prev, struct page, lru))
 #define list_to_page_index(pos, head, index) \
@@ -38,19 +33,19 @@
 		pos->index != index;\
 	pos = list_entry((pos)->prev, struct page, lru))
 
-static int sw_decompress(z_stream *strm, char *ibuff, int ilen,
-	char *obuff, int olen, int compr_type)
+static int sw_decompress(z_stream *strm, char *ibuff, unsigned long ilen,
+	char *obuff, unsigned long olen, int compr_type)
 {
 	int rc = 0;
 
-	strm->avail_out = (unsigned int)olen;
+	strm->avail_out = olen;
 	strm->next_out = obuff;
 	if (compr_type == VDFS4_COMPR_ZLIB) {
-		strm->avail_in = (unsigned)ilen;
+		strm->avail_in = ilen;
 		strm->next_in = ibuff;
 		rc = zlib_inflateInit(strm);
 	} else if (compr_type == VDFS4_COMPR_GZIP) {
-		strm->avail_in = (unsigned)(ilen - 10);
+		strm->avail_in = ilen - 10;
 		strm->next_in = ibuff + 10;
 		rc = zlib_inflateInit2(strm, -MAX_WBITS);
 	} else {
@@ -74,9 +69,7 @@ static int sw_decompress(z_stream *strm, char *ibuff, int ilen,
 	return rc;
 }
 
-
-#ifdef CONFIG_VDFS4_DEBUG
-
+#ifdef VDFS4_DEBUG_DUMP
 static void print_uncomp_err_dump_header(char *name, int name_len)
 {
 	VDFS4_ERR("--------------------------------------------------");
@@ -84,12 +77,8 @@ static void print_uncomp_err_dump_header(char *name, int name_len)
 	VDFS4_ERR(" Current : %s(%d)", current->comm,
 			task_pid_nr(current));
 	VDFS4_ERR("--------------------------------------------------");
-#if defined(VDFS4_GIT_BRANCH) && defined(VDFS4_GIT_REV_HASH) && \
-		defined(VDFS4_VERSION)
-
 	VDFS4_ERR("== VDFS4 Debugger - %15s ===== Core : %2d ===="
 			, VDFS4_VERSION, current_thread_info()->cpu);
-#endif
 	VDFS4_ERR("--------------------------------------------------");
 	VDFS4_ERR("Source image name : %.*s", name_len, name);
 	VDFS4_ERR("--------------------------------------------------");
@@ -122,7 +111,7 @@ static void print_zlib_error(int unzip_error)
 			Z_VERSION_ERROR);
 		break;
 	case (VDFS4_Z_NEED_DICT_ERR):
-		VDFS4_ERR(" The Z_NEED_DICT error happened %d" ,
+		VDFS4_ERR(" The Z_NEED_DICT error happened %d",
 				VDFS4_Z_NEED_DICT_ERR);
 		break;
 	default:
@@ -131,9 +120,7 @@ static void print_zlib_error(int unzip_error)
 	}
 
 }
-#endif
 
-#ifdef CONFIG_VDFS4_DEBUG
 void vdfs4_dump_fbc_error(struct vdfs4_inode_info *inode_i, void *packed,
 		struct vdfs4_comp_extent_info *cext)
 {
@@ -147,7 +134,6 @@ void vdfs4_dump_fbc_error(struct vdfs4_inode_info *inode_i, void *packed,
 	int ret;
 
 	mutex_lock(&sbi->dump_meta);
-	_sep_printk_start();
 
 	chunk = (char *)packed + cext->offset;
 	print_uncomp_err_dump_header(fname, fname_len);
@@ -166,19 +152,19 @@ void vdfs4_dump_fbc_error(struct vdfs4_inode_info *inode_i, void *packed,
 		name_length = snprintf(file_name, VDFS4_FILE_NAME_LEN,
 				"%lu_%.*s_%d_%llu_%d.dump",
 			inode_i->vfs_inode.i_ino,
-			strlen(fname),
+			(int)(strlen(fname)),
 			fname,
 			(cext->flags & VDFS4_CHUNK_FLAG_UNCOMPR),
 			((extent.first_block +
 			cext->start_block) << 12) +
 			(sector_t)cext->offset,
-			1 << inode_i->fbc->log_chunk_size);
+			(int)(cext->blocks_n << PAGE_CACHE_SHIFT));
 
 
 		if (name_length > 0)
-			vdfs4_dump_chunk_to_disk(packed,
-				(size_t)(1 << inode_i->fbc->log_chunk_size),
-				(const char *)file_name, (unsigned)name_length);
+			vdfs4_dump_to_disk(packed,
+				(size_t)(cext->blocks_n << PAGE_CACHE_SHIFT),
+				(const char *)file_name);
 	}
 dump_to_console:
 
@@ -198,13 +184,11 @@ dump_to_console:
 			((extent.first_block +
 			cext->start_block) << 12) + (sector_t)cext->offset,
 			cext->len_bytes, cext->blocks_n,
-			cext->flags & VDFS4_CHUNK_FLAG_UNCOMPR);
+			(int)cext->flags & VDFS4_CHUNK_FLAG_UNCOMPR);
 
-	print_hex_dump(KERN_ERR, "", DUMP_PREFIX_ADDRESS, 16, 1, chunk,
-			(size_t)cext->len_bytes, 1);
-
-	_sep_printk_end();
+	VDFS4_MDUMP("", chunk, (size_t)cext->len_bytes);
 	mutex_unlock(&sbi->dump_meta);
+	vdfs4_print_volume_verification(sbi);
 	kfree(file_name);
 }
 #endif
@@ -224,7 +208,7 @@ static int _unpack_chunk_zlib_gzip(void *src, void *dst, size_t offset,
 			chunk_size, compr_type);
 
 	if (ret) {
-#ifdef CONFIG_VDFS4_DEBUG
+#ifdef VDFS4_DEBUG_DUMP
 		print_zlib_error(ret);
 #endif
 		ret = -EIO;

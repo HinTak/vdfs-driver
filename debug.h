@@ -23,13 +23,29 @@
 #define _VDFS4_DEBUG_H_
 
 #ifdef CONFIG_KPI_SYSTEM_SUPPORT
-extern void set_kpi_hw_error(char* prefix, char* msg);
+extern void set_kpi_hw_error(char *prefix, char *msg);
 #else
-#define set_kpi_hw_error(x,y)
+#define set_kpi_hw_error(x, y)
 #endif
 
 #include <linux/crc32.h>
+#include <linux/console.h>
 
+extern void console_forbid_async_printk(void);
+extern void console_permit_async_printk(void);
+
+#define VDFS4_PRE_DUMP()\
+	do {\
+		console_forbid_async_printk();\
+		console_flush_messages();\
+		_sep_printk_start();\
+	} while (0)
+
+#define VDFS4_POST_DUMP()\
+	do {\
+		_sep_printk_end();\
+		console_permit_async_printk();\
+	} while (0)
 /**
  * @brief		Memory dump.
  * @param [in]	type	Sets debug type (see VDFS4_DBG_*).
@@ -39,10 +55,12 @@ extern void set_kpi_hw_error(char* prefix, char* msg);
  */
 #define VDFS4_MDUMP(log_str, buf, len)\
 	do {\
-		VDFS4_ERR(log_str);\
+		VDFS4_NOTICE(log_str);\
+		VDFS4_PRE_DUMP();\
 		print_hex_dump(KERN_ERR, "",\
-				DUMP_PREFIX_NONE, 16, 1, buf, len,\
+				DUMP_PREFIX_ADDRESS, 16, 1, buf, len,\
 				true);\
+		VDFS4_POST_DUMP();\
 	} while (0)
 
 /**
@@ -50,17 +68,21 @@ extern void set_kpi_hw_error(char* prefix, char* msg);
  * @param [in]	fmt	Printf format string.
  * @return	void
  */
-#define VDFS4_ERR(fmt, ...)\
-	do {\
-		printk(KERN_ERR "vdfs4-ERROR:%d:%s: " fmt "\n", __LINE__,\
-			__func__, ##__VA_ARGS__);\
-		set_kpi_hw_error("vdfs4-ERROR:", fmt);\
-	} while (0)
+void VDFS4_MESSAGE(const char *func, const int line, const char *prefix,
+		   const char *fmt, ...);
+#define VDFS4_ERR(fmt, ...) \
+	VDFS4_MESSAGE(__func__, __LINE__, "vdfs4-ERROR:", fmt, ##__VA_ARGS__)
+#define VDFS4_SECURITY_ERR(fmt, ...) \
+	VDFS4_MESSAGE(__func__, __LINE__, "Security-ERROR:", fmt, ##__VA_ARGS__)
 
-#define VDFS4_MOUNT_INFO(fmt, ...)\
-do {\
-	printk(KERN_INFO "vdfs4-INFO: " fmt, ##__VA_ARGS__);\
-} while (0)
+#define VDFS4_WARNING(fmt, ...) \
+	printk(KERN_ALERT "vdfs4-WARN: " fmt, ##__VA_ARGS__)
+
+#define VDFS4_NOTICE(fmt, ...) \
+	printk(KERN_WARNING "vdfs4-NOTICE: " fmt, ##__VA_ARGS__)
+
+#define VDFS4_INFO(fmt, ...) \
+	printk(KERN_INFO "vdfs4-INFO: " fmt, ##__VA_ARGS__)
 
 /** Enables VDFS4_DEBUG_SB() in super.c */
 #define VDFS4_DBG_SB	(1 << 0)
@@ -87,7 +109,7 @@ do {\
 #define VDFS4_DBG_TMP (1 << 7)
 
 
-#if defined(CONFIG_VDFS4_DEBUG)
+#ifdef CONFIG_VDFS4_DEBUG
 /**
  * @brief		Print debug information.
  * @param [in]	type	Sets debug type (see VDFS4_DBG_*).
@@ -97,7 +119,7 @@ do {\
 #define VDFS4_DEBUG(type, fmt, ...)\
 	do {\
 		if ((type) & vdfs4_debug_mask)\
-			printk(KERN_INFO "vdfs4-DEBUG:%s:%d:%s: " fmt "\n", __FILE__,\
+			printk(KERN_WARNING "vdfs4-DEBUG:%s:%d:%s: " fmt "\n", __FILE__,\
 				__LINE__, __func__, ##__VA_ARGS__);\
 	} while (0)
 #else
@@ -169,11 +191,73 @@ do {\
 
 extern unsigned int vdfs4_debug_mask;
 
-#if defined(CONFIG_VDFS4_DEBUG)
-void vdfs4_debug_print_sb(struct vdfs4_sb_info *sbi);
-#else
-static inline void vdfs4_debug_print_sb(
-		struct vdfs4_sb_info *sbi  __attribute__ ((unused))) {}
-#endif
+enum vdfs4_debug_err_k {
+	VDFS4_DEBUG_ERR_NONE = 0X00,
+	VDFS4_DEBUG_ERR_BUG,
+	VDFS4_DEBUG_ERR_BUG_ON,
+	VDFS4_DEBUG_ERR_BASETABLE_LOAD,
+	VDFS4_DEBUG_ERR_BNODE_SANITY,
+	VDFS4_DEBUG_ERR_BNODE_DELETE,
+	VDFS4_DEBUG_ERR_BNODE_MERGE,
+	VDFS4_DEBUG_ERR_BNODE_ALLOC,
+	VDFS4_DEBUG_ERR_BNODE_PUT,
+	VDFS4_DEBUG_ERR_BNODE_DESTROY,
+	VDFS4_DEBUG_ERR_BNODE_DIRTY,
+	VDFS4_DEBUG_ERR_BNODE_READ,
+	VDFS4_DEBUG_ERR_BNODE_OFFSET,
+	VDFS4_DEBUG_ERR_BITMAP_VALIDATE,
+	VDFS4_DEBUG_ERR_BITMAP_FREE,
+	VDFS4_DEBUG_ERR_INODE_UNLINK,
+	VDFS4_DEBUG_ERR_INODE_WRITE,
+	VDFS4_DEBUG_ERR_INODE_EVICT,
+	VDFS4_DEBUG_ERR_ORPHAN,
+};
 
+#define VDFS_IMG_VERIFY_MAGIC (0x0DEFACED)
+#define VDFS_DBG_AREA_MAGIC "Vdbg"
+#define VDFS_DBG_AREA_VER (1)
+#define VDFS_DBG_VERIFY_START (0x3aa33aa3)
+#define VDFS_DBG_VERIFY_FAIL (0xdead4ead)
+#define VDFS_DBG_VERIFY_MKFS (0x0a0a0a0a)
+#define VDFS_DBG_VERIFY_NODATA (0x00000000)
+#define VDFS_DBG_ERR_MAX_CNT (10)
+
+struct vdfs_err_info {
+	uint16_t idx;
+	uint16_t vdfs_err_type_k;
+	uint32_t proof[2];
+	uint32_t reserved;
+	uint8_t note[32];
+} __packed;
+
+struct vdfs_dbg_info {
+	uint32_t verify_result;
+	uint32_t err_count;
+	uint32_t crash_val;
+} __packed;
+
+struct vdfs_dbg_area_map {
+	uint8_t magic[4];
+	uint32_t dbgmap_ver;
+	uint32_t reserved[6];
+	struct vdfs_dbg_info dbg_info;
+	struct vdfs_err_info err_list[VDFS_DBG_ERR_MAX_CNT] __aligned(512);
+} __packed;
+
+void vdfs4_dump_bnode(struct vdfs4_bnode *bnode, void *data);
+void vdfs4_dump_basetable(struct vdfs4_sb_info *sbi,
+		struct vdfs4_base_table *table, unsigned int table_size);
+
+int vdfs4_debug_get_err_count(struct vdfs4_sb_info *sbi, uint32_t *err_count);
+int vdfs4_record_err_dump_disk(struct vdfs4_sb_info *sbi,
+		uint16_t err_type, uint32_t proof_1, uint32_t proof_2,
+		const uint8_t *note, void *extra_buf, size_t extra_len);
+int vdfs4_debugarea_check(struct vdfs4_sb_info *sbi);
+#ifdef CONFIG_VDFS4_DEBUG
+void vdfs4_print_volume_verification(
+		struct vdfs4_sb_info *sbi);
+#else
+static inline void vdfs4_print_volume_verification(
+		struct vdfs4_sb_info *sbi __attribute__ ((unused))) {}
+#endif
 #endif /* _VDFS4_DEBUG_H_ */

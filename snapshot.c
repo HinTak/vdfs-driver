@@ -33,6 +33,9 @@
 
 #include "vdfs4.h"
 
+#define DELAYED_COMMIT_TIMEOUT (30)
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 struct vdfs4_base_table_record *vdfs4_get_table(struct vdfs4_sb_info *sbi,
 		ino_t ino)
@@ -44,10 +47,23 @@ struct vdfs4_base_table_record *vdfs4_get_table(struct vdfs4_sb_info *sbi,
 	return (void *)((char *)b_table + offset);
 }
 
+unsigned int *vdfs4_get_meta_hashtable(struct vdfs4_sb_info *sbi,
+		ino_t ino)
+{
+	struct vdfs4_meta_hashtable *hashtable = sbi->raw_meta_hashtable;
+	__u32 offset = le32_to_cpu(
+		hashtable->hashtable_offsets[VDFS4_SF_INDEX(ino)]);
+
+	return (void *)((char *)hashtable + offset);
+}
+
 static int expand_special_file(struct vdfs4_sb_info *sbi, ino_t ino_n,
 		__u64 new_last_iblock, int force_insert);
 static void insert_new_iblocks(struct vdfs4_sb_info *sbi, ino_t ino_n,
 		sector_t new_last_iblock);
+static unsigned long free_blocks_in_bitmap(unsigned long *bitmap,
+		unsigned long size);
+static long meta_area_free_blocks(struct vdfs4_sb_info *sbi);
 
 /**
  * @brief		Start transaction.
@@ -79,12 +95,13 @@ void vdfs4_stop_transaction(struct vdfs4_sb_info *sbi)
 {
 	int *transaction_count = (int *)&current->journal_info;
 
-	VDFS4_BUG_ON(!*transaction_count);
+	VDFS4_BUG_ON(!*transaction_count, sbi);
 
 	if (*transaction_count == 1) {
 		VDFS4_DEBUG_MUTEX("transaction_lock up_read");
 		up_read(&sbi->snapshot_info->transaction_lock);
-		mod_delayed_work(system_wq, &sbi->delayed_commit, 60 * HZ);
+		mod_delayed_work(system_wq, &sbi->delayed_commit,
+				 DELAYED_COMMIT_TIMEOUT * HZ);
 	}
 	(*transaction_count)--;
 }
@@ -110,28 +127,51 @@ void vdfs4_stop_writeback(struct vdfs4_sb_info *sbi)
 	}
 }
 
-__u64 validate_base_table(struct vdfs4_base_table *table)
+__u64 validate_base_table(struct vdfs4_sb_info *sbi,
+			struct vdfs4_base_table *table)
 {
-	__u32 checksum, on_disk_checksum;
+	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
+	struct vdfs4_super_block *sb = &l_sb->sb;
+	__u32 checksum_on_sb = sb->basetable_checksum;
+	__u32 checksum, checksum_on_basetable, *__checksum_on_basetable;
 	int is_not_base_table;
-	__u32 *__on_disk_checksum;
 
-	__on_disk_checksum = (void *)((char *)table +
+	__checksum_on_basetable = (void *)((char *)table +
 			le32_to_cpu(table->descriptor.checksum_offset));
-	on_disk_checksum = le32_to_cpu(*__on_disk_checksum);
-
+	checksum_on_basetable = le32_to_cpu(*__checksum_on_basetable);
 
 	is_not_base_table = strncmp(table->descriptor.signature,
 			VDFS4_SNAPSHOT_BASE_TABLE,
 			sizeof(VDFS4_SNAPSHOT_BASE_TABLE) - 1);
 	/* signature not match */
-	if (is_not_base_table)
+	if (is_not_base_table) {
+		VDFS4_NOTICE("This is not base table (%#x)",
+			*(u32 *)table->descriptor.signature);
 		return 0;
+	}
 	checksum = crc32(0, table,
 			le32_to_cpu(table->descriptor.checksum_offset));
-	return (checksum != on_disk_checksum) ? 0 :
-			VDFS4_SNAPSHOT_VERSION(table);
 
+	if (is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN)) {
+		if (checksum == checksum_on_basetable)
+			return VDFS4_SNAPSHOT_VERSION(table);
+		else
+			goto fail;
+	}
+
+	if (checksum != checksum_on_sb) {
+#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
+		VDFS4_NOTICE("basetable crc is updated.(org_sb:%#x,org:%#x,calc:%#x)",
+			checksum_on_sb, checksum_on_basetable, checksum);
+#else
+		goto fail;
+#endif
+	}
+	return VDFS4_SNAPSHOT_VERSION(table);
+fail:
+	VDFS4_NOTICE("basetable crc mismatch.(org_sb:%#x,org:%#x,calc:%#x)",
+		checksum_on_sb, checksum_on_basetable, checksum);
+	return 0;
 }
 
 static __u64 parse_extended_table(struct vdfs4_sb_info *sbi,
@@ -155,7 +195,7 @@ static __u64 parse_extended_table(struct vdfs4_sb_info *sbi,
 		table = vdfs4_get_table(sbi, (ino_t)obj_id);
 		last_table_index = VDFS4_LAST_TABLE_INDEX(sbi, obj_id);
 
-		BUG_ON(table_idx > last_table_index);
+		VDFS4_BUG_ON(table_idx > last_table_index, sbi);
 
 		table[table_idx].meta_iblock = record->meta_iblock;
 		/* TODO - why two layout structures have different sizes ??? */
@@ -207,7 +247,8 @@ static void build_snapshot_bitmaps(struct vdfs4_sb_info *sbi)
 	unsigned long *next_snapshot_bitmap = snapshot->next_snapshot_bitmap;
 	unsigned long count, page_index;
 	unsigned int table_offset;
-	int pos, order;
+	int order;
+	unsigned int pos;
 
 	struct vdfs4_base_table_record *table;
 
@@ -221,7 +262,7 @@ static void build_snapshot_bitmaps(struct vdfs4_sb_info *sbi)
 				(int)sbi->log_blocks_in_page;
 		for (page_index = 0; page_index <=
 			VDFS4_LAST_TABLE_INDEX(sbi, count); page_index++) {
-			pos = (int)le64_to_cpu(table->meta_iblock);
+			pos = (unsigned int)le64_to_cpu(table->meta_iblock);
 
 			bitmap_set(snapshot_bitmap, pos, (1 << order));
 			table++;
@@ -229,7 +270,7 @@ static void build_snapshot_bitmaps(struct vdfs4_sb_info *sbi)
 	}
 
 	bitmap_copy(next_snapshot_bitmap, snapshot_bitmap,
-				(int)snapshot->bitmap_size_in_bits);
+				(unsigned int)snapshot->bitmap_size_in_bits);
 
 }
 
@@ -248,19 +289,32 @@ static int restore_exsb(struct vdfs4_sb_info *sbi, __u64 version)
 	exsb_version = VDFS4_EXSB_VERSION(exsb);
 	exsb_copy_version = VDFS4_EXSB_VERSION(exsb_copy);
 
-	if (exsb_version == exsb_copy_version)
+	/*
+		exsb and basetable update sequence.
+			---> exsb_copy ---> basetable ---> exsb --->
+			^              ^       ^      ^         ^
+	Timing (1)            (2)     (3)    (4)       (5)
+	*/
+	if (exsb_version == exsb_copy_version) {
+		/* (1)or(5) : no problem case */
 		return 0;
+	}
 
-	if (version == exsb_version) {
+	if (version != exsb_copy_version) {
+		/*
+			(2)or(3) : basetable version is older than
+			exsb_copy version. so ignore exsb_copy.
+		*/
 		memcpy(exsb_copy, exsb,
 			sizeof(struct vdfs4_extended_super_block));
 		if (!(sbi->sb->s_flags & MS_RDONLY))
-			ret = vdfs4_sync_second_super(sbi);
+			ret = vdfs4_sync_exsb(sbi, 1);
 	} else {
+		/* (4) : exsb didn't update. so recovery using exsb_copy. */
 		memcpy(exsb, exsb_copy,
 			sizeof(struct vdfs4_extended_super_block));
 		if (!(sbi->sb->s_flags & MS_RDONLY))
-			ret = vdfs4_sync_first_super(sbi);
+			ret = vdfs4_sync_exsb(sbi, 0);
 	}
 
 	return ret;
@@ -323,6 +377,7 @@ static int load_base_table(struct vdfs4_sb_info *sbi,
 		tables_size_in_bytes;
 	int ret = 0;
 	struct vdfs4_base_table *table;
+	int opposite = 0;
 
 	table_tbc = le64_to_cpu(exsb->tables.length);
 
@@ -336,7 +391,8 @@ static int load_base_table(struct vdfs4_sb_info *sbi,
 	if (ret)
 		return ret;
 
-	if (table1_version > table2_version) {
+read_basetable:
+	if ((table1_version > table2_version) ^ opposite) {
 		table_version = table1_version;
 		tables_size_in_bytes = tables1_size_in_bytes;
 		table_start = 0;
@@ -349,26 +405,51 @@ static int load_base_table(struct vdfs4_sb_info *sbi,
 	if ((table_version == 0) || (tables_size_in_bytes == 0))
 		return -EINVAL;
 
-	ret = restore_exsb(sbi, table_version);
-	if (ret)
-		return ret;
-
-	table = vdfs4_vmalloc((long unsigned int)(DIV_ROUND_UP(tables_size_in_bytes,
-			(__u64)PAGE_SIZE) << PAGE_SHIFT));
+	table = vdfs4_vmalloc((unsigned long int)(DIV_ROUND_UP(
+				tables_size_in_bytes,
+				(__u64)PAGE_SIZE) << PAGE_SHIFT));
 	if (!table)
 		return -ENOMEM;
 
-	ret = vdfs4_table_IO(sbi, table, tables_size_in_bytes, READ,
-			&table_start);
+	ret = vdfs4_table_IO(sbi, table, tables_size_in_bytes,
+			READ | REQ_META | REQ_PRIO,	&table_start);
 	if (ret) {
+		VDFS4_ERR("Failed to table IO.");
 		vfree(table);
 		return ret;
 	}
 
-	checked = validate_base_table(table);
+	checked = validate_base_table(sbi, table);
 	if (!checked) {
+		struct page *pg_null = NULL;
+		if (!opposite) {
+			/* try to use opposite base_table. */
+			opposite = 1;
+			vfree(table);
+			goto read_basetable;
+		}
+
+		VDFS4_ERR("Failed to validate basetable.");
+		vdfs4_dump_basetable(NULL, table,
+			(unsigned long int)(DIV_ROUND_UP(tables_size_in_bytes,
+			(__u64)PAGE_SIZE) << PAGE_SHIFT));
+		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_BASETABLE_LOAD,
+			(uint32_t)table1_version,
+			(uint32_t)table2_version,
+			"fail load baseT", table, tables_size_in_bytes);
 		vfree(table);
-		return -EIO;
+		return -EFAULT;
+	} else if (opposite) {
+		/* Success to read opposite base_table */
+		VDFS4_NOTICE("basetable was recovered.(%s).\n",
+			     ((table_start < (table_tbc>>1))?"1st":"2nd"));
+	}
+
+	ret = restore_exsb(sbi, table_version);
+	if (ret) {
+		VDFS4_ERR("Failed to restore exsb\n");
+		vfree(table);
+		return ret;
 	}
 
 	snapshot->base_t = table;
@@ -388,8 +469,8 @@ static int load_extended_table(struct vdfs4_sb_info *sbi, sector_t start)
 			return -ENOMEM;
 	}
 
-	return vdfs4_table_IO(sbi, snapshot->extended_table, PAGE_SIZE, READ,
-			&start);
+	return vdfs4_table_IO(sbi, snapshot->extended_table, PAGE_SIZE,
+			READ | REQ_META | REQ_PRIO,	&start);
 }
 
 int vdfs4_build_snapshot_manager(struct vdfs4_sb_info *sbi)
@@ -420,7 +501,7 @@ int vdfs4_build_snapshot_manager(struct vdfs4_sb_info *sbi)
 	snapshot->snapshot_bitmap = kzalloc(bitmaps_length, GFP_NOFS);
 	snapshot->moved_iblock = kzalloc(bitmaps_length, GFP_NOFS);
 	snapshot->next_snapshot_bitmap = kzalloc(bitmaps_length, GFP_NOFS);
-	snapshot->bitmap_size_in_bits = (long unsigned int)meta_tbc;
+	snapshot->bitmap_size_in_bits = (unsigned long int)meta_tbc;
 
 	if (!snapshot->snapshot_bitmap || !snapshot->moved_iblock ||
 			!snapshot->next_snapshot_bitmap) {
@@ -430,6 +511,7 @@ int vdfs4_build_snapshot_manager(struct vdfs4_sb_info *sbi)
 
 	for (count = 0; count < VDFS4_SNAPSHOT_EXT_TABLES; count++) {
 		struct vdfs4_base_table *base_table = snapshot->base_t;
+
 		ret = load_extended_table(sbi, iblock);
 		if (ret)
 			goto error_exit;
@@ -478,6 +560,7 @@ error_exit_free_snapshot:
 void vdfs4_destroy_snapshot_manager(struct vdfs4_sb_info *sbi)
 {
 	struct vdfs4_snapshot_info *snapshot = sbi->snapshot_info;
+
 	sbi->snapshot_info = NULL;
 	vfree(snapshot->base_t);
 	vfree(snapshot->extended_table);
@@ -488,7 +571,8 @@ void vdfs4_destroy_snapshot_manager(struct vdfs4_sb_info *sbi)
 }
 
 
-static __u64 get_new_meta_iblock(struct vdfs4_sb_info *sbi, ino_t ino_n)
+static int get_new_meta_iblock(struct vdfs4_sb_info *sbi,
+		ino_t ino_n, unsigned long *iblock)
 {
 	unsigned long int hint, nr, align_mask, alignment;
 	struct vdfs4_snapshot_info *snapshot = sbi->snapshot_info;
@@ -496,7 +580,6 @@ static __u64 get_new_meta_iblock(struct vdfs4_sb_info *sbi, ino_t ino_n)
 	unsigned long *next_snapshot_bitmap = snapshot->next_snapshot_bitmap;
 	unsigned long int size = snapshot->bitmap_size_in_bits;
 	unsigned long position;
-
 
 	if (is_tree(ino_n)) {
 		nr = 1lu << sbi->log_blocks_in_leb;
@@ -516,14 +599,26 @@ static __u64 get_new_meta_iblock(struct vdfs4_sb_info *sbi, ino_t ino_n)
 	if (position > size) {
 		position = bitmap_find_next_zero_area(snapshot_bitmap, size, 0,
 				nr, align_mask);
-		if (position > size)
-			BUG();
+		if (position > size) {
+			/* There is not enoguh space left for metadata.
+			Reset position hints, because we already failed
+			while using them. Very improbable that next time
+			will be different */
+			if (is_tree(ino_n))
+				sbi->snapshot_info->hint_btree = 0;
+			else
+				sbi->snapshot_info->hint_bitmaps = 0;
+			return -ENOSPC;
+		}
 	}
 
 	/*2 set bits in snapshot_bitmap & next_snapshot_bitmaps */
-	bitmap_set(snapshot_bitmap, (int)position, (1 << alignment));
-	bitmap_set(next_snapshot_bitmap, (int)position, (1 << alignment));
-	bitmap_set(snapshot->moved_iblock, (int)position, (1 << alignment));
+	bitmap_set(snapshot_bitmap, (unsigned int)position,
+			(1 << alignment));
+	bitmap_set(next_snapshot_bitmap, (unsigned int)position,
+			(1 << alignment));
+	bitmap_set(snapshot->moved_iblock, (unsigned int)position,
+			(1 << alignment));
 
 	hint = position + nr;
 	if (is_tree(ino_n))
@@ -531,37 +626,46 @@ static __u64 get_new_meta_iblock(struct vdfs4_sb_info *sbi, ino_t ino_n)
 	else
 		sbi->snapshot_info->hint_bitmaps = hint;
 
-
-	return (__u64)position;
+	*iblock = position;
+	return 0;
 }
 
 
 static void move_iblock(struct vdfs4_sb_info *sbi, ino_t ino_n,
-		sector_t current_iblock, pgoff_t page_index, sector_t *new_iblock)
+		sector_t current_iblock, pgoff_t page_index,
+		sector_t *new_iblock)
 {
 	struct vdfs4_snapshot_info *snapshot = sbi->snapshot_info;
 	unsigned long *next_snapshot_bitmap = snapshot->next_snapshot_bitmap;
-	sector_t position;
+	unsigned long new_position;
 	struct vdfs4_base_table_record *table = vdfs4_get_table(sbi, ino_n);
 	__u64 last_table_index = VDFS4_LAST_TABLE_INDEX(sbi, ino_n);
 	__u64 table_index;
-	int nr;
+	int nr, ret;
 
 	if (is_tree(ino_n))
 		nr = 1 << sbi->log_blocks_in_leb;
 	else
 		nr = 1 << sbi->log_blocks_in_page;
 
-
 	table_index = GET_TABLE_INDEX(sbi, ino_n, page_index);
-	BUG_ON(table_index > last_table_index);
-	position = get_new_meta_iblock(sbi, ino_n);
-	bitmap_clear(next_snapshot_bitmap, (int)current_iblock, nr);
+	VDFS4_BUG_ON(table_index > last_table_index, sbi);
+	ret = get_new_meta_iblock(sbi, ino_n, &new_position);
+	if (!ret)
+		bitmap_clear(next_snapshot_bitmap, (int)current_iblock, nr);
+	else {
+		/* There is not enough space to do standard Copy-On-Write.
+		Assign same block as current one and modify moved_iblock
+		bitmap to avoid checks in vdfs4_check_moved_iblocks(). */
+		new_position = current_iblock;
+		bitmap_set(snapshot->moved_iblock, (int)current_iblock, nr);
+	}
 
-	table[table_index].meta_iblock = cpu_to_le64(position);
+	table[table_index].meta_iblock = cpu_to_le64((__u64)new_position);
 
-	*new_iblock = position;
+	*new_iblock = (sector_t)new_position;
 }
+
 
 static void update_extended_table(struct vdfs4_sb_info *sbi, ino_t ino_n,
 		sector_t page_index, __u64 new_iblock)
@@ -578,7 +682,8 @@ static void update_extended_table(struct vdfs4_sb_info *sbi, ino_t ino_n,
 	if (snapshot->use_base_table)
 		return;
 
-	new_table_size = (rec_count + 1) * sizeof(struct vdfs4_extended_record) +
+	new_table_size = (rec_count + 1) *
+			sizeof(struct vdfs4_extended_record) +
 			sizeof(struct vdfs4_extended_table) + CRC32_SIZE;
 
 	if (new_table_size > PAGE_CACHE_SIZE) {
@@ -604,21 +709,22 @@ void vdfs4_add_chunk_no_lock(struct vdfs4_sb_info *sbi, ino_t object_id,
 	sector_t meta_iblock, new_iblock;
 	int ret;
 
-	BUG_ON((object_id < VDFS4_FSFILE) || (object_id > VDFS4_LSFILE));
+	VDFS4_BUG_ON((object_id < VDFS4_FSFILE) ||
+			(object_id > VDFS4_LSFILE), sbi);
 
 	ret = vdfs4_get_meta_iblock(sbi, object_id, page_index,
 			&meta_iblock);
-	BUG_ON(ret);
+	VDFS4_BUG_ON(ret, sbi);
 
-	ret = test_bit((int)meta_iblock, moved_iblock);
+	ret = test_bit((unsigned int)meta_iblock, moved_iblock);
 	if (ret)
 		return;
 
 	move_iblock(sbi, object_id, meta_iblock, page_index, &new_iblock);
 
 	if (is_tree(object_id))
-		BUG_ON((new_iblock) &
-				((1llu << sbi->log_blocks_in_leb) - 1llu));
+		VDFS4_BUG_ON((new_iblock) &
+				((1llu << sbi->log_blocks_in_leb) - 1llu), sbi);
 
 	update_extended_table(sbi, object_id, page_index, new_iblock);
 
@@ -639,29 +745,29 @@ static unsigned int get_bnode_size_in_pages(struct vdfs4_sb_info *sbi,
 	default:
 		break;
 	}
-	BUG();
+	VDFS4_BUG(sbi);
 	return 0;
 }
 
 #ifdef CONFIG_VDFS4_DEBUG
-
 void vdfs4_check_moved_iblocks(struct vdfs4_sb_info *sbi, struct page **pages,
 		unsigned int page_count)
 {
 	struct vdfs4_snapshot_info *snapshot = sbi->snapshot_info;
-	long unsigned int *moved_iblock = snapshot->moved_iblock;
+	unsigned long int *moved_iblock = snapshot->moved_iblock;
 	ino_t i_ino = pages[0]->mapping->host->i_ino;
 	sector_t meta_iblock;
 	unsigned int count = 0, chunk_size, i;
+
 	chunk_size = (is_tree(i_ino)) ? get_bnode_size_in_pages(sbi, i_ino) : 1;
 	do {
 		/* page->index must be exist in snapshot tables */
-		BUG_ON(vdfs4_get_meta_iblock(sbi, i_ino, pages[count]->index,
-				&meta_iblock));
+		VDFS4_BUG_ON(vdfs4_get_meta_iblock(sbi, i_ino,
+				pages[count]->index, &meta_iblock), sbi);
 		/* page must be moved */
 		for (i = 0; i < chunk_size; i++) {
-			BUG_ON(!test_and_clear_bit((int)meta_iblock,
-						moved_iblock));
+			VDFS4_BUG_ON(!vdfs4_test_and_clear_bit((int)meta_iblock,
+						moved_iblock), sbi);
 			meta_iblock++;
 			count++;
 		}
@@ -699,7 +805,7 @@ void vdfs4_add_chunk_bnode(struct vdfs4_sb_info *sbi, struct page **pages)
 
 	if (PageDirty(pages[0])) {
 		for (count = 0; count < bnode_size_in_pages; count++)
-			BUG_ON(!PageDirty(pages[count]));
+			VDFS4_BUG_ON(!PageDirty(pages[count]), sbi);
 		/* pages is diry - already moved to new place */
 		return;
 	}
@@ -710,6 +816,48 @@ void vdfs4_add_chunk_bnode(struct vdfs4_sb_info *sbi, struct page **pages)
 	up_write(&snapshot->tables_lock);
 }
 
+/**
+ * @brief		Function counts number of zero bits in bitmap.
+ *				Also checks if there is a contiguous zero-area
+ *				of length bigger or equal to contig_len.
+ * @param [in]	bitmap Bitmap to search for zero bits in
+ * @param [in]	size Bitmap size in bits
+ * @param [in]	contig_len_req Minimal size of contiguous zero-area to find
+ * @param [out]	contig_avail Pointer to value that will be set to:
+ *							0 - contiguous zero-area was not found
+ *							1 - contiguous zero-area was found
+ * @return		Number of free bits in bitmap.
+ */
+static unsigned long free_blocks_in_bitmap_contig_check(unsigned long *bitmap,
+		unsigned long size, unsigned long contig_len,
+		unsigned int *contig_avail)
+{
+	unsigned long position, next_position;
+	unsigned long free_blocks = 0;
+	unsigned int contig_found = 0;
+
+	position = find_first_zero_bit(bitmap, size);
+
+	while (position < size) {
+		next_position = find_next_bit(bitmap, size, position);
+		if (next_position > size) {
+			free_blocks += next_position - 1 - position;
+			if (!contig_found &&
+				((next_position - 1 - position) >= contig_len))
+				contig_found = 1;
+			break;
+		}
+		free_blocks += (next_position - position);
+		if (!contig_found &&
+			((next_position - position) >= contig_len))
+			contig_found = 1;
+		position = find_next_zero_bit(bitmap, size, next_position);
+	}
+
+	*contig_avail = contig_found;
+
+	return free_blocks;
+}
 
 /**
  * @brief		Check offset: space for page with page_index
@@ -759,7 +907,7 @@ __le64 vdfs4_get_page_version(struct vdfs4_sb_info *sbi, struct inode *inode,
 	__le64 version = 0;
 	struct vdfs4_base_table_record *table;
 
-	down_write(&sbi->snapshot_info->tables_lock);
+	down_read(&sbi->snapshot_info->tables_lock);
 	if (is_tree(inode->i_ino))
 		table_index = page_index >> (sbi->log_blocks_in_leb +
 				sbi->block_size_shift - PAGE_SHIFT);
@@ -768,7 +916,7 @@ __le64 vdfs4_get_page_version(struct vdfs4_sb_info *sbi, struct inode *inode,
 	table = vdfs4_get_table(sbi, inode->i_ino);
 	version = cpu_to_le64((((__le64)(table[table_index].mount_count))
 			<< 32) | table[table_index].sync_count);
-	up_write(&sbi->snapshot_info->tables_lock);
+	up_read(&sbi->snapshot_info->tables_lock);
 	return version;
 }
 /**
@@ -793,7 +941,8 @@ static void fill_descriptor_and_calculate_crc(struct vdfs4_sb_info *sbi,
 		struct vdfs4_base_table *base_table = table;
 		__u64 last_table_index;
 
-		memcpy((void *)&descriptor->signature, VDFS4_SNAPSHOT_BASE_TABLE,
+		memcpy((void *)&descriptor->signature,
+				VDFS4_SNAPSHOT_BASE_TABLE,
 				sizeof(VDFS4_SNAPSHOT_BASE_TABLE) - 1);
 
 		base_table->descriptor.checksum_offset = 0;
@@ -819,7 +968,7 @@ static void fill_descriptor_and_calculate_crc(struct vdfs4_sb_info *sbi,
 				sizeof(struct vdfs4_extended_record) *
 				le32_to_cpu(ext_table->records_count);
 	} else
-		VDFS4_BUG();
+		VDFS4_BUG(sbi);
 
 	descriptor->mount_count = exsb->mount_counter;
 	descriptor->sync_count = cpu_to_le32(snapshot->sync_count);
@@ -847,11 +996,10 @@ int vdfs4_update_translation_tables(struct vdfs4_sb_info *sbi)
 	__u64 table_size;
 	sector_t iblock = snapshot->iblock, s_iblock = 0;
 	int ret = 0;
-#ifdef CONFIG_VDFS4_STATISTIC
-	sector_t sectors_count;
-#endif
+	int retry_count = 3;
 	enum snapshot_table_type type;
 
+	down_read(&sbi->snapshot_info->tables_lock);
 	if (snapshot->exteneded_table_count >= VDFS4_SNAPSHOT_TABLES_COUNT ||
 			snapshot->use_base_table) {
 		struct vdfs4_layout_sb *vdfs4_sb = sbi->raw_superblock;
@@ -872,31 +1020,43 @@ int vdfs4_update_translation_tables(struct vdfs4_sb_info *sbi)
 	fill_descriptor_and_calculate_crc(sbi, table, type);
 	descriptor = (struct vdfs4_snapshot_descriptor *)table;
 	table_size = le64_to_cpu(descriptor->checksum_offset) + CRC32_SIZE;
-#ifdef CONFIG_VDFS4_STATISTIC
-	sectors_count = (DIV_ROUND_UP(table_size, SECTOR_SIZE));
-#endif
-	BUG_ON((table_size > PAGE_SIZE) && (type != SNAPSHOT_BASE_TABLE));
+	VDFS4_BUG_ON((table_size > PAGE_SIZE) &&
+			(type != SNAPSHOT_BASE_TABLE), sbi);
 
 	if (table_size > PAGE_SIZE && type == SNAPSHOT_BASE_TABLE) {
 		s_iblock = iblock + 1;
+
+retry_basetable_write:
 		ret = vdfs4_table_IO(sbi, (char *)table + PAGE_SIZE,
-			table_size - PAGE_SIZE, WRITE_FLUSH_FUA, &s_iblock);
-		if (ret)
-			return ret;
+			table_size - PAGE_SIZE,
+			WRITE_FLUSH_FUA | REQ_META | REQ_PRIO, &s_iblock);
+		if (ret) {
+			if (--retry_count >= 0) {
+				VDFS4_WARNING("commit basetable failed. retry(%d)",
+						retry_count);
+				goto retry_basetable_write;
+			}
+			goto out;
+		}
 	}
-	ret = vdfs4_table_IO(sbi, table, PAGE_SIZE, WRITE_FLUSH_FUA,
-			&iblock);
-	if (ret)
-		return ret;
+
+retry_transtable_write:
+	ret = vdfs4_table_IO(sbi, table, PAGE_SIZE,
+			WRITE_FLUSH_FUA | REQ_META | REQ_PRIO, &iblock);
+	if (ret) {
+		if (--retry_count >= 0) {
+			VDFS4_WARNING("commit translation table failed. retry(%d)",
+				      retry_count);
+			goto retry_transtable_write;
+		}
+		goto out;
+	}
 
 	snapshot->iblock = s_iblock ? s_iblock : iblock;
-	snapshot->sync_count++;
 	snapshot->dirty_pages_count = 0;
 	memset(snapshot->extended_table, 0x0, PAGE_SIZE);
-#ifdef CONFIG_VDFS4_STATISTIC
-	sbi->umount_written_bytes += ((DIV_ROUND_UP(table_size, SECTOR_SIZE))
-			<< SECTOR_SIZE_SHIFT);
-#endif
+out:
+	up_read(&sbi->snapshot_info->tables_lock);
 	return ret;
 }
 
@@ -907,14 +1067,45 @@ void vdfs4_update_bitmaps(struct vdfs4_sb_info *sbi)
 	unsigned long *moved_iblock = snapshot->moved_iblock;
 	unsigned long *snapshot_bitmap = snapshot->snapshot_bitmap;
 	unsigned long *next_snapshot_bitmap = snapshot->next_snapshot_bitmap;
-	int nbits = (int)snapshot->bitmap_size_in_bits;
+	unsigned int nbits = snapshot->bitmap_size_in_bits;
 
 #ifdef CONFIG_VDFS4_DEBUG
 	/* moved iblock bitmap must be empty after metadata updating */
-	BUG_ON(!bitmap_empty(moved_iblock, nbits));
+	VDFS4_BUG_ON(!bitmap_empty(moved_iblock, nbits), sbi);
 #endif
 	bitmap_zero(moved_iblock, nbits);
 	bitmap_copy(snapshot_bitmap, next_snapshot_bitmap, nbits);
+}
+
+static inline __u32 align_to_power_of_two(__u32 value)
+{
+	unsigned int pow2_align;
+
+	pow2_align = __fls(value);
+	if (value != (1 << pow2_align))
+		pow2_align++;
+	return (1 << pow2_align);
+}
+
+static __u32 get_minimal_meta_expand_step(struct vdfs4_sb_info *sbi)
+{
+	/* minimal snapshot area size =
+	 * 4 btree 2 *(catalog, extents, hlins and xattr) * bnode_size +
+	 * 3 bimaps (free space, inode id and small files) * block_size)
+	 */
+	 /* This is kept for compatibility only, there is no such
+	 things as 'hlins tree' or small files bitmap anymore. */
+	__u32 minimal_expand_step = 2 * (3 * (1lu <<
+		sbi->log_super_page_size) + 2 * sbi->block_size);
+	__u32 blocks_per_superpage = 1lu << (sbi->log_super_page_size -
+					sbi->log_block_size);
+
+	minimal_expand_step >>= sbi->log_block_size;
+	/* allign to superpage size */
+	minimal_expand_step += blocks_per_superpage -
+			(minimal_expand_step & (blocks_per_superpage - 1));
+
+	return align_to_power_of_two(minimal_expand_step);
 }
 
 /**
@@ -924,30 +1115,31 @@ void vdfs4_update_bitmaps(struct vdfs4_sb_info *sbi)
  */
 static __u32 calculate_expand_step(struct vdfs4_sb_info *sbi)
 {
-	/* minimal snapshot area size =
-	 * 4 btree 2 *(catalog, extents, hlins and xattr) * bnode_size +
-	 * 3 bimaps (free space, inode id and small files) * block_size)
-	 */
 	loff_t volume_size = sbi->sb->s_bdev->bd_inode->i_size;
-	__u32 minimal_expand_step = 2 * (4 * (1lu <<
-		sbi->log_super_page_size) + 3 * sbi->block_size);
+	__u32 minimal_expand_step = get_minimal_meta_expand_step(sbi);
 	__u32 expand_step;
 	char is_volume_small;
-	__u32 blocks_per_superpage = 1lu << (sbi->log_super_page_size -
-					sbi->log_block_size);
+
 	volume_size >>= 5;
-	is_volume_small = (minimal_expand_step > volume_size) ?
-			1 : 0;
-	minimal_expand_step >>= sbi->log_block_size;
+	is_volume_small = ((minimal_expand_step << sbi->log_block_size) >
+			volume_size) ? 1 : 0;
 
-	/* allign to superpage size */
-	minimal_expand_step += blocks_per_superpage -
-			(minimal_expand_step & (blocks_per_superpage - 1));
-
-	expand_step = (is_volume_small) ? minimal_expand_step :
-		(1lu << (sbi->log_erase_block_size - sbi->log_block_size));
-	expand_step = expand_step << 1;
-
+	if (is_volume_small)
+		expand_step = minimal_expand_step << 1;
+	else {
+		/* Expand step is now related with free block size. It should be
+		high enough that filling partition with directories only is
+		possible. Additionally this will help with fragmentation
+		issues - expansion will be done less often, so chance to
+		allocate whole desired chunk is higher */
+		expand_step =
+			((__u32)sbi->free_blocks_count / VDFS4_META_BTREE_EXTENTS);
+		/* never go below minimum (for relatively small volumes) */
+		expand_step = MAX(expand_step, minimal_expand_step << 2);
+		/* Expand step must be power of 2, due to fsm hash table
+		implementation. */
+		expand_step = align_to_power_of_two(expand_step);
+	}
 	return expand_step;
 }
 
@@ -962,11 +1154,12 @@ static __u32 calculate_expand_step(struct vdfs4_sb_info *sbi)
  * @return		Returns 0 on success, errno on failure.
  */
 static int expand_area(struct vdfs4_sb_info *sbi, struct vdfs4_extent *extents,
-		unsigned int extents_count, unsigned int expand_block_count,
-		__le32 *tbc)
+		unsigned int extents_count, unsigned int min_expand_blk_count,
+		unsigned int max_expand_blk_count, __le32 *tbc)
 {
 	unsigned int count;
 	__u64 start_offset;
+	unsigned int expand_block_count = max_expand_blk_count;
 
 	/* lookup for last used extent */
 	for (count = 0; count < extents_count; count++) {
@@ -975,14 +1168,14 @@ static int expand_area(struct vdfs4_sb_info *sbi, struct vdfs4_extent *extents,
 		extents++;
 	}
 	if (count >= extents_count)
-		return -EINVAL;
+		return -ENOSPC;
 
 	extents--;
 	start_offset = le64_to_cpu(extents->begin) +
 			le32_to_cpu(extents->length);
 
 	start_offset = vdfs4_fsm_get_free_block(sbi, start_offset,
-			&expand_block_count,
+			&expand_block_count, min_expand_blk_count,
 			VDFS4_FSM_ALLOC_ALIGNED | VDFS4_FSM_ALLOC_METADATA);
 
 	if (!start_offset)
@@ -1000,22 +1193,22 @@ static int expand_area(struct vdfs4_sb_info *sbi, struct vdfs4_extent *extents,
 	*tbc = cpu_to_le32(le32_to_cpu(*tbc) + expand_block_count);
 
 	return 0;
-
 }
 
 static void insert_new_iblocks(struct vdfs4_sb_info *sbi, ino_t ino_n,
 		sector_t new_last_table_index)
 {
 	void *dest, *src;
-	unsigned long size;
+	unsigned long size, new_position;
 	struct vdfs4_snapshot_info *snapshot = sbi->snapshot_info;
 	struct vdfs4_base_table *base_table = snapshot->base_t;
 	struct vdfs4_base_table_record *table = vdfs4_get_table(sbi, ino_n);
 	__u64 last_table_index = VDFS4_LAST_TABLE_INDEX(sbi, ino_n), offset;
 	__u64 count, add_size;
 	struct vdfs4_layout_sb *vdfs4_sb = sbi->raw_superblock;
+	int ret;
 
-	BUG_ON(last_table_index > new_last_table_index);
+	VDFS4_BUG_ON(last_table_index > new_last_table_index, sbi);
 
 	add_size =  sizeof(struct vdfs4_base_table_record) *
 		(new_last_table_index - last_table_index);
@@ -1046,8 +1239,12 @@ static void insert_new_iblocks(struct vdfs4_sb_info *sbi, ino_t ino_n,
 
 	for (count = last_table_index + 1; count <= new_last_table_index;
 			count++) {
-		table[count].meta_iblock =
-				cpu_to_le64(get_new_meta_iblock(sbi, ino_n));
+		ret = get_new_meta_iblock(sbi, ino_n, &new_position);
+		/* get_new_meta_iblock() cannot return error here,
+		because earlier we checked that there is enough
+		space (expand_special_file) */
+		VDFS4_BUG_ON(ret, sbi);
+		table[count].meta_iblock = cpu_to_le64((__u64)new_position);
 		table[count].mount_count = vdfs4_sb->exsb.mount_counter;
 		table[count].sync_count = snapshot->sync_count;
 	}
@@ -1061,7 +1258,6 @@ static void insert_new_iblocks(struct vdfs4_sb_info *sbi, ino_t ino_n,
 	else
 		snapshot->dirty_pages_count += (unsigned)(new_last_table_index -
 				last_table_index);
-
 }
 
 static int expand_translation_tables(struct vdfs4_sb_info *sbi, ino_t ino_n,
@@ -1143,16 +1339,16 @@ static int expand_special_file(struct vdfs4_sb_info *sbi, ino_t ino_n,
 		__u64 new_table_index, int force_insert)
 {
 	struct vdfs4_layout_sb *vdfs4_sb = sbi->raw_superblock;
+	unsigned long *snapshot_bitmap = sbi->snapshot_info->snapshot_bitmap;
 	__u32 meta_tbc = le32_to_cpu(vdfs4_sb->exsb.meta_tbc);
 	__u32 new_blocks_count;
 	__u64 last_table_index = VDFS4_LAST_TABLE_INDEX(sbi, ino_n);
 	long free_blocks;
-	int ret = 0, count;
+	int ret = 0;
 
 	if (new_table_index <= last_table_index)
 		return -EINVAL;
 
-	free_blocks = (long)meta_tbc;
 	new_blocks_count = (__u32)(new_table_index - last_table_index);
 
 	if (is_tree(ino_n))
@@ -1161,25 +1357,54 @@ static int expand_special_file(struct vdfs4_sb_info *sbi, ino_t ino_n,
 	else
 		new_blocks_count *= (__u32)(1 << sbi->log_blocks_in_page);
 
-	for (count = VDFS4_FSFILE; count <= VDFS4_LSFILE; count++) {
-		last_table_index = (__u64)VDFS4_LAST_TABLE_INDEX(sbi, count);
-		free_blocks -= (long)(1 << (sbi->log_blocks_in_page +
-				sbi->log_blocks_in_leb)) *
-				(long)(last_table_index + 1);
-	}
+	/* Calculate free meta space. Firstly by using
+	fast, but sometimes inaccurate method - it does
+	not take into account moved iblocks (modification) */
+	free_blocks = meta_area_free_blocks(sbi);
 
-	if ((free_blocks - (long)new_blocks_count) < ((long)meta_tbc >> 1)) {
+	if ((free_blocks - (long)new_blocks_count) < ((long)meta_tbc / 3 )) {
 		ret = expand_area(sbi, &vdfs4_sb->exsb.meta[0],
 				VDFS4_META_BTREE_EXTENTS,
+				get_minimal_meta_expand_step(sbi),
 				calculate_expand_step(sbi),
 				&vdfs4_sb->exsb.meta_tbc);
 		if (ret) {
-			if (!force_insert)
+			unsigned int contig_avail = 0;
+			/* Need to calculate real free space to make sure
+			we are not allocating more than actually available -
+			including moved iblocks. Can be time-consuming */
+			free_blocks = free_blocks_in_bitmap_contig_check(
+				snapshot_bitmap, sbi->snapshot_info->bitmap_size_in_bits,
+				new_blocks_count, &contig_avail);
+
+			if (!force_insert &&
+				/* Even if expanding failed, we might have enough
+				space remaining to do requested operation. We will try
+				expanding on the next occasion again (hoping that
+				some space	is eventually freed).
+				We could modify this condition as '<0'. But if we do this,
+				during every metadata modification move_iblock will fail to
+				find new location for Copy-on-Write and during every
+				change in metadata we will be overwriting old location.
+				This can cause problems with flash wearing off at some block.
+				move_iblock can fail, becase free space is also limited by
+				number of changes in metadata before sync. If we have 40
+				free blocks for metadata and we do 10 modifications, then
+				there will be no space (both old location and new location is
+				marked as taken). After sync we will once again have 40
+				free blocks, but before sync there will be none.
+				10*minimal is some arbitrary value (pretty high) that will
+				disallow adding new metadata objects, so that modification
+				of already existing ones has much higher chance to succeed
+				using standard Copy-on-Write technique.	*/
+				((free_blocks - (long)new_blocks_count) <
+						10*get_minimal_meta_expand_step(sbi)))
 				return ret;
-			else
-				ret = 0;
-		} else
+			else if (!contig_avail)
+				return -ENOSPC;
+		} else {
 			set_sbi_flag(sbi, EXSB_DIRTY);
+		}
 	}
 
 	ret = expand_translation_tables(sbi, ino_n, new_table_index);
@@ -1240,14 +1465,14 @@ int vdfs4_is_enospc(struct vdfs4_sb_info *sbi, int threshold)
 	ttb = le32_to_cpu(vdfs_sb->exsb.meta_tbc);
 
 	free_blocks = meta_area_free_blocks(sbi);
-	if (free_blocks > (ttb >> 1)) {
+	if (free_blocks > (ttb / 3)) {
 		up_read(&snapshot->tables_lock);
 		return 0;
 	}
 	free_to_use = free_blocks_in_bitmap(snapshot_bitmap,
 			sbi->snapshot_info->bitmap_size_in_bits);
 
-	threshold_in_blocks = ttb /100;
+	threshold_in_blocks = ttb / 100;
 	threshold_in_blocks *= threshold;
 
 	up_read(&snapshot->tables_lock);
@@ -1266,19 +1491,29 @@ int vdfs4_check_meta_space(struct vdfs4_sb_info *sbi)
 	free_blocks = meta_area_free_blocks(sbi);
 	up_read(&snapshot->tables_lock);
 
-	if (free_blocks > (ttb >> 1))
+	if (free_blocks > (ttb / 3))
 		return 0;
 
 	down_write(&snapshot->tables_lock);
 	ret = expand_area(sbi, &vdfs_sb->exsb.meta[0],
 				VDFS4_META_BTREE_EXTENTS,
+				get_minimal_meta_expand_step(sbi),
 				calculate_expand_step(sbi),
 				&vdfs_sb->exsb.meta_tbc);
 	if (!ret)
 		set_sbi_flag(sbi, EXSB_DIRTY);
 
 	up_write(&snapshot->tables_lock);
-	return ret;
+	/* If expand_area fails here, this means that all
+	metadata extents are already taken or there is
+	not enough contigous free space to make it.
+	This function is just to make sure metadata area
+	is expanded early to	acquire as big chunk as possible.
+	'No space' case will be handled during actual
+	metadata write (expand_special_file).
+	Don't return error during write because metadata
+	expansion failed. */
+	return 0;
 }
 
 int vdfs4_get_meta_iblock(struct vdfs4_sb_info *sbi, ino_t ino_n,
@@ -1310,5 +1545,3 @@ loff_t vdfs4_special_file_size(struct vdfs4_sb_info *sbi, ino_t ino_n)
 
 	return size;
 }
-
-

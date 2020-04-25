@@ -116,7 +116,6 @@ bool vdfs4_cattree_is_orphan(struct vdfs4_cattree_record *record)
 	switch (record->key->record_type) {
 	case VDFS4_CATALOG_FOLDER_RECORD:
 	case VDFS4_CATALOG_FILE_RECORD:
-	case VDFS4_CATALOG_DLINK_RECORD:
 		return (le32_to_cpu(val->flags) & (1<<ORPHAN_INODE)) != 0;
 	default:
 		return false;
@@ -134,11 +133,11 @@ static int temp_fill_record(struct vdfs4_bnode *bnode, int pos,
 	rec_info->rec_pos.pos = pos;
 	record->key = vdfs4_get_btree_record(bnode, pos);
 
-	BUG_ON(!record->key);
+	VDFS4_BUG_ON(!record->key, bnode->host->sbi);
 	if (IS_ERR(record->key)) {
 		kfree(record);
 		VDFS4_ERR("unable to get record");
-		VDFS4_BUG();
+		VDFS4_BUG(bnode->host->sbi);
 	}
 
 
@@ -300,14 +299,11 @@ struct vdfs4_cattree_key *vdfs4_alloc_cattree_key(int name_len,
 	case VDFS4_CATALOG_HLINK_RECORD:
 		record_len = sizeof(struct vdfs4_catalog_hlink_record);
 	break;
-	case VDFS4_CATALOG_DLINK_RECORD:
-		record_len = sizeof(struct vdfs4_catalog_dlink_record);
-	break;
 	case VDFS4_CATALOG_ILINK_RECORD:
 		record_len = 0;
 	break;
 	default:
-		VDFS4_BUG();
+		VDFS4_BUG(NULL);
 	}
 
 	form_key = kzalloc(key_len + record_len, GFP_NOFS);
@@ -365,7 +361,7 @@ struct vdfs4_cattree_record *vdfs4_cattree_place_record(
 			(unsigned)len);
 	record = (struct vdfs4_cattree_record *)
 		vdfs4_btree_place_data(tree, &key->gen_key);
-	if(IS_ERR(record))
+	if (IS_ERR(record))
 		vdfs4_cattree_remove_ilink(tree, object_id, parent_id, name,
 						len);
 
@@ -451,7 +447,7 @@ int vdfs4_cattree_get_next_record(struct vdfs4_cattree_record *record)
 	raw_record = __vdfs4_get_next_btree_record(&bnode, &pos);
 
 	/* Ret value have to be pointer, or error, not null */
-	BUG_ON(!raw_record);
+	VDFS4_BUG_ON(!raw_record, bnode->host->sbi);
 	if (IS_ERR(raw_record))
 		return PTR_ERR(raw_record);
 

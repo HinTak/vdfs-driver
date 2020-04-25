@@ -24,12 +24,6 @@
 
 #include "vdfs4_layout.h"
 
-/* #define CONFIG_VDFS4_DEBUG_GET_BNODE */
-
-#ifdef CONFIG_VDFS4_DEBUG_GET_BNODE
-#include <linux/stacktrace.h>
-#endif
-
 #define VDFS4_BNODE_DSCR(bnode) ((struct vdfs4_gen_node_descr *) \
 		(bnode)->data)
 
@@ -51,8 +45,6 @@
  * with neighborhood */
 #define VDFS4_BNODE_MERGE_LIMIT	(0.7)
 
-#define VDFS4_GET_BNODE_STACK_ITEMS 20
-
 #define VDFS4_WAIT_BNODE_UNLOCK 1
 #define VDFS4_NOWAIT_BNODE_UNLOCK 0
 
@@ -67,6 +59,7 @@
 static inline void *get_value_pointer(void *key_ptr)
 {
 	struct vdfs4_cattree_key *key = key_ptr;
+
 	if (key->gen_key.key_len > VDFS4_MAX_BTREE_KEY_LEN)
 		return ERR_PTR(-EINVAL);
 	else
@@ -112,15 +105,6 @@ enum vdfs4_btree_type {
 typedef int (vdfs4_btree_key_cmp)(struct vdfs4_generic_key *,
 		struct vdfs4_generic_key *);
 
-#ifdef CONFIG_VDFS4_DEBUG_GET_BNODE
-struct vdfs4_get_bnode_trace {
-	unsigned long stack_entries[VDFS4_GET_BNODE_STACK_ITEMS];
-	int mode;
-	struct stack_trace trace;
-	struct list_head list;
-};
-#endif
-
 /**
  * @brief	Structure contains information about bnode in runtime.
  */
@@ -141,11 +125,6 @@ struct vdfs4_bnode {
 
 	/* under btree->hash_lock */
 	int ref_count;
-
-#ifdef CONFIG_VDFS4_DEBUG_GET_BNODE
-	/* under btree->hash_lock */
-	struct list_head get_traces_list;
-#endif
 
 	/**
 	 * Array of pointers to struct page representing pages in
@@ -277,8 +256,8 @@ void vdfs4_put_bnode(struct vdfs4_bnode *bnode);
 struct vdfs4_bnode *vdfs4_get_bnode(struct vdfs4_btree *btree,
 	__u32 node_id, enum vdfs4_get_bnode_mode mode, int wait);
 /* Temporal stubs */
-#define __vdfs4_get_bnode(btree, node_id, mode) vdfs4_get_bnode(btree, node_id, \
-		mode, VDFS4_WAIT_BNODE_UNLOCK)
+#define __vdfs4_get_bnode(btree, node_id, mode) \
+		vdfs4_get_bnode(btree, node_id, mode, VDFS4_WAIT_BNODE_UNLOCK)
 #define vdfs4_put_bnode(bnode) vdfs4_put_bnode(bnode)
 
 int vdfs4_destroy_bnode(struct vdfs4_bnode *bnode);
@@ -301,7 +280,6 @@ void test_init_new_node_descr(struct vdfs4_bnode *bnode,
 
 int vdfs4_init_btree_caches(void);
 void vdfs4_destroy_btree_caches(void);
-int vdfs4_check_btree_slub_caches_empty(void);
 
 int vdfs4_check_btree_links(struct vdfs4_btree *btree, int *dang_num);
 int vdfs4_check_btree_records_order(struct vdfs4_btree *btree);
@@ -309,7 +287,7 @@ int vdfs4_check_btree_records_order(struct vdfs4_btree *btree);
 
 void vdfs4_init_new_node_descr(struct vdfs4_bnode *bnode,
 		enum vdfs4_node_type type);
-void vdfs4_dump_panic_remount(struct vdfs4_bnode *bnode,
+void vdfs4_dump_panic_remount(struct vdfs4_bnode *bnode, uint32_t err_type,
 		const char *fmt, ...);
 int vdfs4_check_and_sign_dirty_bnodes(struct page **page,
 		struct vdfs4_btree *btree, __u64 version);

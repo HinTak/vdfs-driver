@@ -26,6 +26,7 @@
 
 #include "vdfs4.h"
 #include "xattrtree.h"
+#include <linux/vdfs_trace.h>	/* FlashFS : vdfs-trace */
 
 char *vdfs4_xattr_prefixes[] = {
 	XATTR_USER_PREFIX,
@@ -51,8 +52,6 @@ static int check_xattr_prefix(const char *name)
 	return ret;
 }
 
-/* Now this function is not used in the utilities. Hide under ifdef to avoid
- * build warnings */
 static int xattrtree_insert(struct vdfs4_btree *tree, u64 object_id,
 		const char *name, size_t val_len, const void *value)
 {
@@ -88,9 +87,9 @@ static int xattrtree_insert(struct vdfs4_btree *tree, u64 object_id,
 	key->name_len = (__u8)name_len;
 
 	/* Save preceding length byte */
-	*(unsigned char *)get_value_pointer(key) = val_len;
+	*(unsigned char *)get_value_pointer(key) = (unsigned char)val_len;
 	/* Copy value excluding length byte  */
-	memcpy(get_value_pointer(key) + 1, value, val_len);
+	memcpy((void *)((char *)get_value_pointer(key) + 1), value, val_len);
 
 	ret = vdfs4_btree_insert(tree, insert_data, 0);
 	kfree(insert_data);
@@ -237,7 +236,6 @@ err_exit:
 }
 
 #ifdef CONFIG_VDFS4_POSIX_ACL
-
 struct posix_acl *vdfs4_get_acl(struct inode *inode, int type)
 {
 	struct vdfs4_sb_info *sbi = VDFS4_SB(inode->i_sb);
@@ -246,21 +244,18 @@ struct posix_acl *vdfs4_get_acl(struct inode *inode, int type)
 	const char *name;
 	size_t size;
 
-	acl = get_cached_acl(inode, type);
-	if (acl != ACL_NOT_CACHED)
-		return acl;
-
 	switch (type) {
-		case ACL_TYPE_ACCESS:
-			name = POSIX_ACL_XATTR_ACCESS;
-			break;
-		case ACL_TYPE_DEFAULT:
-			name = POSIX_ACL_XATTR_DEFAULT;
-			break;
-		default:
-			return ERR_PTR(-EINVAL);
+	case ACL_TYPE_ACCESS:
+		name = POSIX_ACL_XATTR_ACCESS;
+		break;
+	case ACL_TYPE_DEFAULT:
+		name = POSIX_ACL_XATTR_DEFAULT;
+		break;
+	default:
+		return ERR_PTR(-EINVAL);
 	}
 
+	/* FIXME : vdfs_trace_iops_get_acl */
 	mutex_r_lock(sbi->xattr_tree->rw_tree_lock);
 	record = vdfs4_xattrtree_find(sbi->xattr_tree, inode->i_ino,
 				     name, VDFS4_BNODE_MODE_RO);
@@ -269,9 +264,17 @@ struct posix_acl *vdfs4_get_acl(struct inode *inode, int type)
 	} else if (IS_ERR(record)) {
 		acl = ERR_CAST(record);
 	} else {
-		size = le32_to_cpu(record->key->gen_key.record_len) -
-			le32_to_cpu(record->key->gen_key.key_len);
-		acl = posix_acl_from_xattr(&init_user_ns, record->val, size);
+		/*
+		 * Consider that value has preceding one byte of length.
+		 * See the xattrtree_insert function
+		 */
+		void *value = (unsigned char *)record->val + 1;
+		size = *(unsigned char *)record->val;
+
+		/* size = le32_to_cpu(record->key->gen_key.record_len) -
+			le32_to_cpu(record->key->gen_key.key_len); */
+
+		acl = posix_acl_from_xattr(&init_user_ns, value, size);
 		vdfs4_release_record((struct vdfs4_btree_gen_record *) record);
 	}
 	mutex_r_unlock(sbi->xattr_tree->rw_tree_lock);
@@ -282,7 +285,7 @@ struct posix_acl *vdfs4_get_acl(struct inode *inode, int type)
 	return acl;
 }
 
-static int vdfs4_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+int vdfs4_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 {
 	struct vdfs4_sb_info *sbi = VDFS4_SB(inode->i_sb);
 	const char *name;
@@ -291,14 +294,21 @@ static int vdfs4_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 	int ret;
 
 	switch (type) {
-		case ACL_TYPE_ACCESS:
-			name = POSIX_ACL_XATTR_ACCESS;
-			break;
-		case ACL_TYPE_DEFAULT:
-			name = POSIX_ACL_XATTR_DEFAULT;
-			break;
-		default:
-			return -EINVAL;
+	case ACL_TYPE_ACCESS:
+		name = POSIX_ACL_XATTR_ACCESS;
+		if (acl) {
+			ret = posix_acl_equiv_mode(acl, &inode->i_mode);
+			if (ret < 0)
+				return ret;
+		}
+		break;
+	case ACL_TYPE_DEFAULT:
+		name = POSIX_ACL_XATTR_DEFAULT;
+		if (!S_ISDIR(inode->i_mode))
+			return acl ? -EACCES : 0;
+		break;
+	default:
+		return -EINVAL;
 	}
 
 	if (acl) {
@@ -379,55 +389,26 @@ static int vdfs4_set_acl_xattr(struct inode *inode, int type,
 
 int vdfs4_init_acl(struct inode *inode, struct inode *dir)
 {
-	struct posix_acl *acl = NULL;
-	int ret = 0;
+	struct posix_acl *default_acl = NULL, *acl = NULL;
+	int error;
 
-	if (S_ISLNK(inode->i_mode))
-		goto out;
-	if (IS_POSIXACL(dir)) {
-		acl = vdfs4_get_acl(dir, ACL_TYPE_DEFAULT);
-		if (IS_ERR(acl))
-			return PTR_ERR(acl);
+	error = posix_acl_create(dir, &inode->i_mode, &default_acl, &acl);
+	if (error)
+		return error;
+
+	if (default_acl) {
+		error = vdfs4_set_acl(inode, default_acl, ACL_TYPE_DEFAULT);
+		posix_acl_release(default_acl);
 	}
 	if (acl) {
-		if (S_ISDIR(inode->i_mode)) {
-			ret = vdfs4_set_acl(inode, acl, ACL_TYPE_DEFAULT);
-			if (ret)
-				goto out;
-		}
-		ret = posix_acl_create(&acl, GFP_NOFS, &inode->i_mode);
-		if (ret < 0)
-			goto out;
-		if (ret > 0)
-			ret = vdfs4_set_acl(inode, acl, ACL_TYPE_ACCESS);
-	} else {
-		inode->i_mode &= (umode_t)~current_umask();
+		if (!error)
+			error = vdfs4_set_acl(inode, acl, ACL_TYPE_ACCESS);
+		posix_acl_release(acl);
 	}
-out:
-	posix_acl_release(acl);
-	return ret;
-}
-
-int vdfs4_chmod_acl(struct inode *inode)
-{
-	struct posix_acl *acl;
-	int ret;
-
-	if (S_ISLNK(inode->i_mode) || !IS_POSIXACL(inode))
-		return 0;
-	acl = vdfs4_get_acl(inode, ACL_TYPE_ACCESS);
-	if (IS_ERR_OR_NULL(acl))
-		return PTR_ERR(acl);
-	ret = posix_acl_chmod(&acl, GFP_NOFS, inode->i_mode);
-	if (ret)
-		return ret;
-	ret = vdfs4_set_acl(inode, acl, ACL_TYPE_ACCESS);
-	posix_acl_release(acl);
-	return ret;
+	return error;
 }
 
 #else
-
 static int vdfs4_get_acl_xattr(struct inode *inode, int type,
 				void *buffer, size_t size)
 {
@@ -439,7 +420,6 @@ static int vdfs4_set_acl_xattr(struct inode *inode, int type,
 {
 	return -EOPNOTSUPP;
 }
-
 #endif /* CONFIG_VDFS4_POSIX_ACL */
 
 int vdfs4_xattrtree_remove_all(struct vdfs4_btree *tree, u64 object_id)
@@ -490,6 +470,8 @@ int vdfs4_setxattr(struct dentry *dentry, const char *name, const void *value,
 	struct inode *inode = dentry->d_inode;
 	struct vdfs4_sb_info *sbi = VDFS4_SB(inode->i_sb);
 
+	VT_PREPARE_PARAM(vt_data);
+
 	if (name == NULL)
 		return -EINVAL;
 
@@ -506,6 +488,7 @@ int vdfs4_setxattr(struct dentry *dentry, const char *name, const void *value,
 	if (!strcmp(name, POSIX_ACL_XATTR_ACCESS))
 		return vdfs4_set_acl_xattr(inode, ACL_TYPE_ACCESS, value, size);
 
+	VT_IOPS_START(vt_data, vdfs_trace_iops_setxattr, dentry);
 	vdfs4_start_transaction(sbi);
 	mutex_w_lock(sbi->xattr_tree->rw_tree_lock);
 
@@ -547,7 +530,7 @@ exit:
 		mark_inode_dirty(inode);
 	}
 	vdfs4_stop_transaction(sbi);
-
+	VT_FINISH(vt_data);
 	return ret;
 }
 
@@ -566,6 +549,8 @@ ssize_t vdfs4_getxattr(struct dentry *dentry, const char *name, void *buffer,
 	struct vdfs4_sb_info *sbi = sb->s_fs_info;
 	ssize_t size;
 	struct vdfs4_btree *btree;
+
+	VT_PREPARE_PARAM(vt_data);
 
 	if (strcmp(name, "") == 0)
 		return -EINVAL;
@@ -587,13 +572,14 @@ ssize_t vdfs4_getxattr(struct dentry *dentry, const char *name, void *buffer,
 	if (btree->btree_type != VDFS4_BTREE_INST_XATTR)
 		mutex_r_lock(btree->rw_tree_lock);
 
-
+	VT_IOPS_START(vt_data, vdfs_trace_iops_getxattr, dentry);
 	record = vdfs4_xattrtree_find(btree, get_disk_inode_no(inode), name,
 			VDFS4_BNODE_MODE_RO);
 
 	if (IS_ERR(record)) {
 		if (btree->btree_type != VDFS4_BTREE_INST_XATTR)
 			mutex_r_unlock(btree->rw_tree_lock);
+		VT_FINISH(vt_data);
 		return PTR_ERR(record);
 	}
 
@@ -612,6 +598,7 @@ exit:
 	vdfs4_release_record((struct vdfs4_btree_gen_record *) record);
 	if (btree->btree_type != VDFS4_BTREE_INST_XATTR)
 		mutex_r_unlock(btree->rw_tree_lock);
+	VT_FINISH(vt_data);
 	return size;
 }
 
@@ -621,10 +608,12 @@ int vdfs4_removexattr(struct dentry *dentry, const char *name)
 	struct inode *inode = dentry->d_inode;
 	struct vdfs4_sb_info *sbi = VDFS4_SB(inode->i_sb);
 	int ret = 0;
+
+	VT_PREPARE_PARAM(vt_data);
 	if (strcmp(name, "") == 0)
 		return -EINVAL;
 
-
+	VT_IOPS_START(vt_data, vdfs_trace_iops_removexattr, dentry);
 	vdfs4_start_transaction(sbi);
 	mutex_w_lock(sbi->xattr_tree->rw_tree_lock);
 
@@ -632,7 +621,7 @@ int vdfs4_removexattr(struct dentry *dentry, const char *name)
 
 	mutex_w_unlock(sbi->xattr_tree->rw_tree_lock);
 	vdfs4_stop_transaction(sbi);
-
+	VT_FINISH(vt_data);
 	return ret;
 }
 
@@ -647,18 +636,22 @@ ssize_t vdfs4_listxattr(struct dentry *dentry, char *buffer, size_t buf_size)
 	int ret = 0;
 	u64 disk_ino_no = get_disk_inode_no(inode);
 
+	VT_PREPARE_PARAM(vt_data);
+
 	btree = sbi->xattr_tree;
 	if (IS_ERR(btree))
 		return PTR_ERR(btree);
 
 	if (btree->btree_type != VDFS4_BTREE_INST_XATTR)
 		mutex_r_lock(btree->rw_tree_lock);
+	VT_IOPS_START(vt_data, vdfs_trace_iops_listxattr, dentry);
 	record = xattrtree_get_first_record(btree, disk_ino_no,
 			VDFS4_BNODE_MODE_RO);
 
 	if (IS_ERR(record)) {
 		if (btree->btree_type != VDFS4_BTREE_INST_XATTR)
 			mutex_r_unlock(btree->rw_tree_lock);
+		VT_FINISH(vt_data);
 		if (PTR_ERR(record) == -ENOENT)
 			return 0; /* no exteneded attributes */
 		else
@@ -691,7 +684,7 @@ ssize_t vdfs4_listxattr(struct dentry *dentry, char *buffer, size_t buf_size)
 	vdfs4_release_record((struct vdfs4_btree_gen_record *) record);
 	if (btree->btree_type != VDFS4_BTREE_INST_XATTR)
 		mutex_r_unlock(btree->rw_tree_lock);
-
+	VT_FINISH(vt_data);
 	return ret ? ret : size;
 }
 

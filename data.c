@@ -35,6 +35,7 @@
 
 #include "vdfs4.h"
 #include "debug.h"
+#include <linux/vdfs_trace.h>	/* FlashFS : vdfs-trace */
 
 #ifdef CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT
 #include <mach/hw_decompress.h>
@@ -127,7 +128,7 @@ static struct bio *__allocate_new_bio(struct block_device *bdev,
 
 	if (bio) {
 		bio->bi_bdev = bdev;
-		bio->bi_sector = first_sector;
+		bio->bi_iter.bi_sector = first_sector;
 	}
 
 	return bio;
@@ -155,6 +156,23 @@ int vdfs4_get_table_sector(struct vdfs4_sb_info *sbi, sector_t iblock,
 	return 0;
 }
 
+static void show_all_meta_extents(struct vdfs4_sb_info *sbi)
+{
+	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
+	struct vdfs4_extent *extents = &l_sb->exsb.meta[0];
+	int count;
+
+	for (count = 0; count < VDFS4_META_BTREE_EXTENTS; count++) {
+		if (!le64_to_cpu(extents->begin))
+			continue;
+
+		VDFS4_ERR("[%d] begin:%lld, length:%lld", count,
+				le64_to_cpu(extents->begin),
+				le64_to_cpu(extents->length));
+		extents++;
+	}
+}
+
 static int get_meta_block(struct vdfs4_sb_info *sbi, sector_t iblock,
 		sector_t *result, sector_t *length)
 {
@@ -177,6 +195,9 @@ static int get_meta_block(struct vdfs4_sb_info *sbi, sector_t iblock,
 		first_iblock = last_iblock;
 		extents++;
 	}
+
+	VDFS4_ERR("Fail to find matched one with %llu", iblock);
+	show_all_meta_extents(sbi);
 	return -EINVAL;
 }
 
@@ -208,15 +229,17 @@ static int get_block_meta_wrapper(struct inode *inode, pgoff_t page_idx,
 
 	switch (type) {
 	case VDFS4_META_READ:
-		BUG_ON((inode->i_ino < VDFS4_FSFILE) ||
-				(inode->i_ino > VDFS4_LSFILE));
-		/* need to protect against metadata translation table modification */
-		down_write(&sbi->snapshot_info->tables_lock);
+		VDFS4_BUG_ON((inode->i_ino < VDFS4_FSFILE) ||
+				(inode->i_ino > VDFS4_LSFILE), sbi);
+		/*
+			need to protect against metadata translation table
+			modification
+		*/
+		down_read(&sbi->snapshot_info->tables_lock);
 		ret = vdfs4_get_meta_iblock(sbi, inode->i_ino, page_idx,
 			&start_iblock);
-		if (ret)
-		{
-			up_write(&sbi->snapshot_info->tables_lock);
+		if (ret) {
+			up_read(&sbi->snapshot_info->tables_lock);
 			return ret;
 		}
 
@@ -233,8 +256,8 @@ static int get_block_meta_wrapper(struct inode *inode, pgoff_t page_idx,
 		}
 		*res_block = 0;
 		ret = get_meta_block(sbi, meta_iblock, res_block, &length);
-		up_write(&sbi->snapshot_info->tables_lock);
-		BUG_ON(*res_block == 0);
+		up_read(&sbi->snapshot_info->tables_lock);
+		VDFS4_BUG_ON(*res_block == 0, sbi);
 		break;
 	case VDFS4_PACKTREE_READ:
 		bh_result.b_blocknr = 0;
@@ -251,7 +274,7 @@ static int get_block_meta_wrapper(struct inode *inode, pgoff_t page_idx,
 		ret = vdfs4_get_block_file_based(inode, (pgoff_t)start_block +
 			(page_idx & ((1lu <<
 			(pgoff_t)((pgoff_t)VDFS4_I(inode)->fbc->log_chunk_size -
-			(pgoff_t)PAGE_SHIFT)) - 1lu)) , res_block);
+			(pgoff_t)PAGE_SHIFT)) - 1lu)), res_block);
 		break;
 	default:
 		return -EINVAL;
@@ -328,7 +351,7 @@ int vdfs4_table_IO(struct vdfs4_sb_info *sbi, void *buffer,
 
 			page = vmalloc_to_page((char *)buffer +
 					(submited_pages << PAGE_SHIFT));
-			BUG_ON(!page);
+			VDFS4_BUG_ON(!page, sbi);
 			lock_page(page);
 			size = bio_add_page(bio, page, PAGE_SIZE, 0);
 			if (!size && (!bio->bi_vcnt)) {
@@ -354,7 +377,7 @@ error_exit:
 
 	for (count = 0; count < submited_pages; count++) {
 		page = vmalloc_to_page((char *)buffer + (count << PAGE_SHIFT));
-		BUG_ON(!page);
+		VDFS4_BUG_ON(!page, sbi);
 		wait_on_page_locked(page);
 		if (TestClearPageError(page))
 			ret = -EIO;
@@ -367,10 +390,48 @@ error_exit:
 }
 
 /**
+ * @brief		Calculates count of pages needed for
+ *				chunk after decompression
+ * param [in]	inode Compressed file inode
+ * param [in]	comp_extent_id	Chunk index
+ * @return	int Page count
+ */
+static inline int vdfs4_chunk_page_count(struct inode *inode,
+		int comp_extent_idx)
+{
+	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
+	loff_t i_size;
+
+	VDFS4_BUG_ON(!inode_i->fbc, VDFS4_SB(inode->i_sb));
+	VDFS4_BUG_ON(comp_extent_idx >= inode_i->fbc->comp_extents_n,
+		VDFS4_SB(inode->i_sb));
+
+	/* size of all chunks except last one is
+	 * 1 << inode_i->fbc->log_chunk_size */
+	if (comp_extent_idx < (inode_i->fbc->comp_extents_n - 1))
+		goto log_chunk_size;
+
+	i_size = i_size_read(inode);
+	/* get size of last chunk */
+	i_size &= (loff_t)((1<<inode_i->fbc->log_chunk_size) - 1);
+
+	/* i_size is aligned to (1<<inode_i->fbc->log_chunk_size) */
+	if (!i_size)
+		goto log_chunk_size;
+
+	/* div round up by PAGE_SIZE */
+	return (i_size + PAGE_CACHE_SIZE-1) >> PAGE_CACHE_SHIFT;
+
+log_chunk_size:
+	return (1 << (inode_i->fbc->log_chunk_size - PAGE_CACHE_SHIFT));
+}
+
+/**
  * @brief			Read page from the given sector address.
  *				Fill the locked page with data located in the
  *				sector address. Read operation is synchronous,
  *				and caller must unlock the page.
+ *				Shall be used for sb/metadata only !
  * @param [in]	bdev		Pointer to block device.
  * @param [in]	page		Pointer to locked page.
  * @param [in]	sector_addr	Sector address.
@@ -389,9 +450,8 @@ int vdfs4_read_pages(struct block_device *bdev,
 
 	struct blk_plug plug;
 
-	if (pages_count > BIO_MAX_PAGES) {
-		/* the function supports only one */
-		VDFS4_ERR("to many pages to read");
+	if (pages_count > BIO_MAX_PAGES || pages_count == 0) {
+		VDFS4_ERR("wrong page_count to read : %d", pages_count);
 		return -EINVAL;
 	}
 
@@ -415,8 +475,8 @@ again:
 				PAGE_CACHE_SIZE, 0) < PAGE_CACHE_SIZE) {
 			if (bio->bi_vcnt) {
 				continue_load = 1;
-				sector_addr += (count << (PAGE_CACHE_SHIFT -
-						SECTOR_SIZE_SHIFT));
+				sector_addr += ((sector_t)count <<
+						(PAGE_CACHE_SHIFT - SECTOR_SIZE_SHIFT));
 			} else {
 				VDFS4_ERR("FAIL to add page to BIO");
 				bio_put(bio);
@@ -428,7 +488,7 @@ again:
 		}
 	}
 	bio->bi_private = &wait;
-	submit_bio(READ, bio);
+	submit_bio(READ | REQ_META | REQ_META, bio);
 	blk_finish_plug(&plug);
 
 	/* Synchronous read operation */
@@ -442,12 +502,12 @@ again:
 	return 0;
 }
 
-
 /**
  * @brief			Read page from the given sector address.
  *				Fill the locked page with data located in the
  *				sector address. Read operation is synchronous,
  *				and caller must unlock the page.
+ *				Shall be used for sb/metadata only !
  * @param [in]	bdev		Pointer to block device.
  * @param [in]	page		Pointer to locked page.
  * @param [in]	sector_addr	Sector address.
@@ -489,7 +549,7 @@ int vdfs4_read_page(struct block_device *bdev,
 		return -EFAULT;
 	}
 	bio->bi_private = &wait;
-	submit_bio(READ, bio);
+	submit_bio(READ | REQ_META | REQ_META, bio);
 	blk_finish_plug(&plug);
 
 	/* Synchronous read operation */
@@ -506,61 +566,60 @@ int vdfs4_read_page(struct block_device *bdev,
  *				Write the locked page to the sector address.
  *				Write operation is synchronous, and caller
  *				must unlock the page.
- * @param [in]	bdev		The eMMCFS superblock information.
- * @param [in]	page		Pointer to locked page.
- * @param [in]	sector_addr	Sector address.
- * @param [in]	sector_count	Number of sector to be written.
- * @param [out] written_bytes	Number of actually written bytes
+ *				Shall be used for sb/metadata only !
+ * @param [in]	sbi		The VDFS4 superblock information.
+ * @param [in]	dest_sector	Destination sector offset in the volume.
+ * @param [in]	src_page	Pointer to locked page.
+ * @param [in]	offset_in_page	Byte offset within the page.
+ * @param [in]	len		Data length in byte.
+ * @param [in]	is_sync		Synchronous mode
  * @return			Returns 0 on success, errno on failure.
  */
 int vdfs4_write_page(struct vdfs4_sb_info *sbi,
-			struct page *page,
-			sector_t sector_addr,
-			unsigned int sector_count,
-			unsigned int offset, int sync_mode)
+		     sector_t dest_sector, struct page *src_page,
+		     unsigned int offset_in_src, unsigned int len, int is_sync)
 {
 	struct bio *bio;
 	struct completion wait;
 	struct block_device *bdev = sbi->sb->s_bdev;
 	struct blk_plug plug;
 
-	if (sector_count > SECTOR_PER_PAGE) {
-		end_page_writeback(page);
+	if (PAGE_SIZE < offset_in_src + len) {
+		end_page_writeback(src_page);
 		return -EINVAL;
 	}
 
 	if (VDFS4_IS_READONLY(sbi->sb)) {
-		end_page_writeback(page);
+		end_page_writeback(src_page);
 		return 0;
 	}
 
 	/* Allocate a new bio */
-	bio = __allocate_new_bio(bdev, sector_addr, 1);
+	bio = __allocate_new_bio(bdev, dest_sector, 1);
 	if (IS_ERR_OR_NULL(bio)) {
-		end_page_writeback(page);
+		end_page_writeback(src_page);
 		return PTR_ERR(bio);
 	}
 
 	blk_start_plug(&plug);
-	if (sync_mode)
+	if (is_sync)
 		init_completion(&wait);
 
 	/* Initialize the bio */
 	bio->bi_end_io = end_io_write;
-	if ((unsigned) bio_add_page(bio, page, SECTOR_SIZE * sector_count,
-			offset) < SECTOR_SIZE * sector_count) {
+	if ((unsigned) bio_add_page(bio, src_page, len, offset_in_src) < len) {
 		VDFS4_ERR("FAIL to add page to BIO");
 		bio_put(bio);
 		blk_finish_plug(&plug);
-		end_page_writeback(page);
+		end_page_writeback(src_page);
 		return -EFAULT;
 	}
-	if (sync_mode)
+	if (is_sync)
 		bio->bi_private = &wait;
 
-	submit_bio(WRITE_FLUSH_FUA, bio);
+	submit_bio(WRITE_FLUSH_FUA | REQ_META | REQ_PRIO, bio);
 	blk_finish_plug(&plug);
-	if (sync_mode) {
+	if (is_sync) {
 		/* Synchronous write operation */
 		wait_for_completion(&wait);
 	}
@@ -580,18 +639,19 @@ static int vdfs4_check_and_sign_pages(struct page *page, char *magic,
 		unsigned int magic_len, __u64 version)
 {
 	void *data;
+
 	data = kmap(page);
 	if (!data) {
 		VDFS4_ERR("Can not allocate virtual memory");
 		return -ENOMEM;
 	}
-#if defined(CONFIG_VDFS4_META_SANITY_CHECK)
+#ifdef CONFIG_VDFS4_META_SANITY_CHECK
 	if (memcmp(data, magic, magic_len - VERSION_SIZE) !=
 					0) {
 		VDFS4_ERR(" invalide bitmap magic for %s,"
 			" %lu, actual = %s\n", magic,
 			page->mapping->host->i_ino, (char *)data);
-		BUG();
+		VDFS4_BUG(VDFS4_SB(page->mapping->host->i_sb));
 	}
 #endif
 	memcpy((char *)data + magic_len - VERSION_SIZE, &version, VERSION_SIZE);
@@ -607,7 +667,7 @@ static int vdfs4_validate_bitmap(struct page *page, void *buff,
 	struct vdfs4_sb_info *sbi = VDFS4_SB(page->mapping->host->i_sb);
 	__le64 real_version, version = vdfs4_get_page_version(sbi,
 			page->mapping->host, page->index);
-#ifdef CONFIG_VDFS4_CRC_CHECK
+#ifdef CONFIG_VDFS4_META_SANITY_CHECK
 	unsigned int crc;
 #endif
 	int ret_val = 0;
@@ -628,7 +688,7 @@ static int vdfs4_validate_bitmap(struct page *page, void *buff,
 	real_version = ((((__le64)(p_buff->mount_count)) << 32)
 			| p_buff->sync_count);
 	if (real_version != version) {
-		VDFS4_ERR("read bitmap %s from disk fail:version missmatch "
+		VDFS4_ERR("read bitmap %s from disk fail:version mismatch "
 				"iblock:%lu,"
 				"must be :%u.%u, "
 				"readed :%u.%u", magic,
@@ -641,47 +701,26 @@ static int vdfs4_validate_bitmap(struct page *page, void *buff,
 		destroy_layout(sbi);
 	}
 
-#ifdef CONFIG_VDFS4_CRC_CHECK
+#ifdef CONFIG_VDFS4_META_SANITY_CHECK
 	crc = cpu_to_le32(crc32(0, (char *)buff + magic_len, buff_size -
 			(CRC32_SIZE + magic_len)));
 	if (memcmp(VDFS4_CRC32_OFFSET((char *)buff, buff_size), &crc,
 				CRC32_SIZE) != 0) {
-		VDFS4_ERR("read bimap %s:%lu from disk fail: CRC missmatch"
-				, magic, page->index);
 		ret_val = -EINVAL;
-
+		VDFS4_ERR("read bimap %s:%lu from disk fail: CRC mismatch"
+				, magic, page->index);
 		VDFS4_ERR("index:%lu phy addr: 0x%llx", page->index,
-				(long long unsigned int)
+				(unsigned long long int)
 				page_to_phys(page));
-
-#ifdef CONFIG_VDFS4_DEBUG
-		if (!(VDFS4_IS_READONLY(sbi->sb))) {
-			int ret;
-			struct vdfs4_layout_sb *vdfs4_sb = sbi->raw_superblock;
-
-			sector_t debug_area =
-				le64_to_cpu(vdfs4_sb->exsb.debug_area.begin);
-
-
-			VDFS4_ERR("dump bitmap page to disk");
-			set_page_writeback(page);
-			ret = vdfs4_write_page(sbi, page, debug_area <<
-				(PAGE_CACHE_SHIFT - SECTOR_SIZE_SHIFT),
-				8, 0, 1);
-
-			if (ret)
-				VDFS4_ERR("fail to write a page to flash");
-		} else
-			VDFS4_ERR("can not dump page to disk: read only fs");
+#ifdef VDFS4_DEBUG_DUMP
 		mutex_lock(&sbi->dump_meta);
-		preempt_disable();
-		_sep_printk_start();
-		print_hex_dump(KERN_ERR, "", DUMP_PREFIX_ADDRESS,
-				16, 1, buff, PAGE_SIZE, 1);
-		preempt_enable();
-		_sep_printk_end();
+		VDFS4_MDUMP("", buff, buff_size);
 		mutex_unlock(&sbi->dump_meta);
 #endif
+		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_BITMAP_VALIDATE,
+				*((unsigned int *)VDFS4_CRC32_OFFSET((char *)buff,
+				buff_size)), crc, "bitmap validate err",
+				(void *)buff, buff_size);
 		destroy_layout(sbi);
 	}
 #endif
@@ -725,7 +764,8 @@ static int vdfs4_validate_page(struct page *page)
 		VDFS4_ERR("Can not allocate virtual memory");
 		return -ENOMEM;
 	}
-	ret_val = vdfs4_validate_bitmap(page, data, PAGE_SIZE, magic, magic_len);
+	ret_val = vdfs4_validate_bitmap(page, data, PAGE_SIZE,
+					magic, magic_len);
 
 	kunmap(page);
 	return ret_val;
@@ -742,19 +782,21 @@ static int vdfs4_validate_page(struct page *page)
  *				magic_len bytes will be skiped during crc
  *				calculation.
  */
+#ifdef CONFIG_VDFS4_META_SANITY_CHECK
 void vdfs4_update_block_crc(char *buff, unsigned int blck_size,
 		unsigned int magic_len)
 {
-#ifdef CONFIG_VDFS4_CRC_CHECK
 	unsigned int crc = 0;
 	/* set crc to the end of the buffer */
 	crc = cpu_to_le32(crc32(0, buff + magic_len,
 		blck_size - (CRC32_SIZE  +
 		magic_len)));
 	memcpy(VDFS4_CRC32_OFFSET(buff, blck_size), &crc, CRC32_SIZE);
-#endif
 }
-
+#else
+void vdfs4_update_block_crc(char *buff, unsigned int blck_size,
+		unsigned int magic_len){}
+#endif
 
 /**
  * @brief				Set bits inside buffer and update
@@ -806,7 +848,7 @@ int vdfs4_set_bits(char *buff, int buff_size, unsigned int offset,
 					magic_len) > end_buff)
 				return -EFAULT;
 			/* set bits */
-			if (test_and_set_bit((int)cur_position,
+			if (vdfs4_test_and_set_bit((int)cur_position,
 				(void *)(cur_blck + magic_len)))
 				return -EFAULT;
 
@@ -868,13 +910,13 @@ int vdfs4_clear_bits(char *buff, int buff_size, unsigned int offset,
 				return -EFAULT;
 
 			/* set bits */
-			if (!test_and_clear_bit((int)cur_position,
+			if (!vdfs4_test_and_clear_bit((int)cur_position,
 					(void *)(cur_blck + magic_len))) {
-#ifdef CONFIG_VDFS4_DEBUG
+#ifdef VDFS4_DEBUG_DUMP
 				VDFS4_ERR("bit cleared offset: %u, position: %u",
-										offset, cur_position);
+					  offset, cur_position);
 				VDFS4_MDUMP("space bitmap:", (void *)(cur_blck),
-										blck_size);
+					  blck_size);
 #endif
 				return -EFAULT;
 			}
@@ -1037,7 +1079,7 @@ static void meta_end_IO(struct bio *bio, int err)
 			bvec->bv_page->mapping->host->i_sb->s_fs_info;
 
 	if (bio->bi_rw & WRITE) {
-		VDFS4_BUG_ON(atomic_read(&sbi->meta_bio_count) <= 0);
+		VDFS4_BUG_ON(atomic_read(&sbi->meta_bio_count) <= 0, sbi);
 		if (atomic_dec_and_test(&sbi->meta_bio_count))
 			wake_up_all(&sbi->meta_bio_wait);
 	}
@@ -1086,21 +1128,23 @@ static struct bio *allocate_new_request(struct vdfs4_sb_info *sbi, sector_t
 	return bio;
 }
 
-
 static int vdfs4_sign_mapping_pages(struct vdfs4_sb_info *sbi,
 		struct pagevec *pvec, unsigned long ino)
 {
 	int ret = 0;
 	struct vdfs4_layout_sb *vdfs4_sb = sbi->raw_superblock;
-
 	__u64 version = ((__u64)le32_to_cpu(vdfs4_sb->exsb.mount_counter) << 32)
 		| sbi->snapshot_info->sync_count;
 	unsigned int magic_len = 0;
-	struct vdfs4_base_table_record *table = vdfs4_get_table(sbi, ino);
+	struct vdfs4_base_table_record *table;
+
+	down_read(&sbi->snapshot_info->tables_lock);
+	table = vdfs4_get_table(sbi, ino);
 	if (is_tree(ino)) {
 		__le64 table_index = 0;
 		struct vdfs4_btree *tree;
 		unsigned int i;
+
 		switch (ino) {
 		case VDFS4_CAT_TREE_INO:
 			tree = sbi->catalog_tree;
@@ -1112,7 +1156,8 @@ static int vdfs4_sign_mapping_pages(struct vdfs4_sb_info *sbi,
 			tree = sbi->xattr_tree;
 			break;
 		default:
-			return -EFAULT;
+			ret = -EFAULT;
+			goto ERR_TABLES_LOCK;
 		}
 
 		for (i = 0; i < pvec->nr; i += tree->pages_per_node) {
@@ -1123,7 +1168,8 @@ static int vdfs4_sign_mapping_pages(struct vdfs4_sb_info *sbi,
 				VDFS4_ERR("incomplete bnode: %ld %ld %ld",
 						ino, pages[0]->index,
 						pvec->nr - i);
-				return -EFAULT;
+				ret = -EFAULT;
+				goto ERR_TABLES_LOCK;
 			}
 
 			for (j = 1; j < tree->pages_per_node; j++) {
@@ -1132,7 +1178,8 @@ static int vdfs4_sign_mapping_pages(struct vdfs4_sb_info *sbi,
 							"%ld %ld != %ld + %d",
 							ino, pages[j]->index,
 							pages[0]->index, j);
-					return -EFAULT;
+					ret = -EFAULT;
+					goto ERR_TABLES_LOCK;
 				}
 			}
 
@@ -1151,6 +1198,7 @@ static int vdfs4_sign_mapping_pages(struct vdfs4_sb_info *sbi,
 	} else {
 		unsigned int i;
 		char *magic = NULL;
+
 		switch (ino) {
 		case VDFS4_FREE_INODE_BITMAP_INO:
 			magic = INODE_BITMAP_MAGIC;
@@ -1161,7 +1209,8 @@ static int vdfs4_sign_mapping_pages(struct vdfs4_sb_info *sbi,
 			magic_len = FSM_BMP_MAGIC_LEN;
 			break;
 		default:
-			return -EFAULT;
+			ret = -EFAULT;
+			goto ERR_TABLES_LOCK;
 		}
 		for (i = 0; i < pvec->nr; i++) {
 
@@ -1175,6 +1224,8 @@ static int vdfs4_sign_mapping_pages(struct vdfs4_sb_info *sbi,
 					sbi->snapshot_info->sync_count;
 		}
 	}
+ERR_TABLES_LOCK:
+	up_read(&sbi->snapshot_info->tables_lock);
 	return ret;
 }
 
@@ -1217,12 +1268,12 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 
 		ret = get_block_meta_wrapper(current_mapping->host,
 				page->index, &block, 0, 0);
-		BUG_ON(ret);
+		VDFS4_BUG_ON(ret, sbi);
 
 		lock_page(page);
-		BUG_ON(!PageDirty(page));
-		BUG_ON(PageWriteback(page));
-		BUG_ON(page->mapping != current_mapping);
+		VDFS4_BUG_ON(!PageDirty(page), sbi);
+		VDFS4_BUG_ON(PageWriteback(page), sbi);
+		VDFS4_BUG_ON(page->mapping != current_mapping, sbi);
 		clear_page_dirty_for_io(page);
 		set_page_writeback(page);
 		unlock_page(page);
@@ -1231,22 +1282,19 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 		       !bio_add_page(bio, page, PAGE_CACHE_SIZE, 0)) {
 			if (bio) {
 				atomic_inc(&sbi->meta_bio_count);
-				submit_bio(WRITE_FUA, bio);
+				submit_bio(WRITE_FUA | REQ_META | REQ_PRIO, bio);
 			}
 			bio = allocate_new_request(sbi, block, pvec.nr - i);
 			next_block = block;
 		}
 
 		i++;
-		next_block += (unsigned)(1 << sbi->log_blocks_in_page);
-#ifdef CONFIG_VDFS4_STATISTIC
-		sbi->umount_written_bytes += PAGE_CACHE_SIZE;
-#endif
+		next_block += (sector_t)(1lu << sbi->log_blocks_in_page);
 	}
 
 	if (bio) {
 		atomic_inc(&sbi->meta_bio_count);
-		submit_bio(WRITE_FUA, bio);
+		submit_bio(WRITE_FUA | REQ_META | REQ_PRIO, bio);
 	}
 
 	blk_finish_plug(&plug);
@@ -1315,13 +1363,15 @@ int vdfs4__read(struct inode *inode, int type, struct page **pages,
 	unsigned int blocks_per_page = (unsigned)(1 << (PAGE_CACHE_SHIFT -
 			sbi->block_size_shift));
 	unsigned int count;
+	int bio_flags = (type == VDFS4_META_READ) ?
+			READ | REQ_META | REQ_PRIO : READ;
 
 	blk_start_plug(&plug);
 
 	for (count = 0; count < pages_count; count++) {
 		struct page *page = pages[count];
 
-		BUG_ON(!PageLocked(page));
+		VDFS4_BUG_ON(!PageLocked(page), sbi);
 
 		if (PageUptodate(page)) {
 			unlock_page(page);
@@ -1338,10 +1388,10 @@ int vdfs4__read(struct inode *inode, int type, struct page **pages,
 		}
 
 		if (last_block + blocks_per_page != block) {
-			unsigned max_pages_num = min_t(unsigned, (pages_count - count),
-					(blocks_num - block));
+			unsigned max_pages_num = min_t(unsigned,
+					(pages_count - count), (blocks_num - block));
 			if (bio)
-				submit_bio(READ, bio);
+				submit_bio(bio_flags, bio);
 again:
 			bio = allocate_new_request(sbi, block,
 					max_pages_num);
@@ -1355,7 +1405,7 @@ again:
 
 		size = bio_add_page(bio, page, PAGE_CACHE_SIZE, 0);
 		if (size < (int)PAGE_CACHE_SIZE) {
-			submit_bio(READ, bio);
+			submit_bio(bio_flags, bio);
 			bio = NULL;
 			goto again;
 		}
@@ -1364,7 +1414,7 @@ again:
 
 exit:
 	if (bio)
-		submit_bio(READ, bio);
+		submit_bio(bio_flags, bio);
 
 	blk_finish_plug(&plug);
 
@@ -1381,6 +1431,10 @@ exit:
 int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi)
 {
 	int ret = 0;
+	struct super_block *sb = sbi->sb;
+	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
+	struct vdfs4_extended_super_block *exsb = &l_sb->exsb;
+	struct vdfs4_snapshot_info *snapshot = sbi->snapshot_info;
 
 	if (sbi->snapshot_info->dirty_pages_count == 0)
 		return 0;
@@ -1390,8 +1444,19 @@ int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi)
 		return 0;
 	}
 
+	/* Write statistics */
+	if (sb->s_bdev->bd_part) {
+		u64 kbytes_written = sbi->kbytes_written;
+
+		kbytes_written += BD_PART_WRITTEN(sbi);
+		if (exsb->kbytes_written != cpu_to_le64(kbytes_written)) {
+			exsb->kbytes_written = cpu_to_le64(kbytes_written);
+			set_sbi_flag(sbi, EXSB_DIRTY);
+		}
+	}
+
 	if (is_sbi_flag_set(sbi, EXSB_DIRTY)) {
-		ret = vdfs4_sync_second_super(sbi);
+		ret = vdfs4_sync_exsb(sbi, 1);
 		sbi->snapshot_info->use_base_table = 1;
 		if (ret) {
 			vdfs4_fatal_error(sbi, "cannot sync 2nd sb: %d", ret);
@@ -1412,7 +1477,7 @@ int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi)
 	}
 
 	if (is_sbi_flag_set(sbi, EXSB_DIRTY)) {
-		ret = vdfs4_sync_first_super(sbi);
+		ret = vdfs4_sync_exsb(sbi, 0);
 		clear_sbi_flag(sbi, EXSB_DIRTY);
 		if (ret)
 			vdfs4_fatal_error(sbi, "cannot sync 1st sb: %d", ret);
@@ -1420,6 +1485,8 @@ int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi)
 
 	vdfs4_commit_free_space(sbi);
 
+	/* increase sync count */
+	snapshot->sync_count++;
 	return ret;
 }
 
@@ -1431,6 +1498,7 @@ int vdfs4_read_comp_pages(struct inode *inode, pgoff_t index,
 	int count, ret = 0;
 	struct page *page = NULL;
 	sector_t page_idx;
+
 	if (type != VDFS4_FBASED_READ_C && type != VDFS4_FBASED_READ_M) {
 		VDFS4_ERR("function can't be used for data type %d", type);
 		return -EINVAL;
@@ -1459,7 +1527,7 @@ int vdfs4_read_comp_pages(struct inode *inode, pgoff_t index,
 	if (ret)
 		goto exit_read_data;
 
-	for(--count; count >= 0; count--) {
+	for (--count; count >= 0; count--) {
 		lock_page(pages[count]);
 		if (PageUptodate(pages[count]))
 			SetPageChecked(pages[count]);
@@ -1479,182 +1547,6 @@ exit_read_data:
 	return ret;
 
 }
-
-#if (defined(CONFIG_VDFS4_USE_HW1_DECOMPRESS) \
-		|| defined(CONFIG_VDFS4_USE_HW2_DECOMPRESS))
-/* This translation from hw flags is really ugly. But we do not want to depend
- * from unpredictable modification (e.g. too big values) */
-static inline enum hw_iovec_comp_type convert_hw_comptype(enum compr_type type)
-{
-	enum hw_iovec_comp_type hw_type = 0;
-
-	switch (type) {
-	case VDFS4_COMPR_NONE:
-		/* This case is weird. Must not happen */
-		BUG();
-		break;
-	case VDFS4_COMPR_ZLIB:
-		/* Unaligned zlib can not be supported by HW decompressor
-		 * Consider us undefined */
-		break;
-	case VDFS4_COMPR_GZIP :
-		hw_type = HW_IOVEC_COMP_GZIP;
-		break;
-	case VDFS4_COMPR_ZHW :
-		hw_type = HW_IOVEC_COMP_ZLIB;
-		break;
-	case VDFS4_COMPR_LZO:
-		hw_type = HW_IOVEC_COMP_LZO;
-		break;
-	case VDFS4_COMPR_XZ:
-		/* Not defined */
-		break;
-	case VDFS4_COMPR_LZMA:
-		/* Not defined */
-		break;
-	default :
-		BUG();
-		break;
-	}
-
-	return hw_type;
-}
-
-static inline enum hw_iovec_hash_type convert_hw_hashtype(enum  hash_type type)
-{
-	switch (type) {
-	case VDFS4_HASH_UNDEF:
-		return HW_IOVEC_HASH_NONE;
-	case VDFS4_HASH_SHA1:
-		return HW_IOVEC_HASH_SHA1;
-	case VDFS4_HASH_SHA256:
-		return HW_IOVEC_HASH_SHA256;
-	case VDFS4_HASH_MD5:
-		return HW_IOVEC_HASH_MD5;
-	default:
-		BUG();
-	}
-
-	return 0;
-}
-
-static int is_hw_compr_supported(enum compr_type type)
-{
-	const struct hw_capability hw = get_hw_capability();
-	return hw.comp_type & convert_hw_comptype(type);
-}
-
-#if 0
-static int is_hw_hash_supported(enum hash_type type)
-{
-	const struct hw_capability hw = get_hw_capability();
-	/* No hash - nothing to do to support.
-	 * Thats why VDFS4_HASH_UNDEF is supported as well */
-	if (type == VDFS4_HASH_UNDEF)
-		return 1;
-
-	return (hw.hash_type == convert_hw_hashtype(type));
-}
-#endif
-
-void *vdfs_get_hwdec_fn(struct vdfs4_inode_info *inode_i)
-{
-	enum compr_type compr_type = inode_i->fbc->compr_type;
-	void *hw1 = NULL, *hw2 = NULL;
-
-#if defined(CONFIG_VDFS4_USE_HW1_DECOMPRESS)
-	hw1 = vdfs4_auth_decompress_hw1;
-#endif
-#if defined(CONFIG_VDFS4_USE_HW2_DECOMPRESS)
-	if (inode_i->vfs_inode.i_sb->s_bdev->bd_disk->fops->hw_decompress_vec)
-		hw2 = vdfs4_auth_decompress_hw2;
-#endif
-
-	/* comment out : is_hw_hash_supported(inode_i->fbc->hash_type) */
-	/* Even if hw hash is NOT supported, we can handle it with S/W */
-	if (hw2 && is_hw_compr_supported(compr_type))
-		return hw2;
-
-	if (hw1 && is_hw_compr_supported(compr_type))
-		return hw1;
-
-	return NULL;
-}
-#endif
-
-#ifdef CONFIG_VDFS4_USE_HW2_DECOMPRESS
-static int hw2_unpack_chunk(struct inode *inode,
-		struct vdfs4_comp_extent_info *cext, struct page **out_pages,
-		int out_pages_num, struct req_hash *rq_hash)
-{
-	pgoff_t first_idx = cext->start_block;
-	size_t offset = cext->offset;
-	size_t chunk_len = cext->len_bytes;
-	struct vdfs4_sb_info *sbi = VDFS4_SB(inode->i_sb);
-	struct block_device *bdev = inode->i_sb->s_bdev;
-	const struct block_device_operations *ops = bdev->bd_disk->fops;
-
-	int ret;
-	pgoff_t start_offset;
-	int chunk_blocks_num;
-
-	pgoff_t pstart, blocks_n;
-	struct vdfs4_extent_info pext;
-	sector_t chunk_start_sector;
-	struct hw_iovec iovec;
-	unsigned int hw_flags;
-
-
-	if (cext->flags & VDFS4_CHUNK_FLAG_UNCOMPR) {
-		const struct hw_capability hw = get_hw_capability();
-		/* additional check: is it possible to use HW to read
-		 * non-compressed chunk */
-		hw_flags = (hw.comp_type & HW_IOVEC_COMP_UNCOMPRESSED) ?
-			HW_IOVEC_COMP_UNCOMPRESSED : 0;
-		if (!hw_flags)
-			return -EINVAL;
-	} else {
-		hw_flags = convert_hw_comptype(VDFS4_I(inode)->fbc->compr_type);
-		BUG_ON(!hw_flags);
-	}
-
-	/* If ops does not have hw_decompress_vec function - probably block
-	 * device is not emmc chip, we can use hw1 in this case
-	 */
-	if (!ops->hw_decompress_vec)
-		return -EINVAL;
-	ret = vdfs4_get_iblock_extent(inode, first_idx, &pext, NULL);
-	if (ret)
-		return ret;
-
-
-	start_offset = first_idx - pext.iblock;
-	pstart = pext.first_block + start_offset;
-	if (start_offset >= pext.block_count)
-		return -EAGAIN;
-
-	blocks_n = pext.block_count - start_offset;
-
-	/* Check if chunk is fragmented */
-	chunk_blocks_num = (chunk_len + PAGE_SIZE - 1) >> PAGE_CACHE_SHIFT;
-	if (blocks_n < chunk_blocks_num)
-		return -EAGAIN;
-
-	chunk_start_sector = pstart <<
-		(sbi->block_size_shift - SECTOR_SIZE_SHIFT);
-
-	iovec = (struct hw_iovec){
-		.phys_off = ((unsigned long long)chunk_start_sector << 9) +
-			    offset,
-		.len = chunk_len,
-	};
-
-	return ops->hw_decompress_vec(bdev, &iovec, 1, out_pages,
-				      out_pages_num, rq_hash, hw_flags, 0);
-}
-#else
-#define hw2_unpack_chunk(...) (-EINVAL)
-#endif
 
 static int __get_chunk_extent(struct vdfs4_inode_info *inode_i,
 		pgoff_t chunk_idx, struct vdfs4_comp_extent_info *cext)
@@ -1683,31 +1575,58 @@ static int __get_chunk_extent(struct vdfs4_inode_info *inode_i,
 	data = kmap_atomic(page);
 	raw_extent = (void *)((char *)data + pos);
 
-	if (memcmp(raw_extent->magic, VDFS4_COMPR_EXT_MAGIC,
+	if (!test_bit(VDFS4_PROFILED_FILE, &inode_i->flags) &&
+		memcmp(raw_extent->magic, VDFS4_COMPR_EXT_MAGIC,
 				sizeof(raw_extent->magic))) {
-		VDFS4_ERR("Wrong magic in compressed extent: #%ld %lld",
-			   inode_i->vfs_inode.i_ino, (long long)extent_offset);
+		struct vdfs4_sb_info *sbi = VDFS4_SB(inode_i->vfs_inode.i_sb);
+
+		VDFS4_ERR("Wrong magic in compressed extent: #%ld, "
+				" chunk idx:%lu, ext offset:%lld, addr:0x%x "
+				" (0x%02X 0x%02X, %s)",
+			   inode_i->vfs_inode.i_ino, chunk_idx,
+			   (long long)extent_offset,
+			   (unsigned int)(raw_extent->magic),
+			   raw_extent->magic[0], raw_extent->magic[1],
+			   VDFS4_COMPR_EXT_MAGIC);
+#ifdef VDFS4_DEBUG_DUMP
+		mutex_lock(&sbi->dump_meta);
+		VDFS4_MDUMP("", data, PAGE_SIZE);
+		mutex_unlock(&sbi->dump_meta);
+#endif
+		vdfs4_print_volume_verification(sbi);
 		ret = -EINVAL;
 		goto out_unmap;
 	}
 
 	start = (pgoff_t)le64_to_cpu(raw_extent->start);
+	cext->flags = le16_to_cpu(raw_extent->flags);
 	cext->start_block = (pgoff_t)start >> (pgoff_t)PAGE_CACHE_SHIFT;
 	cext->offset = start & (PAGE_CACHE_SIZE - 1);
 	cext->len_bytes = (int)le32_to_cpu(raw_extent->len_bytes);
 	last_block = (pgoff_t)(start + cext->len_bytes + PAGE_CACHE_SIZE - 1)
-		>> PAGE_CACHE_SHIFT;
+			>> PAGE_CACHE_SHIFT;
 	cext->blocks_n = (int)(last_block - cext->start_block);
-	cext->flags = le16_to_cpu(raw_extent->flags);
+#ifdef CONFIG_VDFS4_SQUEEZE
+	cext->profiled_prio =  le16_to_cpu(raw_extent->profiled_prio);
+#endif
 out_unmap:
-	kunmap_atomic(data);
-
 	if (!ret && (cext->len_bytes < 0 || cext->offset < 0)) {
-		VDFS4_ERR("Invalid compressed extent: #%ld %lld",
-			   inode_i->vfs_inode.i_ino, (long long)extent_offset);
+		struct vdfs4_sb_info *sbi = VDFS4_SB(inode_i->vfs_inode.i_sb);
+
+		VDFS4_ERR("Invalid compressed extent: #%ld, chunk idx:%lu, "
+			  "ext offset:%lld, cext len:%d, cext offset:%d",
+			   inode_i->vfs_inode.i_ino, chunk_idx,
+			   (long long)extent_offset, cext->len_bytes, cext->offset);
+#ifdef VDFS4_DEBUG_DUMP
+		mutex_lock(&sbi->dump_meta);
+		VDFS4_MDUMP("", data, PAGE_SIZE);
+		mutex_unlock(&sbi->dump_meta);
+#endif
+		vdfs4_print_volume_verification(sbi);
 		ret = -EINVAL;
 	}
-	if(ret) {
+	kunmap_atomic(data);
+	if (ret) {
 		lock_page(page);
 		ClearPageChecked(page);
 		unlock_page(page);
@@ -1717,12 +1636,137 @@ out_unmap:
 	return ret;
 }
 
-#if defined(CONFIG_VDFS4_USE_HW2_DECOMPRESS) || \
-	defined(CONFIG_VDFS4_USE_HW1_DECOMPRESS)
-static int __find_get_pages(struct inode *inode,pgoff_t index,
+#ifdef CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT
+/* This translation from hw flags is really ugly. But we do not want to depend
+ * from unpredictable modification (e.g. too big values) */
+static inline enum hw_iovec_comp_type convert_hw_comptype(enum compr_type type)
+{
+	enum hw_iovec_comp_type hw_type = 0;
+
+	switch (type) {
+	case VDFS4_COMPR_NONE:
+		/* This case is weird. Must not happen */
+		VDFS4_BUG(NULL);
+		break;
+	case VDFS4_COMPR_ZLIB:
+		hw_type = HW_IOVEC_COMP_ZLIB;
+		break;
+	case VDFS4_COMPR_GZIP:
+		hw_type = HW_IOVEC_COMP_GZIP;
+		break;
+	case VDFS4_COMPR_LZO:
+		hw_type = HW_IOVEC_COMP_LZO;
+		break;
+	case VDFS4_COMPR_XZ:
+		/* Not defined */
+		break;
+	case VDFS4_COMPR_LZMA:
+		/* Not defined */
+		break;
+	default:
+		VDFS4_BUG(NULL);
+		break;
+	}
+
+	return hw_type;
+}
+
+static inline enum hw_iovec_hash_type convert_hw_hashtype(enum  hash_type type)
+{
+	switch (type) {
+	case VDFS4_HASH_UNDEF:
+		return HW_IOVEC_HASH_NONE;
+	case VDFS4_HASH_SHA1:
+		return HW_IOVEC_HASH_SHA1;
+	case VDFS4_HASH_SHA256:
+		return HW_IOVEC_HASH_SHA256;
+	case VDFS4_HASH_MD5:
+		return HW_IOVEC_HASH_MD5;
+	default:
+		return 0;
+	}
+}
+
+static inline int is_hw_compr_supported(struct vdfs4_inode_info *inode_i,
+		const struct hw_capability *hw_cap)
+
+{
+	enum compr_type compr_type = inode_i->fbc->compr_type;
+
+	return hw_cap->comp_type & convert_hw_comptype(compr_type);
+}
+
+void *vdfs_get_hwdec_fn(struct vdfs4_inode_info *inode_i)
+{
+	const struct hw_capability hw_cap = get_hw_capability();
+
+	if (inode_i->vfs_inode.i_sb->s_bdev->bd_disk->fops->hw_decompress_vec
+		&& is_hw_compr_supported(inode_i, &hw_cap))
+		return vdfs4_auth_decompress_hw2;
+
+	return NULL;
+}
+
+static int hw2_unpack_chunk(struct inode *inode,
+		struct vdfs4_comp_extent_info *cext, struct page **out_pages,
+		int out_pages_num, struct req_hw *rq_hw)
+{
+	pgoff_t first_idx = cext->start_block;
+	size_t offset = cext->offset;
+	size_t chunk_len = cext->len_bytes;
+	struct vdfs4_sb_info *sbi = VDFS4_SB(inode->i_sb);
+	struct block_device *bdev = inode->i_sb->s_bdev;
+	const struct block_device_operations *ops = bdev->bd_disk->fops;
+
+	int ret;
+	pgoff_t start_offset;
+	int chunk_blocks_num;
+
+	pgoff_t pstart, blocks_n;
+	struct vdfs4_extent_info pext;
+	sector_t chunk_start_sector;
+	struct hw_iovec iovec;
+
+	ret = vdfs4_get_iblock_extent(inode, first_idx, &pext, NULL);
+	if (ret)
+		return ret;
+
+	start_offset = first_idx - pext.iblock;
+	pstart = pext.first_block + start_offset;
+	if (start_offset >= pext.block_count)
+		return -EAGAIN;
+
+	blocks_n = pext.block_count - start_offset;
+
+	/* Check if chunk is fragmented */
+	chunk_blocks_num = (chunk_len + PAGE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+	if (blocks_n < chunk_blocks_num)
+		return -EAGAIN;
+
+	chunk_start_sector = (sector_t)pstart <<
+		(sbi->block_size_shift - SECTOR_SIZE_SHIFT);
+
+#ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
+	vdfs4_save_profiling_log(sbi, inode->i_ino,
+			cext->start_block, cext->blocks_n);
+#endif
+
+	iovec = (struct hw_iovec){
+		.phys_off = ((unsigned long long)chunk_start_sector << 9) +
+			    offset,
+		.len = chunk_len,
+	};
+
+	ret = ops->hw_decompress_vec(bdev, &iovec, 1, out_pages,
+				      out_pages_num, rq_hw);
+	return ret;
+}
+
+static int __find_get_pages(struct inode *inode, pgoff_t index,
 		struct page **pages, int pages_count)
 {
 	int i;
+
 	for (i = 0; i < (int)pages_count; i++) {
 		pages[i] = find_or_create_page(inode->i_mapping,
 				index + (pgoff_t)i, GFP_NOFS);
@@ -1734,12 +1778,61 @@ static int __find_get_pages(struct inode *inode,pgoff_t index,
 			return -ENOMEM;
 		}
 	}
-
 	return 0;
 }
-#endif
 
-#ifdef CONFIG_VDFS4_USE_HW2_DECOMPRESS
+static int vdfs4_hw2_prep_req(struct inode *inode,
+		struct vdfs4_comp_extent_info *ext,
+		int comp_extent_idx,
+		struct req_hw *req)
+{
+	int ret = 0;
+	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
+	const struct hw_capability hw_cap = get_hw_capability();
+	int compr = !(ext->flags & VDFS4_CHUNK_FLAG_UNCOMPR);
+	int auth = is_vdfs4_inode_flag_set(inode, VDFS4_AUTH_FILE) &&
+			is_sbi_flag_set(VDFS4_SB(inode->i_sb), VOLUME_AUTH);
+
+	/* fallback to sw path if we must just read data */
+	if (!compr && !auth)
+		return -EINVAL;
+
+	if (!compr)
+		req->compr_type =
+				(hw_cap.comp_type & HW_IOVEC_COMP_UNCOMPRESSED) ?
+				HW_IOVEC_COMP_UNCOMPRESSED : 0;
+	else
+		req->compr_type =
+				convert_hw_comptype(VDFS4_I(inode)->fbc->compr_type);
+
+	if (!req->compr_type)
+		return -EINVAL;
+
+	if (auth) {
+		req->hash_type = convert_hw_hashtype(inode_i->fbc->hash_type);
+		if (!req->hash_type)
+			VDFS4_BUG(VDFS4_SB(inode->i_sb));
+		if (!(req->hash_type & hw_cap.hash_type))
+			/*
+				is this really needed? It looks like do_decompression()
+				can process every hash type
+			*/
+			return -EINVAL;
+
+		req->hashdata = kzalloc(inode_i->fbc->hash_len, GFP_NOFS);
+		if (!req->hashdata)
+			return -ENOMEM;
+	} else
+		req->hash_type = HW_IOVEC_HASH_NONE;
+
+	return ret;
+}
+
+static inline void vdfs4_hw2_free_req(struct req_hw *req)
+{
+	kfree(req->hashdata);
+}
+
 int vdfs4_auth_decompress_hw2(struct inode *inode, struct page *page)
 {
 	int ret = 0, i;
@@ -1748,174 +1841,75 @@ int vdfs4_auth_decompress_hw2(struct inode *inode, struct page *page)
 	int comp_extent_idx = (int)(page->index >> (inode_i->fbc->log_chunk_size
 				- PAGE_SHIFT));
 	struct page **dst_pages = NULL;
-	int pages_count = 1 << (inode_i->fbc->log_chunk_size - PAGE_SHIFT);
+	int pages_count = vdfs4_chunk_page_count(inode, comp_extent_idx);
 	pgoff_t index = page->index & ~((1 << (inode_i->fbc->log_chunk_size -
 					PAGE_SHIFT)) - 1);
-	struct req_hash *rq_hash = NULL;
-	struct req_hash req_hash = { .data = NULL };
+	struct req_hw req_hw = {0};
+	int auth = is_vdfs4_inode_flag_set(inode, VDFS4_AUTH_FILE) &&
+			is_sbi_flag_set(VDFS4_SB(inode->i_sb), VOLUME_AUTH);
+	VT_PREPARE_PARAM(vt_data);
 
-	/* currently target supports only sha256//MD5 */
-	/* uncompress a chunk by hw2,then read it againg and calculate hash is*/
-	/* tooo slow */
-	BUG_ON(inode_i->fbc->hash_fn &&
-		((inode_i->fbc->hash_type != VDFS4_HASH_SHA256) && (inode_i->fbc->hash_type != VDFS4_HASH_MD5)) );
+	if (PageUptodate(page))
+		/* somebody read it for us */
+		return 0;
 
+	VT_START(vt_data);
 	ret = __get_chunk_extent(inode_i, comp_extent_idx, &cext);
 	if (ret)
-		return ret;
+		goto exit;
 
-	dst_pages = kzalloc(pages_count * sizeof(*page), GFP_NOFS);
-	if (!dst_pages)
-		return -ENOMEM;
+	ret = vdfs4_hw2_prep_req(inode, &cext, comp_extent_idx, &req_hw);
+	if (ret)
+		goto exit;
+
+	dst_pages = kzalloc(pages_count * sizeof(struct page *), GFP_NOFS);
+	if (!dst_pages) {
+		ret = -ENOMEM;
+		goto exit;
+	}
 
 	ret = __find_get_pages(inode, index, dst_pages, pages_count);
 	if (ret) {
 		kfree(dst_pages);
-		return -ENOMEM;
-	}
-
-	if (PageUptodate(page))
-		/* somebody read it for us */
+		ret = -ENOMEM;
 		goto exit;
-
-	if (inode_i->fbc->hash_fn) {
-		rq_hash = &req_hash;
-		rq_hash->hash_type = inode_i->fbc->hash_type;
-		rq_hash->data = kzalloc(inode_i->fbc->hash_len, GFP_NOFS);
-		if (!rq_hash->data) {
-			ret = -ENOMEM;
-			goto exit;
-		}
 	}
 
-	ret = hw2_unpack_chunk(inode, &cext, dst_pages,
-		(1 << (inode_i->fbc->log_chunk_size - PAGE_SHIFT)), rq_hash);
+	ret = hw2_unpack_chunk(inode, &cext, dst_pages, pages_count, &req_hw);
 
 	if (ret < 0)
-		goto exit;
-
-	if (ret > 0)
+		goto exit_unlock;
+	else
 		ret = 0;
 
-	if (rq_hash && !ret)
-		/* check hash value, compare to disk value */
+	if (auth)
+		/*This is AUTH FILE. check hash value, compare to disk value */
 		ret = vdfs4_check_hash_chunk_no_calc(inode_i, comp_extent_idx,
-				rq_hash->data);
+				req_hw.hashdata);
 
 	if (!ret)
 		for (i = 0; i < pages_count; ++i) {
 			SetPageUptodate(dst_pages[i]);
 			mark_page_accessed(dst_pages[i]);
 		}
-exit:
+exit_unlock:
 	for (i = 0; i < pages_count; ++i) {
 		unlock_page(dst_pages[i]);
 		page_cache_release(dst_pages[i]);
 	}
 	kfree(dst_pages);
-	if (rq_hash)
-		kfree(rq_hash->data);
-
-	return ret;
-}
-#endif
-
-
-#ifdef CONFIG_VDFS4_USE_HW1_DECOMPRESS
-int vdfs4_auth_decompress_hw1(struct inode *inode, struct page *page)
-{
-	int ret = 0, i;
-	void *buffer = NULL;
-	struct page **pages;
-	struct vdfs4_comp_extent_info cext;
-	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
-	int comp_extent_idx = (int)(page->index >> (inode_i->fbc->log_chunk_size
-				- PAGE_SHIFT));
-	struct page **dst_pages = NULL;
-	int pages_count = 1 << (inode_i->fbc->log_chunk_size - PAGE_SHIFT);
-	pgoff_t index = page->index & ~((1 << (inode_i->fbc->log_chunk_size -
-					PAGE_SHIFT)) - 1);
-	u8 *hash = NULL;
-
-	ret = __get_chunk_extent(inode_i, comp_extent_idx, &cext);
-	if (ret)
-		return ret;
-
-	if (cext.flags & VDFS4_COMPR_NONE)
-		return -EBUSY;
-
-	dst_pages = kzalloc(pages_count * sizeof(*page), GFP_NOFS);
-	if (!dst_pages)
-		return -ENOMEM;
-
-	ret = __find_get_pages(inode, index, dst_pages, pages_count);
-	if (ret) {
-		kfree(dst_pages);
-		return -ENOMEM;
-	}
-
-	if (PageUptodate(page))
-		/* somebody read it for us */
-		goto exit;
-
-	if (inode_i->fbc->hash_fn) {
-		hash = kzalloc(inode_i->fbc->hash_len, GFP_NOFS);
-		if (!hash) {
-			ret = -ENOMEM;
-			goto exit;
-		}
-	}
-
-	pages = vdfs4_get_hw_buffer(inode, cext.start_block,
-			&buffer, cext.blocks_n);
-	if (!pages) {
-		ret = -EBUSY;
-		goto exit;
-	}
-
-	ret = vdfs4__read(inode, VDFS4_FBASED_READ_C, pages,
-			(unsigned int)cext.blocks_n, 0);
-	if (ret)
-		goto exit_hw1;
-
-	ret = hw_decompress_sync((char *)buffer + cext.offset,
-			ALIGN(cext.len_bytes, 8), dst_pages,
-			(1 << (inode_i->fbc->log_chunk_size - PAGE_SHIFT)), 1,
-			convert_hw_comptype(inode_i->fbc->compr_type));
-	if (ret >= 0)
-		ret = 0;
-
-	if (hash && !ret)
-		ret = inode_i->fbc->hash_fn(buffer + cext.offset,
-				cext.len_bytes, hash);
-	if (hash && !ret)
-		/* check hash value, compare to disk value */
-		ret = vdfs4_check_hash_chunk_no_calc(inode_i, comp_extent_idx,
-				hash);
-
-	if (!ret)
-		for (i = 0; i < pages_count; ++i) {
-			SetPageUptodate(dst_pages[i]);
-			mark_page_accessed(dst_pages[i]);
-		}
-exit_hw1:
-	vdfs4_put_hw_buffer(pages);
+	vdfs4_hw2_free_req(&req_hw);
 exit:
-
-	for (i = 0; i < pages_count; ++i) {
-		unlock_page(dst_pages[i]);
-		page_cache_release(dst_pages[i]);
-	}
-	kfree(dst_pages);
-	kfree(hash);
-
+	VT_DECOMP_FINISH(vt_data, vdfs_trace_decomp_hw, inode,
+			 (cext.start_block << PAGE_CACHE_SHIFT) + cext.offset,
+			 cext.len_bytes, auth,
+			 !!ret,(cext.flags&VDFS4_CHUNK_FLAG_UNCOMPR));
 	return ret;
 }
-#endif
+#endif /* end of CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT */
 
 #define COMPR_TABLE_EXTENTS_PER_PAGE (PAGE_CACHE_SIZE \
 		/ sizeof(struct vdfs4_comp_extent))
-
 
 /* just read a chunk from disk
  * the function returns uptodated pages*/
@@ -1926,8 +1920,8 @@ int vdfs4_read_chunk(struct page *page, struct page **chunk_pages,
 	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
 	int comp_extent_idx = (int)(page->index >>
 			(inode_i->fbc->log_chunk_size - PAGE_SHIFT));
-	pgoff_t index = page->index & ~((1 << (inode_i->fbc->log_chunk_size -
-					PAGE_SHIFT)) - 1);
+	pgoff_t index = page->index & ~((1lu << (inode_i->fbc->log_chunk_size -
+					(unsigned long)PAGE_SHIFT)) - 1lu);
 	sector_t page_idx = 0;
 	int ret = 0, count, type = VDFS4_FBASED_READ_C;
 	/* block device inode i_mapping is used to store compressed pages */
@@ -1939,12 +1933,17 @@ int vdfs4_read_chunk(struct page *page, struct page **chunk_pages,
 	if (ret)
 		return ret;
 
-	if ((cext->flags & VDFS4_CHUNK_FLAG_UNCOMPR)) {
+	if (cext->flags & VDFS4_CHUNK_FLAG_UNCOMPR) {
 		/* read un-compressed data directly into the inode->i_mapping */
 		mapping = inode->i_mapping;
 		type = VDFS4_FBASED_READ_UNC;
 		start_block = cext->start_block;
 	}
+
+#ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
+	vdfs4_save_profiling_log(VDFS4_SB(inode->i_sb), inode->i_ino,
+			cext->start_block, cext->blocks_n);
+#endif
 
 	for (count = 0; count < cext->blocks_n; count++) {
 		if (cext->flags & VDFS4_CHUNK_FLAG_UNCOMPR)
@@ -1970,33 +1969,35 @@ int vdfs4_read_chunk(struct page *page, struct page **chunk_pages,
 	ret = vdfs4__read(inode, type, chunk_pages, cext->blocks_n,
 			start_block);
 exit:
-	for (count = 0; count < cext->blocks_n; count++)
+	for (count = 0; count < cext->blocks_n; count++) {
 		if (chunk_pages[count]) {
 			lock_page(chunk_pages[count]);
 			if (ret) {
 				ClearPageUptodate(chunk_pages[count]);
 				ClearPageChecked(chunk_pages[count]);
 				page_cache_release(chunk_pages[count]);
-			} else
+			} else {
 				SetPageChecked(chunk_pages[count]);
+			}
 			unlock_page(chunk_pages[count]);
 		}
+	}
 
 	return ret;
-
 }
 
-int vdfs4_auth_decompress(struct inode *inode, struct page **chunk_pages,
+int vdfs4_auth_decompress_sw(struct inode *inode, struct page **chunk_pages,
 		pgoff_t index, struct vdfs4_comp_extent_info *cext,
 		struct page *page)
 {
 	struct page **unpacked_pages = NULL;
 	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
 	void *src = NULL, *dst = NULL;
-	int i, ret = 0;
+	int ret = 0;
+	unsigned int i;
 	int comp_extent_idx = (int)(index >> (inode_i->fbc->log_chunk_size -
 			PAGE_SHIFT));
-	int pages_count = 1 << (inode_i->fbc->log_chunk_size - PAGE_SHIFT);
+	unsigned int pages_count = vdfs4_chunk_page_count(inode, comp_extent_idx);
 
 	if (!inode_i->fbc->hash_fn && (cext->flags & VDFS4_CHUNK_FLAG_UNCOMPR))
 		/* nothing to do: non-auth, non-compressed chunk */
@@ -2019,17 +2020,17 @@ int vdfs4_auth_decompress(struct inode *inode, struct page **chunk_pages,
 	if (cext->flags & VDFS4_CHUNK_FLAG_UNCOMPR)
 		goto exit_uncompressed;
 
-	unpacked_pages = kzalloc(pages_count * sizeof(*page), GFP_NOFS);
+	unpacked_pages = kzalloc(pages_count * sizeof(struct page *), GFP_NOFS);
 	if (!unpacked_pages) {
 		ret = -ENOMEM;
 		goto exit;
 	}
 
-	for (i = 0; i < (int)pages_count; i++) {
+	for (i = 0; i < pages_count; i++) {
 		unpacked_pages[i] = find_or_create_page(inode->i_mapping,
 				index + (pgoff_t)i, GFP_NOFS);
 		if (!unpacked_pages[i]) {
-			while (--i >= 0) {
+			while (i-- > 0) {
 				unlock_page(unpacked_pages[i]);
 				page_cache_release(unpacked_pages[i]);
 			}
@@ -2055,10 +2056,11 @@ int vdfs4_auth_decompress(struct inode *inode, struct page **chunk_pages,
 		goto exit_free_pages;
 	}
 
-	ret = inode_i->fbc->decomp_fn(src, dst, (size_t)cext->offset,
+	ret = inode_i->fbc->decomp_fn(src,
+			dst, (size_t)cext->offset,
 			(size_t)cext->len_bytes,
 			(size_t)(pages_count << PAGE_SHIFT));
-#ifdef CONFIG_VDFS4_DEBUG
+#ifdef VDFS4_DEBUG_DUMP
 	if (ret)
 		/* dump file based decompression error */
 		vdfs4_dump_fbc_error(inode_i, src, cext);
@@ -2072,7 +2074,6 @@ exit_free_pages:
 		unlock_page(unpacked_pages[i]);
 		page_cache_release(unpacked_pages[i]);
 	}
-
 exit_alloc_pages:
 	kfree(unpacked_pages);
 exit:
@@ -2083,7 +2084,6 @@ exit_uncompressed:
 		vm_unmap_ram(src, cext->blocks_n);
 
 	return ret;
-
 }
 
 /* type : 0 - meta , 1 - packtree, 2 - filebased decompression */
@@ -2098,9 +2098,8 @@ int vdfs4_read_or_create_pages(struct inode *inode, pgoff_t index,
 	struct page *page = NULL;
 	char is_new = 0;
 	int validate_err;
-#ifdef CONFIG_VDFS4_DEBUG
-	int reread_count = VDFS4_META_REREAD;
-#endif
+	int reread_count = 0;
+
 	if (type == VDFS4_META_READ && (inode->i_ino <= VDFS4_LSFILE)) {
 		ret = vdfs4_check_page_offset(sbi, inode, index, &is_new,
 				force_insert);
@@ -2127,9 +2126,8 @@ int vdfs4_read_or_create_pages(struct inode *inode, pgoff_t index,
 			SetPageChecked(page);
 		}
 	}
-#ifdef CONFIG_VDFS4_DEBUG
+
 do_reread:
-#endif
 	validate_err = 0;
 	ret = vdfs4__read(inode, type, pages, pages_count, start_block);
 	if (ret)
@@ -2159,16 +2157,13 @@ do_reread:
 
 	ret = (validate_err) ? -EINVAL : 0;
 
-#ifdef CONFIG_VDFS4_DEBUG
-	if (ret && (--reread_count >= 0)) {
-		VDFS4_DEBUG_TMP("do re-read bitmap %d",
-			VDFS4_META_REREAD -
-			reread_count);
+	if (ret && (reread_count < VDFS4_META_REREAD)) {
+		reread_count++;
+		VDFS4_ERR("do re-read bitmap %d", reread_count);
 		for (count = 0; count < (int)pages_count; count++)
 			lock_page(pages[count]);
 		goto do_reread;
 	}
-#endif
 
 	if (ret && (is_sbi_flag_set(sbi, IS_MOUNT_FINISHED)))
 			vdfs4_fatal_error(sbi, "bitmap validate FAIL");
@@ -2212,49 +2207,12 @@ struct page *vdfs4_read_or_create_page(struct inode *inode, pgoff_t index,
 	return pages[0];
 }
 
-/**
- * @brief			This function write data to the file
- * @param [in]		iocb	The kiocb struct to advance by
- *				performing an operation
- * @param [in]		iov	data buffer
- * @param [in]		nr_segs	count of blocks to map
- * @param [in]		pos
- * @return			0 if success, negative value if error
- */
-ssize_t vdfs4_gen_file_buff_write(struct kiocb *iocb,
-		const struct iovec *iov, unsigned long nr_segs, loff_t pos)
-{
-	ssize_t ret = 0;
-	struct blk_plug plug;
-	struct inode *inode = INODE(iocb);
-	mutex_lock(&inode->i_mutex);
-	blk_start_plug(&plug);
-	ret = generic_file_buffered_write(iocb, iov, nr_segs, pos,
-			&iocb->ki_pos, iov->iov_len, 0);
-
-	mutex_unlock(&inode->i_mutex);
-	if (ret > 0 || ret == -EIOCBQUEUED) {
-		ssize_t err;
-
-		err = generic_write_sync(iocb->ki_filp, 0, ret);
-		if (err < 0 && ret > 0)
-			ret = err;
-	}
-	blk_finish_plug(&plug);
-	if (-EIOCBQUEUED == ret)
-		ret = wait_on_sync_kiocb(iocb);
-	return ret;
-}
-
-
-
 struct bio *vdfs4_mpage_bio_submit(int rw, struct bio *bio)
 {
 	bio->bi_end_io = end_io_write;
 	submit_bio(rw, bio);
 	return NULL;
 }
-
 
 int vdfs4_mpage_writepage(struct page *page,
 		struct writeback_control *wbc, void *data)
@@ -2276,12 +2234,13 @@ int vdfs4_mpage_writepage(struct page *page,
 	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
 	struct buffer_head *bh;
 	loff_t i_size = i_size_read(inode);
+
 	memset(&extent, 0x0, sizeof(extent));
 	block_in_file = (sector_t)page->index << (PAGE_CACHE_SHIFT - blkbits);
 	blocksize = (unsigned int)(1 << inode->i_blkbits);
 	if (page_has_buffers(page)) {
 		bh = page_buffers(page);
-		BUG_ON(buffer_locked(bh));
+		VDFS4_BUG_ON(buffer_locked(bh), sbi);
 		mutex_lock(&inode_info->truncate_mutex);
 		if (buffer_mapped(bh)) {
 			if (buffer_delay(bh)) {
@@ -2332,13 +2291,13 @@ int vdfs4_mpage_writepage(struct page *page,
 		/*
 		* The page has no buffers: map it to disk
 		*/
-		BUG_ON(!PageUptodate(page));
+		VDFS4_BUG_ON(!PageUptodate(page), sbi);
 
 		create_empty_buffers(page, blocksize, 0);
 		bh = page_buffers(page);
 
 		bh->b_state = 0;
-		bh->b_size = (size_t)(1 << blkbits);
+		bh->b_size = (size_t)(1lu << blkbits);
 		if (vdfs4_get_block(inode, block_in_file, bh, 1))
 			goto confused;
 		if (buffer_new(bh))
@@ -2348,7 +2307,7 @@ int vdfs4_mpage_writepage(struct page *page,
 	}
 
 	boundary_block = bh->b_blocknr;
-	end_index = (long unsigned int)(i_size >> PAGE_CACHE_SHIFT);
+	end_index = (unsigned long int)(i_size >> PAGE_CACHE_SHIFT);
 	if (page->index >= end_index) {
 		/*
 		 * The page straddles i_size.  It must be zeroed out on each
@@ -2376,7 +2335,7 @@ alloc_new:
 	bdev = bh->b_bdev;
 	boundary_block = bh->b_blocknr;
 	if (boundary_block == 0)
-		BUG();
+		VDFS4_BUG(sbi);
 	if (IS_ERR_OR_NULL(bio)) {
 		sector_t s_count = (sector_t)(bdev->bd_inode->i_size >>
 							SECTOR_SIZE_SHIFT);
@@ -2412,7 +2371,7 @@ alloc_new:
 		clear_buffer_dirty(head);
 	}
 
-	BUG_ON(PageWriteback(page));
+	VDFS4_BUG_ON(PageWriteback(page), sbi);
 	set_page_writeback(page);
 	unlock_page(page);
 	mpd->last_block_in_bio = boundary_block;
@@ -2425,7 +2384,7 @@ confused:
 		bio = vdfs4_mpage_bio_submit(WRITE, bio);
 	if (buffer_mapped(bh))
 		if (bh->b_blocknr == 0)
-			BUG();
+			VDFS4_BUG(sbi);
 
 	/*
 	 * vdfs4_writepage cannot perform delayed allocations
@@ -2440,57 +2399,4 @@ out:
 	mpd->bio = bio;
 	return err;
 }
-
-
-int vdfs4_dump_chunk_to_disk(void *mapped_chunk, size_t chunk_length,
-		const char *name, unsigned int length)
-{
-	int ret = 0;
-	struct file *fd;
-#ifdef CONFIG_PLAT_TIZEN
-	/* Tizen, dump to /opt */
-	const char path[] = "/opt/vdfs43_debug_err_chunk.bin";
-#elif defined(CONFIG_ARCH_SDP)
-	/* Orsey */
-	const char path[] = "/mtd_rwarea/vdfs43_debug_err_chunk.bin";
-#else
-	/* qemu */
-	const char path[] = "/tmp/vdfs43_debug_err_chunk.bin";
-#endif
-
-	VDFS4_ERR("dump the chunk to file %s", path);
-
-	fd = filp_open((const char *)path, O_CREAT | O_WRONLY | O_TRUNC,
-			S_IRWXU);
-	if (!IS_ERR(fd)) {
-		loff_t pos;
-		ssize_t written;
-		mm_segment_t fs;
-
-		pos = fd->f_path.dentry->d_inode->i_size;
-		fs = get_fs();
-		set_fs(KERNEL_DS);
-
-		written = vfs_write(fd, name, length, &pos);
-		if (written < 0) {
-			VDFS4_ERR("cannot write to file %s err:%d",
-					path, written);
-			ret = (int)written;
-			goto exit;
-		}
-
-		written = vfs_write(fd, mapped_chunk, chunk_length, &pos);
-		if (written < 0) {
-			VDFS4_ERR("cannot write to file %s err:%d",
-					path, written);
-			ret = (int)written;
-		}
-exit:
-		set_fs(fs);
-		filp_close(fd, NULL);
-	}
-
-	return ret;
-}
-
 

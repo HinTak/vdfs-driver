@@ -34,12 +34,12 @@ static int vdfs4_set_type_status(struct vdfs4_inode_info *inode_i,
 	struct vdfs4_sb_info *sbi = inode_i->vfs_inode.i_sb->s_fs_info;
 	struct inode *inode = &inode_i->vfs_inode;
 	int ret = 0;
-#ifdef CONFIG_VDFS4_RETRY
 	int retry_count = 0;
-#endif
+
 	if (inode->i_size == 0)
 		return 0;
-	if (status && (!is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE))) {
+	if (status && (!is_vdfs4_inode_flag_set(inode,
+							VDFS4_COMPRESSED_FILE))) {
 		/* Write and flush, tuned inodes are read via bdev cache */
 		filemap_write_and_wait(inode_i->vfs_inode.i_mapping);
 		invalidate_bdev(inode->i_sb->s_bdev);
@@ -53,26 +53,18 @@ static int vdfs4_set_type_status(struct vdfs4_inode_info *inode_i,
 		goto out;
 	}
 	if (status) {
-#ifdef CONFIG_VDFS4_RETRY
 retry:
-#endif
 		ret = vdfs4_prepare_compressed_file_inode(inode_i);
 		if (!ret)
 			set_vdfs4_inode_flag(&inode_i->vfs_inode,
 				VDFS4_COMPRESSED_FILE);
-#ifdef CONFIG_VDFS4_RETRY
 		else if (retry_count < 3) {
 			retry_count++;
 			VDFS4_ERR("init decompression retry %d",
 					retry_count);
 			goto retry;
 		} else
-
-#else
-		else if (ret != -EOPNOTSUPP)
-#endif
 			goto out;
-		ret = 0;
 	}
 	if (!is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE)) {
 		if (status) {
@@ -103,34 +95,61 @@ out:
 
 static __u8 vdfs4_get_type_status(struct vdfs4_inode_info *inode_i)
 {
-	struct inode *inode = (inode_i->record_type !=
-			VDFS4_CATALOG_DLINK_RECORD) ?
-			&inode_i->vfs_inode :
-			inode_i->data_link.inode;
-	if (is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE))
-		return 1;
-	else
-		return 0;
+	return test_bit(VDFS4_COMPRESSED_FILE, &inode_i->flags) ? 1 : 0;
 }
 
 static __u32 vdfs4_get_compr_type(struct vdfs4_inode_info *inode_i)
 {
-	struct inode *inode = (inode_i->record_type !=
-			VDFS4_CATALOG_DLINK_RECORD) ?
-			&inode_i->vfs_inode :
-			inode_i->data_link.inode;
-	return VDFS4_I(inode)->fbc->compr_type;
+	return inode_i->fbc == NULL ? VDFS4_COMPR_UNDEF :
+			 (__u32)inode_i->fbc->compr_type;
 }
 
 static __u32 vdfs4_get_auth_status(struct vdfs4_inode_info *inode_i)
 {
-	struct inode *inode = (inode_i->record_type !=
-			VDFS4_CATALOG_DLINK_RECORD) ?
-			&inode_i->vfs_inode :
-			inode_i->data_link.inode;
-	return VDFS4_I(inode)->flags & ((1 << VDFS4_AUTH_FILE) |
+	return inode_i->flags & ((1 << VDFS4_AUTH_FILE) |
 			(1 << VDFS4_READ_ONLY_AUTH));
 }
+
+#if defined(CONFIG_VDFS4_DEBUG) || defined(CONFIG_VDFS4_PERF)
+static u32 vdfs4_get_extent_count(struct inode *inode)
+{
+	int ret = 0;
+	u32 extent_cnt = 0;
+	sector_t iblock = 0;
+	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
+	struct vdfs4_fork_info *fork = &inode_info->fork;
+	u32 tatal_blk_count = fork->total_block_count;
+	u32 blk_count = 0;
+
+	if (inode_info->name)
+		VDFS4_INFO("filename : %s\n", inode_info->name);
+	VDFS4_INFO("total blk count  : %u\n", fork->total_block_count);
+	VDFS4_INFO("used extents cnt : %d\n", fork->used_extents);
+
+	while (blk_count < tatal_blk_count) {
+		struct vdfs4_extent_info result;
+		memset(&result, 0x00, sizeof(struct vdfs4_extent_info));
+		ret = vdfs4_get_iblock_extent(inode, iblock, &result, NULL);
+		if (ret && ret != -ENOENT) {
+			extent_cnt = 0;
+			break;
+		} else if (result.first_block == 0) {
+			/* if no iblock extent, skip counting */
+			iblock++;
+			continue;
+		}
+		VDFS4_INFO("Tree Extent %03u : "
+			   "idx(%08llu) - count(%08u) - phy(0x%08llx)\n",
+			   extent_cnt, result.iblock,
+			   result.block_count, result.first_block);
+		iblock += result.block_count;
+		blk_count += result.block_count;
+		extent_cnt++;
+	}
+	return extent_cnt;
+}
+#endif
+
 /**
  * @brief	ioctl (an abbreviation of input/output control) is a system
  *		call for device-specific input/output operations and other
@@ -143,7 +162,7 @@ static __u32 vdfs4_get_auth_status(struct vdfs4_inode_info *inode_i)
 long vdfs4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int flags;
-	struct inode *inode = filp->f_dentry->d_inode;
+	struct inode *inode = filp->f_path.dentry->d_inode;
 	struct vdfs4_sb_info *sbi = inode->i_sb->s_fs_info;
 	int ret;
 
@@ -210,10 +229,6 @@ long vdfs4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 unlock_inode_exit:
 		mutex_unlock(&inode->i_mutex);
 		break;
-	case VDFS4_IOC_GET_OPEN_COUNT:
-		ret = put_user(atomic_read(&(VDFS4_I(inode)->open_count)),
-			(int __user *) arg);
-		break;
 	case VDFS4_IOC_SET_DECODE_STATUS:
 		ret = -EFAULT;
 		if (get_user(flags, (int __user *) arg))
@@ -224,13 +239,90 @@ unlock_inode_exit:
 		ret = put_user(vdfs4_get_type_status(VDFS4_I(inode)),
 			(int __user *) arg);
 		break;
-	case VDFS4_IOC_GET_COMPR_TYPE:
-		ret = put_user((int)vdfs4_get_compr_type(VDFS4_I(inode)),
-			(int __user *) arg);
-		break;
-	case VDFS4_IOC_IS_AUTHENTICATED:
-		ret = put_user((int)vdfs4_get_auth_status(VDFS4_I(inode)),
-				(int __user *) arg);
+	case VDFS4_IOC_GET_FILE_INFORMATION:
+#if defined(CONFIG_VDFS4_DEBUG) || defined(CONFIG_VDFS4_PERF)
+		if (arg != 0) {
+			struct vdfs4_ioc_file_info ioc_file_info;
+
+			memset(&ioc_file_info, 0x0, sizeof(struct vdfs4_ioc_file_info));
+			ioc_file_info.open_count =
+				atomic_read(&(VDFS4_I(inode)->open_count));
+			ioc_file_info.compressed_status =
+				vdfs4_get_type_status(VDFS4_I(inode));
+			ioc_file_info.compressed_type =
+				(int)vdfs4_get_compr_type(VDFS4_I(inode));
+			ioc_file_info.authenticated_status =
+				(int)vdfs4_get_auth_status(VDFS4_I(inode));
+			ioc_file_info.encryption_status = 0;
+			ioc_file_info.extents_num = vdfs4_get_extent_count(inode);
+			ioc_file_info.size = inode->i_size;
+			if (ioc_file_info.compressed_status
+						&& VDFS4_I(inode)->fbc != NULL) {
+				struct vdfs4_comp_extent *raw_extent;
+				loff_t extent_offset;
+				pgoff_t page_idx;
+				struct page **pages;
+				int pos, chunk_extable_size, pages_count, i;
+				void *data;
+
+				/* Copy comp info */
+				ioc_file_info.compressed_size =
+									VDFS4_I(inode)->fbc->comp_size;
+				ioc_file_info.chunk_cnt =
+									VDFS4_I(inode)->fbc->comp_extents_n;
+
+				/* Count comp/uncomp chunk */
+				extent_offset = VDFS4_I(inode)->fbc->comp_table_start_offset;
+				page_idx = (pgoff_t)extent_offset >> PAGE_CACHE_SHIFT;
+				pos = extent_offset & (PAGE_CACHE_SIZE - 1);
+				chunk_extable_size =
+					ioc_file_info.chunk_cnt *
+					sizeof(struct vdfs4_comp_extent);
+				pages_count = ((pos+chunk_extable_size) / 4096) + 1;
+				pages = kmalloc(pages_count * sizeof(*pages), GFP_NOFS);
+				if (!pages) {
+					ret = -ENOMEM;
+					break;
+				}
+
+				ret = vdfs4_read_comp_pages(inode, page_idx,
+					pages_count, pages, VDFS4_FBASED_READ_M);
+				if (ret) {
+					kfree(pages);
+					break;
+				}
+				data = vdfs4_vmap(pages, (unsigned int)pages_count,
+							VM_MAP, PAGE_KERNEL);
+				if (!data) {
+					ret = -ENOMEM;
+					kfree(pages);
+					break;
+				}
+				raw_extent = (void *)((char *)data + pos);
+				for (i = 0; i < ioc_file_info.chunk_cnt; i++, raw_extent++) {
+					if (raw_extent->flags & VDFS4_CHUNK_FLAG_UNCOMPR)
+						ioc_file_info.uncompressed_chunk_cnt++;
+					else
+						ioc_file_info.compressed_chunk_cnt++;
+				}
+				vunmap(data);
+				while (pages_count--) {
+					lock_page(pages[pages_count]);
+					ClearPageUptodate(pages[pages_count]);
+					ClearPageChecked(pages[pages_count]);
+					page_cache_release(pages[pages_count]);
+					unlock_page(pages[pages_count]);
+				}
+				kfree(pages);
+			}
+			copy_to_user((void *)arg, (void *)&ioc_file_info,
+				sizeof(struct vdfs4_ioc_file_info));
+		} else {
+			ret = -EINVAL;
+		}
+#else
+		ret = -EINVAL;
+#endif
 		break;
 	default:
 		ret = -ENOTTY;
@@ -269,34 +361,6 @@ long vdfs4_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 }
 #endif /* CONFIG_COMPAT */
 
-static void clear_files_rw_mode(struct super_block *sb)
-{
-	struct file *f;
-
-retry:
-	do_file_list_for_each_entry(sb, f) {
-		struct vfsmount *mnt;
-		if (!S_ISREG(f->f_path.dentry->d_inode->i_mode))
-			continue;
-		if (!file_count(f))
-			continue;
-		if (!(f->f_mode & FMODE_WRITE))
-			continue;
-		spin_lock(&f->f_lock);
-		f->f_mode &= ~FMODE_WRITE;
-		spin_unlock(&f->f_lock);
-		if (file_check_writeable(f) != 0)
-			continue;
-		file_release_write(f);
-		mnt = mntget(f->f_path.mnt);
-		if (!mnt)
-			goto retry;
-		mnt_drop_write(mnt);
-		mntput(mnt);
-		goto retry;
-	} while_file_list_for_each_entry;
-}
-
 static int force_ro(struct super_block *sb)
 {
 	if (sb->s_writers.frozen != SB_UNFROZEN)
@@ -305,10 +369,13 @@ static int force_ro(struct super_block *sb)
 	shrink_dcache_sb(sb);
 	sync_filesystem(sb);
 
-	clear_files_rw_mode(sb);
+	sb->s_readonly_remount = 1;
 
-	sb->s_flags = (sb->s_flags & ~(unsigned)MS_RMT_MASK) |
-		(unsigned)MS_RDONLY;
+	/* this is the barrier before RO setting */
+	smp_wmb();
+
+	sb->s_flags = (sb->s_flags & ~(unsigned long)MS_RMT_MASK) |
+		(unsigned long)MS_RDONLY;
 
 	invalidate_bdev(sb->s_bdev);
 	return 0;
@@ -326,20 +393,10 @@ static int force_ro(struct super_block *sb)
 long vdfs4_dir_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret = 0;
-	struct inode *inode = filp->f_dentry->d_inode;
+	struct inode *inode = filp->f_path.dentry->d_inode;
 	struct vdfs4_sb_info *sbi =
 		((struct super_block *)inode->i_sb)->s_fs_info;
 	struct super_block *sb = (struct super_block *)inode->i_sb;
-
-	switch (cmd) {
-	case VDFS4_IOC_DATA_LINK:
-		ret = mnt_want_write_file(filp);
-		if (ret)
-			return ret;
-	default:
-		break;
-
-	}
 
 	switch (cmd) {
 	case VDFS4_IOC_FORCE_RO:
@@ -354,34 +411,8 @@ long vdfs4_dir_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		set_option(sbi, FORCE_RO);
 		ret = 0;
 		break;
-	case VDFS4_IOC_DATA_LINK: {
-		struct ioctl_data_link input;
-		struct file *data_file;
-
-		ret = -EFAULT;
-		if (copy_from_user(&input, (void __user *)arg, sizeof(input)))
-			break;
-		ret = -EBADF;
-		data_file = fget((unsigned int)input.data_inode_fd);
-		if (!data_file)
-			break;
-		/* Terminate the string if userspace forgot to do that */
-		input.name[sizeof(input.name) - 1] = '\0';
-		ret = vdfs4_data_link_create(filp->f_dentry,
-				input.name, data_file->f_mapping->host,
-				input.data_offset, input.data_length);
-		fput(data_file);
-		break;
-	}
-		default:
-		ret = -EINVAL;
-		break;
-	}
-
-	switch (cmd) {
-	case VDFS4_IOC_DATA_LINK:
-		mnt_drop_write_file(filp);
 	default:
+		ret = -EINVAL;
 		break;
 	}
 

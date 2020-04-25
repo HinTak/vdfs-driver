@@ -58,8 +58,8 @@ struct vdfs4_cattree_record *vdfs4_cattree_place_record(
 		struct vdfs4_btree *tree, u64 object_id, u64 parent_id,
 		const char *name, size_t len, u8 record_type);
 
-struct vdfs4_cattree_record *vdfs4_cattree_build_record(struct vdfs4_btree * tree,
-		__u32 bnode_id, __u32 pos);
+struct vdfs4_cattree_record *vdfs4_cattree_build_record(
+		struct vdfs4_btree *tree, __u32 bnode_id, __u32 pos);
 
 #include "vdfs4_layout.h"
 

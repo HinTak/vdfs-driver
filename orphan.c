@@ -20,6 +20,7 @@
  */
 
 #include "vdfs4.h"
+#include "lock_trace.h"
 
 static inline struct vdfs4_inode_info *
 prev_orphan(struct vdfs4_sb_info *sbi, struct inode *inode)
@@ -27,14 +28,13 @@ prev_orphan(struct vdfs4_sb_info *sbi, struct inode *inode)
 	/*
 	 * @inode must be in orphan list and not be the first,
 	 */
-	BUG_ON(list_empty(&VDFS4_I(inode)->orphan_list));
-	BUG_ON(VDFS4_I(inode)->orphan_list.prev == &sbi->orphan_inodes);
+	VDFS4_BUG_ON(list_empty(&VDFS4_I(inode)->orphan_list), sbi);
+	VDFS4_BUG_ON(VDFS4_I(inode)->orphan_list.prev ==
+					&sbi->orphan_inodes, sbi);
 
 	return list_entry(VDFS4_I(inode)->orphan_list.prev,
 			struct vdfs4_inode_info, orphan_list);
 }
-
-int __vdfs4_write_inode(struct vdfs4_sb_info *sbi, struct inode *inode);
 
 int vdfs4_add_to_orphan(struct vdfs4_sb_info *sbi, struct inode *inode)
 {
@@ -46,7 +46,7 @@ int vdfs4_add_to_orphan(struct vdfs4_sb_info *sbi, struct inode *inode)
 	list_add_tail(&VDFS4_I(inode)->orphan_list, &sbi->orphan_inodes);
 
 	prev = prev_orphan(sbi, inode);
-	BUG_ON(prev->next_orphan_id != 0);
+	VDFS4_BUG_ON(prev->next_orphan_id != 0, sbi);
 	prev->next_orphan_id = inode->i_ino;
 	ret = __vdfs4_write_inode(sbi, &prev->vfs_inode);
 	if (ret) {
@@ -66,15 +66,20 @@ int vdfs4_add_to_orphan(struct vdfs4_sb_info *sbi, struct inode *inode)
 void vdfs4_del_from_orphan(struct vdfs4_sb_info *sbi, struct inode *inode)
 {
 	struct vdfs4_inode_info *prev;
+
 	if (!list_empty(&VDFS4_I(inode)->orphan_list)) {
 		int ret = 0;
+
 		prev = prev_orphan(sbi, inode);
-		BUG_ON(prev->next_orphan_id != inode->i_ino);
+		VDFS4_BUG_ON(prev->next_orphan_id != inode->i_ino, sbi);
 		prev->next_orphan_id = VDFS4_I(inode)->next_orphan_id;
 		mark_inode_dirty(&prev->vfs_inode);
 		ret = __vdfs4_write_inode(sbi, &prev->vfs_inode);
-		if (ret)
+		if (ret) {
 			vdfs4_fatal_error(sbi, "delete from orphan list");
+			vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_ORPHAN,
+					inode->i_ino, 0, "fail delete orphan", NULL, 0);
+		}
 		clear_vdfs4_inode_flag(inode, ORPHAN_INODE);
 		VDFS4_I(inode)->next_orphan_id = FINAL_ORPHAN_ID;
 		list_del_init(&VDFS4_I(inode)->orphan_list);
@@ -92,18 +97,22 @@ int vdfs4_process_orphan_inodes(struct vdfs4_sb_info *sbi)
 
 	while (VDFS4_I(root)->next_orphan_id) {
 		inode = vdfs4_iget(sbi, (ino_t)VDFS4_I(root)->next_orphan_id);
+		if (IS_ERR(inode))
+			return -EINVAL;
 		if (inode->i_nlink ||
 		    !is_vdfs4_inode_flag_set(inode, ORPHAN_INODE)) {
 			vdfs4_fatal_error(sbi,
 					"non-orphan ino#%lu in orphan list",
 					inode->i_ino);
+			vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_ORPHAN,
+					inode->i_ino, 0, "non orphan", NULL, 0);
 			return -EINVAL;
 		}
 
-		mutex_w_lock(sbi->catalog_tree->rw_tree_lock);
+		vdfs4_cattree_w_lock(sbi);
 		list_add_tail(&VDFS4_I(inode)->orphan_list,
 				&sbi->orphan_inodes);
-		mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+		vdfs4_cattree_w_unlock(sbi);
 
 		iput(inode); /* smash it */
 	}

@@ -58,7 +58,7 @@ int vdfs4_exttree_get_next_record(struct vdfs4_exttree_record *record)
 	struct vdfs4_exttree_lrecord *raw_record =
 		__vdfs4_get_next_btree_record(&bnode, &pos);
 
-	BUG_ON(!raw_record);
+	VDFS4_BUG_ON(!raw_record, bnode->host->sbi);
 	if (IS_ERR(raw_record))
 		return PTR_ERR(raw_record);
 
@@ -281,6 +281,7 @@ int vdfs4_parse_fork(struct inode *inode, struct vdfs4_fork *lfork)
 {
 	struct vdfs4_fork_info *ifork = &VDFS4_I(inode)->fork;
 	struct vdfs4_sb_info *sbi = inode->i_sb->s_fs_info;
+
 	if (!is_fork_valid(lfork, sbi))
 		return -EINVAL;
 	inode->i_size = le64_to_cpu(lfork->size_in_bytes);
@@ -294,7 +295,7 @@ int vdfs4_parse_fork(struct inode *inode, struct vdfs4_fork *lfork)
 	ifork->prealloc_start_block = 0;
 
 	/* VFS expects i_blocks value in sectors*/
-	inode->i_blocks = ifork->total_block_count <<
+	inode->i_blocks = ((blkcnt_t)ifork->total_block_count) <<
 			(sbi->block_size_shift - 9);
 
 	vdfs4_lfork_to_rfork(lfork, ifork);
@@ -305,7 +306,7 @@ int vdfs4_parse_fork(struct inode *inode, struct vdfs4_fork *lfork)
  * @brief		Form layout fork from run time fork.
  * @param [out]	inode	The inode for appropriate run time fork
  * @param [in]	lfork	Layout fork
- * @return	void
+ * @return		void
  */
 void vdfs4_form_fork(struct vdfs4_fork *lfork, struct inode *inode)
 {
@@ -449,6 +450,7 @@ int vdfs4_runtime_extent_add(sector_t iblock, sector_t alloc_hint,
 	struct list_head *ptr, *next;
 	struct vdfs4_runtime_extent_info *entry, *next_entry;
 	struct vdfs4_runtime_extent_info *ext = NULL;
+
 	list_for_each_safe(ptr, next, list) {
 		entry = list_entry(ptr, struct vdfs4_runtime_extent_info, list);
 		/* new block is aligned to the existent block at the end */
@@ -544,8 +546,7 @@ int vdfs4_runtime_extent_del(sector_t iblock, struct list_head *list)
 		}
 	}
 	/* try to remove a nonexistent extent */
-	BUG();
-	return 0;
+	return -EINVAL;
 }
 /** returns total of freed blocks
  *
@@ -557,6 +558,7 @@ sector_t vdfs4_truncate_runtime_blocks(sector_t new_size_iblocks,
 	struct vdfs4_runtime_extent_info *entry;
 	sector_t total = 0;
 	u32 trunc_size = 0;
+
 	list_for_each_safe(ptr, next, list) {
 		entry = list_entry(ptr, struct vdfs4_runtime_extent_info,
 			list);
@@ -579,6 +581,7 @@ u32 vdfs4_runtime_extent_exists(sector_t iblock, struct list_head *list)
 {
 	struct list_head *ptr;
 	struct vdfs4_runtime_extent_info *entry;
+
 	list_for_each(ptr, list) {
 		entry = list_entry(ptr, struct vdfs4_runtime_extent_info, list);
 		if ((iblock >= entry->iblock) && (iblock < entry->iblock +
@@ -593,17 +596,10 @@ u32 vdfs4_runtime_extent_count(struct list_head *list)
 	struct list_head *ptr;
 	struct vdfs4_runtime_extent_info *entry;
 	u32 count = 0;
+
 	list_for_each(ptr, list) {
 		entry = list_entry(ptr, struct vdfs4_runtime_extent_info, list);
 		count += entry->block_count;
 	}
 	return count;
-}
-
-long vdfs4_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
-{
-	struct inode *inode = file->f_path.dentry->d_inode;
-	if (!S_ISREG(inode->i_mode))
-		return -ENODEV;
-	return -EOPNOTSUPP; /*todo implementation*/
 }

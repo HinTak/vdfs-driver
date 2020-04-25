@@ -36,6 +36,9 @@
 #include <linux/security.h>
 #include <linux/file.h>
 #include <linux/crypto.h>
+#include <linux/uio.h>
+#include <linux/falloc.h>
+#include <linux/posix_acl_xattr.h>
 
 #ifdef CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT
 #include <crypto/crypto_wrapper.h>
@@ -45,7 +48,19 @@
 #include "vdfs4.h"
 #include "cattree.h"
 #include "debug.h"
+#include <trace/events/vdfs4.h>
+#include <linux/vdfs_trace.h>	/* FlashFS : vdfs-trace */
+#include "lock_trace.h"
 
+static const uint16_t supported_compressed_layouts[] = {
+	/* current layout */
+	VDFS4_COMPR_LAYOUT_VER_06,
+	/* with RSA1024 hardcoded */
+	VDFS4_COMPR_LAYOUT_VER_05,
+};
+
+#define VDFS4_NUM_OF_SUPPORTED_COMPR_LAYOUTS \
+	ARRAY_SIZE(supported_compressed_layouts)
 
 /**
  * @brief		Create inode.
@@ -59,7 +74,7 @@ static int vdfs4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 		bool excl);
 
 static int vdfs4_get_block_prep_da(struct inode *inode, sector_t iblock,
-		struct buffer_head *bh_result, int create) ;
+		struct buffer_head *bh_result, int create);
 
 
 /**
@@ -70,7 +85,6 @@ static int vdfs4_get_block_prep_da(struct inode *inode, sector_t iblock,
  *			errno on failure
  */
 static struct inode *vdfs4_new_inode(struct inode *dir, umode_t mode);
-int __vdfs4_write_inode(struct vdfs4_sb_info *sbi, struct inode *inode);
 
 /**
  * @brief		Get root folder.
@@ -106,7 +120,7 @@ static void vdfs4_fill_cattree_record(struct inode *inode,
 {
 	void *pvalue = record->val;
 
-	BUG_ON(!pvalue || IS_ERR(pvalue));
+	VDFS4_BUG_ON(!pvalue || IS_ERR(pvalue), VDFS4_SB(inode->i_sb));
 
 	VDFS4_I(inode)->record_type = record->key->record_type;
 
@@ -117,59 +131,47 @@ static void vdfs4_fill_cattree_record(struct inode *inode,
 }
 
 /**
- * @brief		Method to read (list) directory.
+ * @brief		Method to iterate directory.
  * @param [in]	filp	File pointer
- * @param [in]	dirent	Directory entry
- * @param [in]	filldir	Callback filldir for kernel
- * @return		Returns count of files/dirs
+ * @param [in]	ctx		Dir context
  */
-static int vdfs4_readdir(struct file *filp, void *dirent, filldir_t filldir)
+static int vdfs4_iterate(struct file *filp, struct dir_context *ctx)
 {
 	struct inode *inode = filp->f_path.dentry->d_inode;
-	struct dentry *dentry = filp->f_dentry;
 	struct vdfs4_sb_info *sbi = inode->i_sb->s_fs_info;
 	__u64 catalog_id = inode->i_ino;
 	int ret = 0;
 	struct vdfs4_cattree_record *record;
 	struct vdfs4_btree *btree = NULL;
-	loff_t pos = 2; /* "." and ".." */
+	loff_t pos = 2;
 
-	/* return 0 if no more entries in the directory */
-	switch (filp->f_pos) {
-	case 0:
-		if (filldir(dirent, ".", 1, filp->f_pos++, inode->i_ino,
-					DT_DIR))
-			goto exit_noput;
-		/* fallthrough */
-		/* filp->f_pos increases and so processing is done immediately*/
-	case 1:
-		if (filldir(dirent, "..", 2, filp->f_pos++,
-			dentry->d_parent->d_inode->i_ino, DT_DIR))
-			goto exit_noput;
-		break;
-	default:
-		break;
-	}
+	VT_PREPARE_PARAM(vt_data);
 
-	mutex_r_lock(sbi->catalog_tree->rw_tree_lock);
+	if (!dir_emit_dots(filp, ctx))
+		return 0;
+
+	vdfs4_cattree_r_lock(sbi);
 	btree = sbi->catalog_tree;
 
 	if (IS_ERR(btree)) {
-		mutex_r_unlock(sbi->catalog_tree->rw_tree_lock);
+		vdfs4_cattree_r_unlock(sbi);
 		return PTR_ERR(btree);
 	}
 
+	VT_FOPS_START(vt_data, vdfs_trace_fops_dir_iterate,
+		      inode->i_sb->s_bdev->bd_part, inode, filp);
 	if (!filp->private_data) {
 		record = vdfs4_cattree_get_first_child(btree, catalog_id);
 	} else {
 		char *name = filp->private_data;
+
 		record = vdfs4_cattree_find(btree, catalog_id,
 				name, strlen(name), VDFS4_BNODE_MODE_RO);
 	}
 
 	if (IS_ERR(record)) {
 		ret = (PTR_ERR(record) == -EISDIR) ? 0 : PTR_ERR(record);
-		goto fail;
+		goto exit;
 	}
 
 	while (1) {
@@ -183,9 +185,9 @@ static int vdfs4_readdir(struct file *filp, void *dirent, filldir_t filldir)
 
 		if ((record->key->record_type == VDFS4_CATALOG_ILINK_RECORD) ||
 				vdfs4_cattree_is_orphan(record))
-			goto skip;
+			goto get_next_record;
 
-		if (!filp->private_data && pos < filp->f_pos)
+		if (!filp->private_data && pos < ctx->pos)
 			goto next;
 
 		cattree_val = record->val;
@@ -202,10 +204,8 @@ static int vdfs4_readdir(struct file *filp, void *dirent, filldir_t filldir)
 		if (btree->btree_type == VDFS4_BTREE_INST_CATALOG)
 			obj_id += btree->start_ino;
 
-		ret = filldir(dirent, record->key->name, record->key->name_len,
-				filp->f_pos, obj_id, IFTODT(object_mode));
-
-		if (ret) {
+		if (!dir_emit(ctx, record->key->name, record->key->name_len,
+				obj_id, IFTODT(object_mode))) {
 			char *private_data;
 
 			if (!filp->private_data) {
@@ -214,7 +214,7 @@ static int vdfs4_readdir(struct file *filp, void *dirent, filldir_t filldir)
 				filp->private_data = private_data;
 				if (!private_data) {
 					ret = -ENOMEM;
-					goto fail;
+					goto exit;
 				}
 			} else {
 				private_data = filp->private_data;
@@ -228,10 +228,10 @@ static int vdfs4_readdir(struct file *filp, void *dirent, filldir_t filldir)
 			goto exit;
 		}
 
-		++filp->f_pos;
+		++ctx->pos;
 next:
 		++pos;
-skip:
+get_next_record:
 		ret = vdfs4_cattree_get_next_record(record);
 		if ((ret == -ENOENT) ||
 			record->key->parent_id != cpu_to_le64(catalog_id)) {
@@ -239,25 +239,17 @@ skip:
 			kfree(filp->private_data);
 			filp->private_data = NULL;
 			ret = 0;
-			break;
+			goto exit;
 		} else if (ret) {
-			goto fail;
+			goto exit;
 		}
-
 	}
 
 exit:
-	vdfs4_release_record((struct vdfs4_btree_gen_record *) record);
-	mutex_r_unlock(sbi->catalog_tree->rw_tree_lock);
-exit_noput:
-	return ret;
-fail:
-	VDFS4_DEBUG_INO("finished with err (%d)", ret);
 	if (!IS_ERR_OR_NULL(record))
 		vdfs4_release_record((struct vdfs4_btree_gen_record *) record);
-
-	VDFS4_DEBUG_MUTEX("cattree mutex r lock un");
-	mutex_r_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_r_unlock(sbi);
+	VT_FINISH(vt_data);
 	return ret;
 }
 
@@ -279,15 +271,22 @@ static loff_t vdfs4_llseek_dir(struct file *file, loff_t offset, int whence)
 	return generic_file_llseek(file, offset, whence);
 }
 
-static int vdfs4_dir_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+static int vdfs4_dir_fsync(struct file *file, loff_t start,
+						loff_t end, int datasync)
 {
-	struct super_block *sb = file->f_dentry->d_sb;
+	struct super_block *sb = file->f_path.dentry->d_sb;
 	int ret = 0;
 
+	VT_PREPARE_PARAM(vt_data);
+
 	if (!datasync) {
+		VT_FOPS_START(vt_data, vdfs_trace_fops_dir_fsync,
+			      sb->s_bdev->bd_part,file->f_path.dentry->d_inode,
+			      file);
 		down_read(&sb->s_umount);
 		ret = sync_filesystem(sb);
 		up_read(&sb->s_umount);
+		VT_FINISH(vt_data);
 	}
 
 	return ret;
@@ -312,17 +311,21 @@ struct dentry *vdfs4_lookup(struct inode *dir, struct dentry *dentry,
 	struct dentry *ret = NULL;
 	__u64 catalog_id = dir->i_ino;
 
+	VT_PREPARE_PARAM(vt_data);
+
 	if (dentry->d_name.len > VDFS4_FILE_NAME_LEN)
 		return ERR_PTR(-ENAMETOOLONG);
 
-	mutex_r_lock(sbi->catalog_tree->rw_tree_lock);
+again:
+	vdfs4_cattree_r_lock(sbi);
 	tree = sbi->catalog_tree;
 
 	if (IS_ERR(tree)) {
-		mutex_r_unlock(sbi->catalog_tree->rw_tree_lock);
+		vdfs4_cattree_r_unlock(sbi);
 		return (struct dentry *)tree;
 	}
 
+	VT_IOPS_START(vt_data, vdfs_trace_iops_lookup, dentry);
 	record = vdfs4_cattree_find(tree, catalog_id,
 			dentry->d_name.name, dentry->d_name.len,
 			VDFS4_BNODE_MODE_RO);
@@ -330,6 +333,7 @@ struct dentry *vdfs4_lookup(struct inode *dir, struct dentry *dentry,
 	if (!IS_ERR(record) && ((record->key->record_type ==
 			VDFS4_CATALOG_ILINK_RECORD))) {
 		struct vdfs4_cattree_key *key;
+
 		key = kzalloc(sizeof(*key), GFP_KERNEL);
 		if (!key) {
 			vdfs4_release_record((struct vdfs4_btree_gen_record *)
@@ -371,10 +375,12 @@ struct dentry *vdfs4_lookup(struct inode *dir, struct dentry *dentry,
 	else
 		inode = ERR_CAST(record);
 exit:
-	mutex_r_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_r_unlock(sbi);
 	ret = d_splice_alias(inode, dentry);
-	if (IS_ERR(ret))
-		return ret;
+	VT_FINISH(vt_data);
+
+	if (inode == ERR_PTR(-EAGAIN))
+		goto again;
 	return ret;
 }
 
@@ -402,11 +408,16 @@ again:
 
 	if (record->key->record_type == VDFS4_CATALOG_ILINK_RECORD) {
 		struct vdfs4_cattree_record *ilink = record;
+
 		record = vdfs4_cattree_find_inode(tree,
 				ino, ilink->key->object_id,
 				ilink->key->name, ilink->key->name_len,
 				VDFS4_BNODE_MODE_RO);
 		vdfs4_release_record((struct vdfs4_btree_gen_record *) ilink);
+		if (IS_ERR(record)) {
+			inode = (void*)record;
+			goto out;
+		}
 	} else if (le64_to_cpu(record->key->object_id) == ino) {
 		/* hard-link body */
 	} else {
@@ -437,9 +448,9 @@ struct inode *vdfs4_iget(struct vdfs4_sb_info *sbi, ino_t ino)
 
 	inode = ilookup(sbi->sb, ino);
 	if (!inode) {
-		mutex_r_lock(sbi->catalog_tree->rw_tree_lock);
+		vdfs4_cattree_r_lock(sbi);
 		inode = __vdfs4_iget(sbi, ino);
-		mutex_r_unlock(sbi->catalog_tree->rw_tree_lock);
+		vdfs4_cattree_r_unlock(sbi);
 	}
 	return inode;
 }
@@ -470,16 +481,21 @@ int vdfs4_get_free_inode(struct vdfs4_sb_info *sbi, ino_t *i_ino,
 	int err = 0;
 	int pass = 0;
 	pgoff_t start_page = page_index;
-	pgoff_t total_pages = (pgoff_t)VDFS4_LAST_TABLE_INDEX(sbi,
-			VDFS4_FREE_INODE_BITMAP_INO) + 1;
+	pgoff_t total_pages;
 	*i_ino = 0;
 
 	if (count > data_size)
 		return -ENOMEM; /* todo we can allocate inode numbers chunk
 		 only within one page*/
 
+	down_read(&sbi->snapshot_info->tables_lock);
+	total_pages = (pgoff_t)VDFS4_LAST_TABLE_INDEX(sbi,
+			 VDFS4_FREE_INODE_BITMAP_INO) + 1;
+	up_read(&sbi->snapshot_info->tables_lock);
+
 	while (*i_ino == 0) {
 		unsigned long *addr;
+
 		page = vdfs4_read_or_create_page(sbi->free_inode_bitmap.inode,
 				page_index, VDFS4_META_READ);
 		if (IS_ERR_OR_NULL(page))
@@ -494,14 +510,16 @@ int vdfs4_get_free_inode(struct vdfs4_sb_info *sbi, ino_t *i_ino,
 				count, 0);
 		/* free area is found */
 		if ((unsigned int)(*i_ino + count - 1) < data_size) {
-			VDFS4_BUG_ON(*i_ino + id_offset < VDFS4_1ST_FILE_INO);
+			VDFS4_BUG_ON(*i_ino + id_offset < VDFS4_1ST_FILE_INO,
+							sbi);
 			if (count > 1) {
 				bitmap_set(addr, (int)*i_ino, (int)count);
 			} else {
-				int ret = test_and_set_bit((int)*i_ino, addr);
+				int ret = vdfs4_test_and_set_bit((int)*i_ino, addr);
+
 				if (ret) {
 					destroy_layout(sbi);
-					VDFS4_BUG_ON(1);
+					VDFS4_BUG_ON(1, sbi);
 				}
 			}
 			*i_ino += (ino_t)id_offset;
@@ -578,12 +596,12 @@ int vdfs4_free_inode_n(struct vdfs4_sb_info *sbi, ino_t inode_n, int count)
 	lock_page(page);
 	data = kmap(page);
 	for (; count; count--)
-		if (!test_and_clear_bit((long)int_offset + count - 1,
+		if (!vdfs4_test_and_clear_bit((long)int_offset + count - 1,
 			(void *)((char *)data + INODE_BITMAP_MAGIC_LEN))) {
 			VDFS4_DEBUG_INO("vdfs4_free_inode_n %lu"
 				, inode_n);
 			destroy_layout(sbi);
-			VDFS4_BUG();
+			VDFS4_BUG(sbi);
 		}
 
 	vdfs4_add_chunk_bitmap(sbi, page, 1);
@@ -606,6 +624,8 @@ static int vdfs4_unlink(struct inode *dir, struct dentry *dentry)
 	struct vdfs4_sb_info *sbi = sb->s_fs_info;
 	int ret = 0;
 
+	VT_PREPARE_PARAM(vt_data);
+
 	VDFS4_DEBUG_INO("unlink '%s', ino = %lu", dentry->d_iname,
 			inode->i_ino);
 
@@ -614,12 +634,13 @@ static int vdfs4_unlink(struct inode *dir, struct dentry *dentry)
 		return -EFAULT;
 	}
 
+	VT_IOPS_START(vt_data, vdfs_trace_iops_unlink, dentry);
 	vdfs4_start_transaction(sbi);
 	vdfs4_assert_i_mutex(inode);
-	mutex_w_lock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_lock(sbi);
 
 	drop_nlink(inode);
-	VDFS4_BUG_ON(inode->i_nlink > VDFS4_LINK_MAX);
+	VDFS4_BUG_ON(inode->i_nlink > VDFS4_LINK_MAX, sbi);
 
 	if (is_vdfs4_inode_flag_set(inode, HARD_LINK)) {
 		/* remove hard-link reference */
@@ -641,49 +662,19 @@ static int vdfs4_unlink(struct inode *dir, struct dentry *dentry)
 		goto keep;
 	}
 
-	if (is_dlink(inode)) {
-		struct inode *data_inode = VDFS4_I(inode)->data_link.inode;
-
-		/*
-		 * This is third i_mutex in the stack: parent locked as
-		 * I_MUTEX_PARENT, target inode locked as I_MUTEX_NORMAL.
-		 * I_MUTEX_XATTR is ok, newer kernels have more suitable
-		 * I_MUTEX_NONDIR2 which is actually renamed I_MUTEX_QUOTA.
-		 */
-		mutex_lock_nested(&data_inode->i_mutex, I_MUTEX_XATTR);
-		drop_nlink(data_inode);
-		if (!data_inode->i_nlink) {
-			ret = vdfs4_add_to_orphan(sbi, data_inode);
-			if (ret) {
-				inc_nlink(data_inode);
-				mutex_unlock(&data_inode->i_mutex);
-				goto exit_inc_nlink;
-			}
-
-			ret = __vdfs4_write_inode(sbi, data_inode);
-			if (ret) {
-				vdfs4_fatal_error(sbi, "fail to update orphan \
-						list %d", ret);
-				inc_nlink(data_inode);
-				mutex_unlock(&data_inode->i_mutex);
-				goto exit_inc_nlink;
-			}
-		}
-		mark_inode_dirty(data_inode);
-		mutex_unlock(&data_inode->i_mutex);
-	}
-
 	ret = vdfs4_add_to_orphan(sbi, inode);
 	if (ret)
 		goto exit_inc_nlink;
 	ret = __vdfs4_write_inode(sbi, inode);
 	if (ret) {
 		vdfs4_fatal_error(sbi, "fail to update orphan list %d", ret);
+		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_UNLINK,
+			dir->i_ino, inode->i_ino, "fail update orphan", NULL, 0);
 		goto exit_inc_nlink;
 	}
 keep:
 	mark_inode_dirty(inode);
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 
 	vdfs4_assert_i_mutex(dir);
 	if (dir->i_size != 0)
@@ -696,11 +687,12 @@ keep:
 	mark_inode_dirty(dir);
 exit:
 	vdfs4_stop_transaction(sbi);
+	VT_FINISH(vt_data);
 	return ret;
 
 exit_inc_nlink:
 	inc_nlink(inode);
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 	goto exit;
 }
 
@@ -787,10 +779,12 @@ exit:
  * @param [in]	update_bnode	It's flag which control the update of the
 				bnode. 1 - update bnode rec, 0 - update only
 				inode structs.
+ * @param [in]	do_erase	It's flag which control erase block.
  * @return			Returns physical block number, or err_code
  */
 static int insert_extent(struct vdfs4_inode_info *inode_info,
-		struct vdfs4_extent_info *extent, int update_bnode)
+			 struct vdfs4_extent_info *extent,
+			 int update_bnode, int do_erase)
 {
 
 	struct inode *inode = &inode_info->vfs_inode;
@@ -870,13 +864,33 @@ insert_in_fork:
 			fork->used_extents++;
 
 		/*  3b. shift extents in fork to right  */
-		for (count = fork->used_extents - 1lu; count > pos; count--)
+		for (count = fork->used_extents - 1; count > pos; count--)
 			memcpy(&fork->extents[count], &fork->extents[count - 1],
 						sizeof(*extent));
 		memcpy(&fork->extents[pos], extent, sizeof(*extent));
 	}
 
 update_on_disk_layout:
+	/*
+	 * erase blocks
+	 */
+	if (do_erase) {
+		unsigned int sector_cnt_in_blk;
+		sector_cnt_in_blk = sbi->log_block_size - SECTOR_SIZE_SHIFT;
+		ret = blkdev_issue_discard(sbi->sb->s_bdev,
+			extent->first_block << sector_cnt_in_blk,
+			extent->block_count << sector_cnt_in_blk,
+			GFP_NOFS, BLKDEV_DISCARD_ZERO);
+		if (ret)
+			ret = blkdev_issue_zeroout(sbi->sb->s_bdev,
+				extent->first_block << sector_cnt_in_blk,
+				extent->block_count << sector_cnt_in_blk,
+				GFP_NOFS, 0);
+	}
+
+	/*
+	 * update inode and sb info
+	 */
 	fork->total_block_count += extent->block_count;
 	inode_add_bytes(inode, sbi->sb->s_blocksize * extent->block_count);
 	if (update_bnode)
@@ -893,7 +907,7 @@ void vdfs4_free_reserved_space(struct inode *inode, sector_t iblocks_count)
 	 * fsm may not exist in case of umount */
 	if (iblocks_count && sbi->fsm_info) {
 		mutex_lock(&sbi->fsm_info->lock);
-		BUG_ON(sbi->reserved_blocks_count < iblocks_count);
+		VDFS4_BUG_ON(sbi->reserved_blocks_count < iblocks_count, sbi);
 		sbi->reserved_blocks_count -= iblocks_count;
 		sbi->free_blocks_count += iblocks_count;
 		mutex_unlock(&sbi->fsm_info->lock);
@@ -916,8 +930,18 @@ static int vdfs4_reserve_space(struct inode *inode, sector_t iblocks_count)
 
 	return ret;
 }
-/*
- * */
+
+/**
+ * @brief      This is a special get_block_t callback which is used by
+ *              vdfs4_write_begin(). It will either return mapped block or
+ *              reserved space for a single block.
+ *              (prepare delayed allocation)
+ * @param [in] inode           Pointer to inode_info structure.
+ * @param [in] iblock          Logical block number to find
+ * @param [out]        bh_result       Pointer to buffer_head.
+ * @param [in] create          "Expand file allowed" flag.
+ * @return                                     0 on success, or error code
+ */
 int vdfs4_get_block_prep_da(struct inode *inode, sector_t iblock,
 		struct buffer_head *bh_result, int create) {
 	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
@@ -926,11 +950,11 @@ int vdfs4_get_block_prep_da(struct inode *inode, sector_t iblock,
 	sector_t offset_alloc_hint = 0, res_block;
 	int err = 0;
 	__u32 max_blocks = 1;
-	__u32 buffer_size = bh_result->b_size >> sbi->block_size_shift;
-
+	__u32 buffer_size = (__u32)(bh_result->b_size >> sbi->block_size_shift);
 	struct vdfs4_extent_info extent;
+
 	if (!create)
-		BUG();
+		VDFS4_BUG(sbi);
 	memset(&extent, 0x0, sizeof(extent));
 	mutex_lock(&inode_info->truncate_mutex);
 
@@ -951,24 +975,32 @@ int vdfs4_get_block_prep_da(struct inode *inode, sector_t iblock,
 	if (err)
 		goto exit;
 
+	if (S_ISLNK(inode->i_mode) &&
+		!list_empty(&inode_info->runtime_extents) &&
+		vdfs4_runtime_extent_exists(iblock, &inode_info->runtime_extents))
+		/* already reserved in vdfs4_symlink() */
+		goto map_only;
+
 	err = vdfs4_reserve_space(inode, 1);
 	if (err)
 		/* not enough space to reserve */
 		goto exit;
-	map_bh(bh_result, inode->i_sb, VDFS4_INVALID_BLOCK);
-	set_buffer_new(bh_result);
-	set_buffer_delay(bh_result);
+
 	err = vdfs4_runtime_extent_add(iblock, offset_alloc_hint,
 			&inode_info->runtime_extents);
 	if (err) {
 		vdfs4_free_reserved_space(inode, 1);
 		goto exit;
 	}
+map_only:
+	map_bh(bh_result, inode->i_sb, VDFS4_INVALID_BLOCK);
+	set_buffer_new(bh_result);
+	set_buffer_delay(bh_result);
 	goto exit;
 done:
 	res_block = extent.first_block + (iblock - extent.iblock);
 	max_blocks = extent.block_count - (__u32)(iblock - extent.iblock);
-	BUG_ON(res_block > extent.first_block + extent.block_count);
+	VDFS4_BUG_ON(res_block > extent.first_block + extent.block_count, sbi);
 
 	if (res_block > (sector_t)(sb->s_bdev->bd_inode->i_size >>
 				sbi->block_size_shift)) {
@@ -977,7 +1009,7 @@ done:
 			err = -EFAULT;
 			goto exit;
 		} else {
-			BUG();
+			VDFS4_BUG(sbi);
 		}
 	}
 	mutex_unlock(&inode_info->truncate_mutex);
@@ -1010,11 +1042,11 @@ int vdfs4_get_int_block(struct inode *inode, sector_t iblock,
 	int alloc = 0;
 	__u32 max_blocks = 1;
 	int count = 1;
-	__u32 buffer_size = bh_result->b_size >> sbi->block_size_shift;
+	__u32 buffer_size = (__u32)(bh_result->b_size >> sbi->block_size_shift);
 	int err = 0;
 	struct vdfs4_extent_info extent;
 
-	BUG_ON(!mutex_is_locked(&inode_info->truncate_mutex));
+	VDFS4_BUG_ON(!mutex_is_locked(&inode_info->truncate_mutex), sbi);
 	memset(&extent, 0x0, sizeof(extent));
 
 	/* get extent contains iblock*/
@@ -1031,16 +1063,16 @@ int vdfs4_get_int_block(struct inode *inode, sector_t iblock,
 		goto exit;
 
 	if (fsm_flags & VDFS4_FSM_ALLOC_DELAYED) {
-		if(!vdfs4_runtime_extent_exists(iblock,
+		if (!vdfs4_runtime_extent_exists(iblock,
 				&inode_info->runtime_extents))
-			BUG();
+			VDFS4_BUG(sbi);
 	} else {
 		if (buffer_delay(bh_result))
-			BUG();
+			VDFS4_BUG(sbi);
 	}
 	extent.block_count = (u32)count;
 	extent.first_block = vdfs4_fsm_get_free_block(sbi, offset_alloc_hint,
-			&extent.block_count, fsm_flags);
+			&extent.block_count, extent.block_count, fsm_flags);
 
 	if (!extent.first_block) {
 		err = -ENOSPC;
@@ -1048,7 +1080,7 @@ int vdfs4_get_int_block(struct inode *inode, sector_t iblock,
 	}
 
 	extent.iblock = iblock;
-	err = insert_extent(inode_info, &extent, 1);
+	err = insert_extent(inode_info, &extent, 1, 0);
 	if (err) {
 		fsm_flags |= VDFS4_FSM_FREE_UNUSED;
 		if (fsm_flags & VDFS4_FSM_ALLOC_DELAYED) {
@@ -1063,7 +1095,7 @@ int vdfs4_get_int_block(struct inode *inode, sector_t iblock,
 	if (fsm_flags & VDFS4_FSM_ALLOC_DELAYED) {
 		err = vdfs4_runtime_extent_del(extent.iblock,
 			&inode_info->runtime_extents);
-		BUG_ON(err);
+		VDFS4_BUG_ON(err, sbi);
 	}
 
 	alloc = 1;
@@ -1071,7 +1103,7 @@ int vdfs4_get_int_block(struct inode *inode, sector_t iblock,
 done:
 	res_block = extent.first_block + (iblock - extent.iblock);
 	max_blocks = extent.block_count - (u32)(iblock - extent.iblock);
-	BUG_ON(res_block > extent.first_block + extent.block_count);
+	VDFS4_BUG_ON(res_block > extent.first_block + extent.block_count, sbi);
 
 	if (res_block > (sector_t)(sb->s_bdev->bd_inode->i_size >>
 				sbi->block_size_shift)) {
@@ -1080,7 +1112,7 @@ done:
 			err = -EFAULT;
 			goto exit;
 		} else {
-			BUG();
+			VDFS4_BUG(sbi);
 		}
 	}
 
@@ -1099,6 +1131,27 @@ exit:
 	return err;
 }
 
+#ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
+void vdfs4_save_profiling_log(struct vdfs4_sb_info *sbi,
+		ino_t ino, sector_t iblock, u32 blk_cnt)
+{
+	struct vdfs4_prof_data prof_data;
+	const char *pname = CONFIG_VDFS4_SQUEEZE_PROFILING_PARTITION;
+
+	if (VDFS4_IS_READONLY(sbi->sb) ||
+		(strncmp(sbi->sb->s_id, pname, strlen(pname))))
+		return;
+
+	prof_data.stamp = vdfs4_encode_time(CURRENT_TIME);
+	prof_data.ino = (__u32)ino;
+	prof_data.block = (__u32)iblock;
+	prof_data.count = (__u32)blk_cnt;
+
+	kfifo_in_locked(&sbi->prof_fifo, &prof_data, sizeof(prof_data),
+			&sbi->prof_lock);
+}
+#endif
+
 /**
  * @brief				Logical to physical block numbers
  *					translation.
@@ -1106,15 +1159,19 @@ exit:
  * @param [in]		iblock		Requested logical block number.
  * @param [in, out]	bh_result	Pointer to buffer_head.
  * @param [in]		create		"Expand file allowed" flag.
- * @return			Returns physical block number,
- *					0 if ENOSPC
+ * @return                     0 on success, or error code
  */
 int vdfs4_get_block(struct inode *inode, sector_t iblock,
 	struct buffer_head *bh_result, int create)
 {
 	int ret = 0;
-	struct vdfs4_inode_info *inode_info= VDFS4_I(inode);
+	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
 	struct mutex *lock = &inode_info->truncate_mutex;
+#ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
+	struct vdfs4_sb_info *sbi = inode->i_sb->s_fs_info;
+
+	vdfs4_save_profiling_log(sbi, inode->i_ino, iblock, 1);
+#endif
 	mutex_lock(lock);
 	ret = vdfs4_get_int_block(inode, iblock, bh_result, create, 0);
 	mutex_unlock(lock);
@@ -1128,10 +1185,20 @@ int vdfs4_get_block_da(struct inode *inode, sector_t iblock,
 					VDFS4_FSM_ALLOC_DELAYED);
 }
 
+/**
+ * @brief					This is a special get_block_t callback
+ *							which is used by vdfs4_writepage().
+ *							This function will be not called in normal.
+ * @param [in]         inode           Pointer to inode structure.
+ * @param [in]         iblock          Requested logical block number.
+ * @param [in, out]    bh_result       Pointer to buffer_head.
+ * @param [in]         create          "Expand file allowed" flag.
+ * @return                     0 on success, or error code
+ */
 static int vdfs4_get_block_bug(struct inode *inode, sector_t iblock,
 	struct buffer_head *bh_result, int create)
 {
-	BUG();
+	VDFS4_BUG(VDFS4_SB(inode->i_sb));
 	return 0;
 }
 
@@ -1146,7 +1213,7 @@ static int vdfs4_releasepage(struct page *page, gfp_t gfp_mask)
 	return try_to_free_buffers(page);
 }
 
-#ifdef CONFIG_VDFS4_EXEC_ONLY_AUTHENTICATED
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 
 static int vdfs4_access_remote_vm(struct mm_struct *mm,
 		unsigned long addr, void *buf, int len)
@@ -1229,7 +1296,7 @@ static int current_reads_only_authenticated(struct inode *inode, bool mm_locked)
 	if (!mm_locked)
 		down_read(&mm->mmap_sem);
 	if (mm->exe_file) {
-		struct inode *caller = mm->exe_file->f_dentry->d_inode;
+		struct inode *caller = mm->exe_file->f_path.dentry->d_inode;
 
 		ret = !memcmp(&caller->i_sb->s_magic, VDFS4_SB_SIGNATURE,
 			sizeof(VDFS4_SB_SIGNATURE) - 1) &&
@@ -1240,6 +1307,7 @@ static int current_reads_only_authenticated(struct inode *inode, bool mm_locked)
 #endif
 			unsigned int len;
 			char *buffer = kzalloc(PAGE_SIZE, GFP_NOFS);
+
 			VDFS4_ERR("mmap is not permited for:"
 					" ino - %lu: name -%s, pid - %d,"
 					" Can't read "
@@ -1253,6 +1321,7 @@ static int current_reads_only_authenticated(struct inode *inode, bool mm_locked)
 			len = get_pid_cmdline(mm, buffer);
 			if (len > 0) {
 				size_t i = 0;
+
 				VDFS4_ERR("Pid %d cmdline - ", task_pid_nr(task));
 				for (i = 0; i <= len;
 						i += strlen(buffer + i) + 1)
@@ -1283,7 +1352,14 @@ out:
  */
 static int vdfs4_readpage(struct file *file, struct page *page)
 {
-	return mpage_readpage(page, vdfs4_get_block);
+	int ret;
+
+	VT_PREPARE_PARAM(vt_data);
+	VT_AOPS_START(vt_data, vdfs_trace_aops_readpage,
+		      page->mapping->host, file, page->index, 1, AOPS_SYNC);
+	ret = mpage_readpage(page, vdfs4_get_block);
+	VT_FINISH(vt_data);
+	return ret;
 }
 
 
@@ -1295,7 +1371,7 @@ static int vdfs4_readpage(struct file *file, struct page *page)
  */
 static int vdfs4_readpage_special(struct file *file, struct page *page)
 {
-	BUG();
+	VDFS4_BUG(NULL);
 }
 
 /**
@@ -1309,15 +1385,24 @@ static int vdfs4_readpage_special(struct file *file, struct page *page)
 static int vdfs4_readpages(struct file *file, struct address_space *mapping,
 		struct list_head *pages, unsigned nr_pages)
 {
-	return mpage_readpages(mapping, pages, nr_pages, vdfs4_get_block);
+	int ret;
 
+	#define list_to_page(head) (list_entry((head)->prev, struct page, lru))
+	struct page *page = list_to_page(pages);
+
+	VT_PREPARE_PARAM(vt_data);
+	VT_AOPS_START(vt_data, vdfs_trace_aops_readpages,
+		      mapping->host, file, page->index, nr_pages, AOPS_SYNC);
+	ret = mpage_readpages(mapping, pages, nr_pages, vdfs4_get_block);
+	VT_FINISH(vt_data);
+	return ret;
 }
 
 static int vdfs4_readpages_special(struct file *file,
 		struct address_space *mapping, struct list_head *pages,
 		unsigned nr_pages)
 {
-	BUG();
+	VDFS4_BUG(NULL);
 }
 
 static enum compr_type get_comprtype_by_descr(
@@ -1335,26 +1420,45 @@ static enum compr_type get_comprtype_by_descr(
 			sizeof(descr->magic) - 1))
 		return VDFS4_COMPR_GZIP;
 
-	if (!memcmp(descr->magic + 1, VDFS4_COMPR_ZHW_FILE_DESCR_MAGIC,
-			sizeof(descr->magic) - 1))
-		return VDFS4_COMPR_ZHW;
 	return -EINVAL;
+}
+
+static int get_file_descr_length(struct vdfs4_comp_file_descr *descr)
+{
+	switch (descr->layout_version) {
+	case VDFS4_COMPR_LAYOUT_VER_06:
+		return VDFS4_COMPR_FILE_DESC_LEN_06;
+	case VDFS4_COMPR_LAYOUT_VER_05:
+		return VDFS4_COMPR_FILE_DESC_LEN_05;
+	default:
+		VDFS4_ERR("Unsupported compressed file layout %04x",
+			descr->layout_version);
+		return -1;
+	}
 }
 
 static int vdfs4_file_descriptor_verify(struct vdfs4_inode_info *inode_i,
 		struct vdfs4_comp_file_descr *descr)
 {
-	int ret = 0;
+	int ret = 0, i, supported = 0;
 	enum compr_type compr_type;
-	if (le32_to_cpu(descr->layout_version) != VDFS4_COMPR_LAYOUT_VER) {
+
+	for (i = 0; i < VDFS4_NUM_OF_SUPPORTED_COMPR_LAYOUTS; i++) {
+		if (le16_to_cpu(descr->layout_version) ==
+					supported_compressed_layouts[i]) {
+			supported = 1;
+			break;
+		}
+	}
+	if (!supported) {
 		VDFS4_ERR("Wrong descriptor layout version %d (expected %d) file %s",
-				le32_to_cpu(descr->layout_version), VDFS4_COMPR_LAYOUT_VER,
+				le16_to_cpu(descr->layout_version), VDFS4_COMPR_LAYOUT_VER,
 				INODEI_NAME(inode_i));
 		ret = -EINVAL;
 		goto err;
 	}
 
-	switch(descr->magic[0]) {
+	switch (descr->magic[0]) {
 	case VDFS4_COMPR_DESCR_START:
 	case VDFS4_SHA1_AUTH:
 	case VDFS4_SHA256_AUTH:
@@ -1371,7 +1475,6 @@ static int vdfs4_file_descriptor_verify(struct vdfs4_inode_info *inode_i,
 	compr_type = get_comprtype_by_descr(descr);
 	switch (compr_type) {
 	case VDFS4_COMPR_ZLIB:
-	case VDFS4_COMPR_ZHW:
 	case VDFS4_COMPR_GZIP:
 	case VDFS4_COMPR_LZO:
 		break;
@@ -1385,8 +1488,11 @@ static int vdfs4_file_descriptor_verify(struct vdfs4_inode_info *inode_i,
 	}
 
 err:
-	if(ret)
+	if (ret) {
 		VDFS4_MDUMP("Bad descriptor dump:", descr, sizeof(*descr));
+		vdfs4_print_volume_verification(
+					VDFS4_SB(inode_i->vfs_inode.i_sb));
+	}
 	return ret;
 }
 
@@ -1399,6 +1505,7 @@ static int get_file_descriptor(struct vdfs4_inode_info *inode_i,
 	loff_t descr_offset;
 	int ret = 0;
 	struct page *pages[2] = {0};
+
 	if (inode_i->fbc->comp_size < sizeof(*descr))
 		return -EINVAL;
 	descr_offset = inode_i->fbc->comp_size - sizeof(*descr);
@@ -1414,7 +1521,7 @@ static int get_file_descriptor(struct vdfs4_inode_info *inode_i,
 			return ret;
 
 		data = vdfs4_vmap(pages, 2, VM_MAP, PAGE_KERNEL);
-		if(!data) {
+		if (!data) {
 			ret = -ENOMEM;
 			goto err;
 		}
@@ -1430,11 +1537,22 @@ static int get_file_descriptor(struct vdfs4_inode_info *inode_i,
 		memcpy(descr, (char *)data + pos, sizeof(*descr));
 		kunmap_atomic(data);
 	}
+
+	if (le16_to_cpu(descr->layout_version) ==
+			VDFS4_COMPR_LAYOUT_VER_05) {
+#ifdef CONFIG_VDFS4_ALLOW_LEGACY_SIGN
+		descr->sign_type = VDFS4_SIGN_RSA1024;
+#else
+		descr->sign_type = VDFS4_SIGN_MAX;
+		ret = -EPERM;
+		goto err;
+#endif
+	}
 	ret = vdfs4_file_descriptor_verify(inode_i, descr);
 err:
 	for (page_idx = 0; page_idx < 2; page_idx++) {
-		if(pages[page_idx]) {
-			if(ret && ret != -ENOMEM) {
+		if (pages[page_idx]) {
+			if (ret && ret != -ENOMEM) {
 				lock_page(pages[page_idx]);
 				ClearPageChecked(pages[page_idx]);
 				unlock_page(pages[page_idx]);
@@ -1444,66 +1562,6 @@ err:
 		}
 	}
 	return ret;
-}
-
-static void copy_pages(struct page **src_pages, struct page **dst_pages,
-		int src_offset, int dst_offset, unsigned long length)
-{
-	void *src, *dst;
-	int len;
-	while (length) {
-		len = min(PAGE_SIZE - max(src_offset, dst_offset), length);
-		src = kmap_atomic(*src_pages);
-		dst = kmap_atomic(*dst_pages);
-		memcpy((char *)dst + dst_offset, (char *)src + src_offset,
-				(size_t)len);
-		kunmap_atomic(dst);
-		kunmap_atomic(src);
-		length -= (unsigned long)len;
-		src_offset += len;
-		dst_offset += len;
-		if (src_offset == PAGE_SIZE) {
-			src_pages++;
-			src_offset = 0;
-		}
-		if (dst_offset == PAGE_SIZE) {
-			dst_pages++;
-			dst_offset = 0;
-		}
-	}
-}
-
-static int vdfs4_data_link_readpage(struct file *file, struct page *page)
-{
-	struct inode *inode = page->mapping->host;
-	struct inode *data_inode = VDFS4_I(inode)->data_link.inode;
-	u64 offset = VDFS4_I(inode)->data_link.offset;
-	pgoff_t index = page->index + (pgoff_t)(offset >> PAGE_CACHE_SHIFT);
-	struct page *data[2];
-
-	data[0] = read_mapping_page(data_inode->i_mapping, index, NULL);
-	if (IS_ERR(data[0]))
-		goto err0;
-	if (offset % PAGE_CACHE_SIZE) {
-		data[1] = read_mapping_page(data_inode->i_mapping,
-					    index + 1, NULL);
-		if (IS_ERR(data[1]))
-			goto err1;
-	}
-	copy_pages(data, &page, offset % PAGE_CACHE_SIZE, 0, PAGE_CACHE_SIZE);
-	if (offset % PAGE_CACHE_SIZE)
-		page_cache_release(data[1]);
-	page_cache_release(data[0]);
-	SetPageUptodate(page);
-	unlock_page(page);
-	return 0;
-
-err1:
-	page_cache_release(data[0]);
-	data[0] = data[1];
-err0:
-	unlock_page(page);
-	return PTR_ERR(data[0]);
 }
 
 /**
@@ -1518,7 +1576,9 @@ static int vdfs4_writepage(struct page *page, struct writeback_control *wbc)
 	struct buffer_head *bh;
 	int ret = 0;
 
-	BUG_ON(inode->i_ino <= VDFS4_LSFILE);
+	VT_PREPARE_PARAM(vt_data);
+
+	VDFS4_BUG_ON(inode->i_ino <= VDFS4_LSFILE, VDFS4_SB(inode->i_sb));
 
 	if (!page_has_buffers(page))
 		goto redirty_page;
@@ -1527,14 +1587,18 @@ static int vdfs4_writepage(struct page *page, struct writeback_control *wbc)
 	if ((!buffer_mapped(bh) || buffer_delay(bh)) && buffer_dirty(bh))
 		goto redirty_page;
 
+	VT_AOPS_START(vt_data, vdfs_trace_aops_writepage,
+		      page->mapping->host, NULL, 0, wbc->nr_to_write,
+		      wbc->sync_mode);
 	ret = block_write_full_page(page, vdfs4_get_block_bug, wbc);
-#if defined(CONFIG_VDFS4_DEBUG)
+#ifdef CONFIG_VDFS4_DEBUG
 	if (ret)
 		VDFS4_ERR("err = %d, ino#%lu name=%s, page index: %lu, "
 				" wbc->sync_mode = %d", ret, inode->i_ino,
 				VDFS4_I(inode)->name, page->index,
 				wbc->sync_mode);
 #endif
+	VT_FINISH(vt_data);
 	return ret;
 redirty_page:
 	redirty_page_for_writepage(wbc, page);
@@ -1544,18 +1608,18 @@ redirty_page:
 
 static int vdfs4_readpage_tuned_sw(struct file *file, struct page *page)
 {
-
 	int ret = 0, i;
 	struct page **chunk_pages = NULL;
 	struct vdfs4_comp_extent_info cext;
 	struct inode *inode = page->mapping->host;
 	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
-	pgoff_t index = page->index & ~((1 << (inode_i->fbc->log_chunk_size -
-					PAGE_SHIFT)) - 1);
+	pgoff_t index = page->index & ~((1lu << (inode_i->fbc->log_chunk_size -
+					(unsigned long)PAGE_SHIFT)) - 1lu);
 	int pages_count = (1 << (inode_i->fbc->log_chunk_size -
 			PAGE_SHIFT)) + 1;
+	VT_PREPARE_PARAM(vt_data);
 
-	chunk_pages = kmalloc(sizeof(struct page *) * pages_count, GFP_NOFS);
+	chunk_pages = kzalloc(sizeof(struct page *) * pages_count, GFP_NOFS);
 
 	if (!chunk_pages) {
 		ret = -ENOMEM;
@@ -1571,14 +1635,17 @@ static int vdfs4_readpage_tuned_sw(struct file *file, struct page *page)
 		unlock_page(page);
 		goto exit;
 	}
+	VT_START(vt_data);
 
 	unlock_page(page);
 	/* read input data (read chunk from disk) */
 	ret = vdfs4_read_chunk(page, chunk_pages, &cext);
-	if (ret < 0)
+	if (ret < 0) {
+		VT_DECOMP_FINISH(vt_data, vdfs_trace_decomp_sw, NULL,
+				 0, 0, 0, 1/*canceled*/, 0);
 		goto exit;
-
-	ret = vdfs4_auth_decompress(page->mapping->host, chunk_pages, index,
+	}
+	ret = vdfs4_auth_decompress_sw(page->mapping->host, chunk_pages, index,
 			&cext, page);
 
 	for (i = 0; i < cext.blocks_n; i++) {
@@ -1590,26 +1657,34 @@ static int vdfs4_readpage_tuned_sw(struct file *file, struct page *page)
 			mark_page_accessed(chunk_pages[i]);
 		page_cache_release(chunk_pages[i]);
 	}
+	VT_DECOMP_FINISH(vt_data, vdfs_trace_decomp_sw, inode,
+			 (cext.start_block << PAGE_CACHE_SHIFT) + cext.offset,
+			 cext.len_bytes,!!(inode_i->fbc->hash_fn),
+			 !!(ret), (cext.flags&VDFS4_CHUNK_FLAG_UNCOMPR));
 exit:
 	kfree(chunk_pages);
 	return ret;
 }
 
-
 #ifdef CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT
-static int vdfs4_readpage_tuned_hw(struct file *file, struct page *page)
+#ifdef CONFIG_VDFS4_SQUEEZE
+static int vdfs4_readpage_tuned_hw_generic(struct file *file, struct page *page)
 {
 	int ret = 0;
 	struct inode *inode = page->mapping->host;
 	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
+	unsigned file_size_pg = ((i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
+					PAGE_CACHE_SHIFT);
 
-	if (page->index >= ((i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
-					PAGE_CACHE_SHIFT)) {
+	if (page->index >= file_size_pg) {
 		clear_highpage(page);
 		SetPageUptodate(page);
 		unlock_page(page);
 		return 0;
 	}
+
+	if (inode_i->fbc->force_path == FORCE_SW)
+		goto sw;
 
 	/* We must lock all pages in the chunk one by one from the beginning,
 	 * otherwise we might deadlock with concurrent read of other page. */
@@ -1619,14 +1694,130 @@ static int vdfs4_readpage_tuned_hw(struct file *file, struct page *page)
 	if (ret) {
 		/* HW decompression/auth has failed, try software one */
 		lock_page(page);
+sw:
+		ret = vdfs4_readpage_tuned_sw(file, page);
+	}
+	return ret;
+
+}
+
+static int vdfs4_readpage_tuned_hw(struct file *file, struct page *page)
+{
+	int ret;
+	struct inode *inode = page->mapping->host;
+	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
+	unsigned file_size_pg = ((i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
+						PAGE_CACHE_SHIFT);
+	VT_PREPARE_PARAM(vt_data);
+
+	VT_AOPS_START(vt_data, vdfs_trace_aops_tuned_chunk,
+		      page->mapping->host, file, 0, 0, AOPS_SYNC);
+	ret = vdfs4_readpage_tuned_hw_generic(file, page);
+	if (ret)
+		goto out;
+
+	if (is_vdfs4_inode_flag_set(inode, VDFS4_PROFILED_FILE)) {
+		struct page *ra_pg;
+		unsigned cur_chunk_idx = (int)(page->index >>
+			(inode_i->fbc->log_chunk_size - PAGE_SHIFT));
+		unsigned next_chunk_idx, next_pg;
+
+		if (inode_i->sci[cur_chunk_idx].order == VDFS4_COMPR_NON_SQUEEZE)
+			next_chunk_idx = cur_chunk_idx + 1;
+		else {
+			struct list_head *ptr, *next;
+			struct vdfs4_squeeze_chunk_info *entry;
+			unsigned i = 0;
+
+			spin_lock(&inode_i->to_read_lock);
+			if (list_empty(&inode_i->to_read_list)) {
+				/* every profiled chunk was read already */
+				spin_unlock(&inode_i->to_read_lock);
+				goto out;
+			}
+
+			list_for_each_safe(ptr, next, &inode_i->to_read_list) {
+				entry = list_entry(ptr, struct vdfs4_squeeze_chunk_info,
+								list);
+
+				if (entry->order == cur_chunk_idx)
+					list_del(&entry->list);
+			}
+
+			if (list_empty(&inode_i->to_read_list)) {
+				spin_unlock(&inode_i->to_read_lock);
+				goto out;
+			}
+
+			entry = list_first_entry(&inode_i->to_read_list,
+						struct vdfs4_squeeze_chunk_info, list);
+			list_del(&entry->list);
+			spin_unlock(&inode_i->to_read_lock);
+
+			next_chunk_idx = entry->order;
+		}
+
+		next_pg = next_chunk_idx <<
+			(inode_i->fbc->log_chunk_size - PAGE_SHIFT);
+
+		if (next_pg > file_size_pg)
+			goto out;
+
+		ra_pg = find_or_create_page(inode->i_mapping, next_pg, GFP_NOFS);
+		if (!ra_pg)
+			/* main read was done, so ignore read ahead error */
+			goto out;
+
+		file->f_ra.start = ra_pg->index;
+		file->f_ra.size = 1 << (inode_i->fbc->log_chunk_size - PAGE_SHIFT);
+
+		/* don't care about result */
+		vdfs4_readpage_tuned_hw_generic(file, ra_pg);
+	}
+out:
+	VT_FINISH(vt_data);
+	return ret;
+}
+#else /* not CONFIG_VDFS4_SQUEEZE */
+static int vdfs4_readpage_tuned_hw(struct file *file, struct page *page)
+{
+	int ret = 0;
+	struct inode *inode = page->mapping->host;
+	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
+	unsigned file_size_pg = ((i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
+					PAGE_CACHE_SHIFT);
+	VT_PREPARE_PARAM(vt_data);
+
+	if (page->index >= file_size_pg) {
+		clear_highpage(page);
+		SetPageUptodate(page);
+		unlock_page(page);
+		return 0;
+	}
+	VT_AOPS_START(vt_data, vdfs_trace_aops_tuned_chunk,
+		      page->mapping->host, file, 0, 0, AOPS_SYNC);
+
+	if (inode_i->fbc->force_path == FORCE_SW)
+		goto sw;
+
+	/* We must lock all pages in the chunk one by one from the beginning,
+	 * otherwise we might deadlock with concurrent read of other page. */
+	unlock_page(page);
+
+	ret = inode_i->fbc->hw_fn(inode, page);
+	if (ret) {
+		/* HW decompression/auth has failed, try software one */
+		lock_page(page);
+sw:
 		ret = vdfs4_readpage_tuned_sw(file, page);
 	}
 
+	VT_FINISH(vt_data);
 	return ret;
 }
-#endif
+#endif /* CONFIG_VDFS4_SQUEEZE */
+#endif /* CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT */
 
-#ifdef CONFIG_VDFS4_RETRY
 static int vdfs4_readpage_tuned_sw_retry(struct file *file, struct page *page)
 {
 	int i = 0, ret;
@@ -1636,11 +1827,11 @@ static int vdfs4_readpage_tuned_sw_retry(struct file *file, struct page *page)
 			lock_page(page);
 		ret = vdfs4_readpage_tuned_sw(file, page);
 		if (ret)
-			i++;
-	} while (ret && (i < 3));
+			VDFS4_ERR("read(sw) decompression retry: %d", i);
+	} while (ret && (++i < 3));
 
 	if (i && !ret)
-		VDFS4_DEBUG_TMP("decomression retry successfully done");
+		VDFS4_NOTICE("decompression retry successfully done");
 	return ret;
 }
 
@@ -1654,17 +1845,23 @@ static int vdfs4_readpage_tuned_hw_retry(struct file *file, struct page *page)
 			lock_page(page);
 		ret = vdfs4_readpage_tuned_hw(file, page);
 		if (ret)
-			i++;
-	} while (ret && (i < 3));
+			VDFS4_ERR("read(hw) decompression retry: %d", i);
+	} while (ret && (++i < 3));
 
 	if (i && !ret)
-		VDFS4_DEBUG_TMP("decomression retry successfully done");
+		VDFS4_NOTICE("decompression retry successfully done");
 	return ret;
 }
 #endif
-#endif
 
-static int vdfs4_allocate_space(struct vdfs4_inode_info *inode_info)
+/**
+ * @brief		Allocate physical space corresponding to extent(logical offset and size)
+ * @param [in]	inode_info	Pointer to inode_info structure.
+ * @param [in]	do_erase	It's flag which control erase.
+ * @return		Returns error codes
+ */
+static int vdfs4_allocate_space(struct vdfs4_inode_info *inode_info,
+				int do_erase)
 {
 	struct list_head *ptr;
 	struct list_head *next;
@@ -1685,18 +1882,18 @@ again:
 		count = entry->block_count;
 
 		extent.first_block = vdfs4_fsm_get_free_block(sbi, entry->
-				alloc_hint, &count, VDFS4_FSM_ALLOC_DELAYED);
+				alloc_hint, &count, count, VDFS4_FSM_ALLOC_DELAYED);
 
 		if (!extent.first_block) {
 			/* it shouldn't happen because space
 			 * was reserved early in aio_write */
-			BUG();
+			VDFS4_BUG(sbi);
 			goto exit;
 		}
 
 		extent.iblock = entry->iblock;
 		extent.block_count = count;
-		err = insert_extent(inode_info, &extent, 0);
+		err = insert_extent(inode_info, &extent, 0, do_erase);
 		if (err) {
 			vdfs4_fsm_put_free_block(inode_info,
 				extent.first_block, extent.block_count,
@@ -1743,17 +1940,28 @@ static int vdfs4_writepages(struct address_space *mapping,
 			.bio = NULL,
 			.last_block_in_bio = 0,
 	};
+
+	VT_PREPARE_PARAM(vt_data);
+	VT_AOPS_START(vt_data, vdfs_trace_aops_writepages,
+		      mapping->host, NULL, wbc->range_start,
+		      wbc->range_end - wbc->range_start,
+		      wbc->sync_mode);
+
 	vdfs4_start_writeback(sbi);
 	/* if we have runtime extents, allocate space on volume*/
 	if (!list_empty(&inode_info->runtime_extents))
-		ret = vdfs4_allocate_space(inode_info);
+		ret = vdfs4_allocate_space(inode_info, 0);
+
 	blk_start_plug(&plug);
 	/* write dirty pages */
 	ret = write_cache_pages(mapping, wbc, vdfs4_mpage_writepage, &mpd);
 	if (mpd.bio)
 		vdfs4_mpage_bio_submit(WRITE, mpd.bio);
 	blk_finish_plug(&plug);
+
 	vdfs4_stop_writeback(sbi);
+
+	VT_FINISH(vt_data);
 	return ret;
 }
 
@@ -1785,12 +1993,21 @@ static int vdfs4_write_begin(struct file *file, struct address_space *mapping,
 			struct page **pagep, void **fsdata)
 {
 	int rc = 0;
+
+	VT_PREPARE_PARAM(vt_data);
+	VT_AOPS_START(vt_data, vdfs_trace_aops_write_begin,
+		      mapping->host, file, pos, len,
+			  AOPS_SYNC_NONE);	/* FIXME */
+
 	vdfs4_start_transaction(VDFS4_SB(mapping->host->i_sb));
+
 	rc = block_write_begin(mapping, pos, len, flags, pagep,
 		vdfs4_get_block_prep_da);
 
 	if (rc)
 		vdfs4_stop_transaction(VDFS4_SB(mapping->host->i_sb));
+
+	VT_FINISH(vt_data);
 	return rc;
 }
 
@@ -1848,17 +2065,15 @@ static int vdfs4_file_open_init_compressed(struct inode *inode)
 	if (inode_info->fbc) {
 		mutex_lock(&inode->i_mutex);
 		if ((inode_info->fbc) &&
-			(inode_info->fbc->compr_type == VDFS4_COMPR_UNDEF)) {
-#ifdef CONFIG_VDFS4_RETRY
-				int retry_count = 1;
-				do {
-#endif
-					rc = vdfs4_init_file_decompression(inode_info, 1);
-#ifdef CONFIG_VDFS4_RETRY
-					if (rc)
-						VDFS4_ERR("init decompression retry %d", retry_count);
-				} while (rc && (retry_count++ < 3));
-#endif
+		    (inode_info->fbc->compr_type == VDFS4_COMPR_UNDEF)) {
+			int retry_count = 0;
+
+			do {
+				rc = vdfs4_init_file_decompression(inode_info, 1);
+				if (rc)
+					VDFS4_ERR("init decompression retry: %d",
+						retry_count);
+			} while (rc && (++retry_count < 3));
 		}
 		mutex_unlock(&inode->i_mutex);
 	}
@@ -1875,26 +2090,33 @@ static int vdfs4_file_open(struct inode *inode, struct file *filp)
 {
 	int rc = 0;
 
-	if (is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE))
-	{
+	VT_PREPARE_PARAM(vt_data);
+
+	trace_vdfs4_file_open(inode, filp);
+	VT_FOPS_START(vt_data, vdfs_trace_fops_open,
+		      inode->i_sb->s_bdev->bd_part, inode, filp);
+
+	if (is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE)) {
 		if (filp->f_flags & (O_CREAT | O_TRUNC | O_WRONLY | O_RDWR))
 			rc = -EPERM;
 		else
 			rc = vdfs4_file_open_init_compressed(inode);
+		if (rc)
+			goto exit;
 	}
-
-	/* dlink should never have COMPRESSED_FILE set, only link inode can */
-	if (!rc && is_dlink(inode) && is_vdfs4_inode_flag_set(
-			VDFS4_I(inode)->data_link.inode, VDFS4_COMPRESSED_FILE))
-		rc = vdfs4_file_open_init_compressed(VDFS4_I(inode)->data_link.inode);
-
-	if (rc)
-		return rc;
+#ifdef CONFIG_VDFS4_SQUEEZE
+	if (is_vdfs4_inode_flag_set(inode, VDFS4_PROFILED_FILE)) {
+		/* turn off standard read-ahead for this file */
+		filp->f_ra.ra_pages = 0;
+		filp->f_flags |= O_PROFILED;
+	}
+#endif
 
 	rc = generic_file_open(inode, filp);
 	if (!rc)
 		atomic_inc(&(VDFS4_I(inode)->open_count));
-
+exit:
+	VT_FINISH(vt_data);
 	return rc;
 }
 
@@ -1907,6 +2129,8 @@ static int vdfs4_file_open(struct inode *inode, struct file *filp)
 static int vdfs4_file_release(struct inode *inode, struct file *file)
 {
 	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
+
+	trace_vdfs4_file_release(inode, file);
 	VDFS4_DEBUG_INO("#%lu", inode->i_ino);
 	atomic_dec(&(inode_info->open_count));
 	return 0;
@@ -1921,7 +2145,13 @@ static int vdfs4_file_release(struct inode *inode, struct file *file)
  */
 static int vdfs4_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 {
-	return vdfs4_create(dir, dentry, S_IFDIR | mode, NULL);
+	int rtn;
+
+	VT_PREPARE_PARAM(vt_data);
+	VT_IOPS_START(vt_data, vdfs_trace_iops_mkdir, dentry);
+	rtn = vdfs4_create(dir, dentry, S_IFDIR | mode, NULL);
+	VT_FINISH(vt_data);
+	return rtn;
 }
 
 /**
@@ -1932,35 +2162,41 @@ static int vdfs4_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
  */
 static int vdfs4_rmdir(struct inode *dir, struct dentry *dentry)
 {
+	int rtn;
+
+	VT_PREPARE_PARAM(vt_data);
 	if (dentry->d_inode->i_size)
 		return -ENOTEMPTY;
-
-	return vdfs4_unlink(dir, dentry);
+	VT_IOPS_START(vt_data, vdfs_trace_iops_rmdir, dentry);
+	rtn = vdfs4_unlink(dir, dentry);
+	VT_FINISH(vt_data);
+	return rtn;
 }
 
 /**
  * @brief		Direct IO.
- * @param [in]	rw		read/write
  * @param [in]	iocb	Pointer to io block
- * @param [in]	iov		Pointer to IO vector
+ * @param [in]	iov_iter	Pointer to io iter
  * @param [in]	offset	Offset
- * @param [in]	nr_segs	Number of segments
  * @return		Returns written size
  */
-static ssize_t vdfs4_direct_IO(int rw, struct kiocb *iocb,
-		const struct iovec *iov, loff_t offset, unsigned long nr_segs)
+static ssize_t vdfs4_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
+						loff_t offset)
 {
 	ssize_t rc, inode_new_size = 0;
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file->f_path.dentry->d_inode->i_mapping->host;
 	struct vdfs4_sb_info *sbi = VDFS4_SB(inode->i_sb);
 
-	if (rw)
+	VT_PREPARE_PARAM(vt_data);
+
+	VT_AOPS_START(vt_data, vdfs_trace_aops_direct_io,
+		      inode, file, iocb->ki_pos, iter->count, AOPS_SYNC);
+	if (iov_iter_rw(iter))
 		vdfs4_start_transaction(sbi);
-	rc = blockdev_direct_IO(rw, iocb, inode, iov, offset, nr_segs,
-			vdfs4_get_block);
-	if (!rw)
-		return rc;
+	rc = blockdev_direct_IO(iocb, inode, iter, offset, vdfs4_get_block);
+	if (!iov_iter_rw(iter))
+		goto exit;
 
 	vdfs4_assert_i_mutex(inode);
 
@@ -1983,6 +2219,8 @@ static ssize_t vdfs4_direct_IO(int rw, struct kiocb *iocb,
 	}
 
 	vdfs4_stop_transaction(VDFS4_SB(inode->i_sb));
+exit:
+	VT_FINISH(vt_data);
 	return rc;
 }
 
@@ -2017,7 +2255,6 @@ exit:
 	return error;
 }
 
-
 static int vdfs4_update_inode(struct inode *inode, loff_t newsize)
 {
 	int error = 0;
@@ -2045,6 +2282,9 @@ static int vdfs4_setattr(struct dentry *dentry, struct iattr *iattr)
 	struct inode *inode = dentry->d_inode;
 	int error = 0;
 
+	VT_PREPARE_PARAM(vt_data);
+
+	VT_IOPS_START(vt_data, vdfs_trace_iops_setattr, dentry);
 	vdfs4_start_transaction(VDFS4_SB(inode->i_sb));
 	error = inode_change_ok(inode, iattr);
 	if (error)
@@ -2058,7 +2298,7 @@ static int vdfs4_setattr(struct dentry *dentry, struct iattr *iattr)
 		if (error)
 			goto exit;
 
-		truncate_pagecache(inode, inode->i_size, iattr->ia_size);
+		 truncate_pagecache(inode, iattr->ia_size);
 
 		error = vdfs4_update_inode(inode, iattr->ia_size);
 		if (error)
@@ -2071,12 +2311,12 @@ static int vdfs4_setattr(struct dentry *dentry, struct iattr *iattr)
 
 #ifdef CONFIG_VDFS4_POSIX_ACL
 	if (iattr->ia_valid & ATTR_MODE)
-		error = vdfs4_chmod_acl(inode);
+		error = posix_acl_chmod(inode, inode->i_mode);
 #endif
 
 exit:
 	vdfs4_stop_transaction(VDFS4_SB(inode->i_sb));
-
+	VT_FINISH(vt_data);
 	return error;
 }
 
@@ -2088,7 +2328,14 @@ exit:
  */
 static sector_t vdfs4_bmap(struct address_space *mapping, sector_t block)
 {
-	return generic_block_bmap(mapping, block, vdfs4_get_block);
+	sector_t ret;
+
+	VT_PREPARE_PARAM(vt_data);
+	VT_AOPS_START(vt_data, vdfs_trace_aops_bmap,
+		      mapping->host, NULL, 0, 0, AOPS_SYNC);	/* FIXME */
+	ret = generic_block_bmap(mapping, block, vdfs4_get_block);
+	VT_FINISH(vt_data);
+	return ret;
 }
 
 static int __get_record_type_on_mode(struct inode *inode, u8 *record_type)
@@ -2097,8 +2344,6 @@ static int __get_record_type_on_mode(struct inode *inode, u8 *record_type)
 
 	if (is_vdfs4_inode_flag_set(inode, HARD_LINK))
 		*record_type = VDFS4_CATALOG_HLINK_RECORD;
-	else if (is_dlink(inode))
-		*record_type = VDFS4_CATALOG_DLINK_RECORD;
 	else if (S_ISDIR(mode) || S_ISFIFO(mode) ||
 		S_ISSOCK(mode) || S_ISCHR(mode) || S_ISBLK(mode))
 		*record_type = VDFS4_CATALOG_FOLDER_RECORD;
@@ -2108,6 +2353,7 @@ static int __get_record_type_on_mode(struct inode *inode, u8 *record_type)
 		return -EINVAL;
 	return 0;
 }
+
 /**
  * @brief			Function rename.
  * @param [in]	old_dir		Pointer to old dir struct
@@ -2126,9 +2372,12 @@ static int vdfs4_rename(struct inode *old_dir, struct dentry *old_dentry,
 	u8 record_type;
 	int ret;
 
+	VT_PREPARE_PARAM(vt_data);
+
 	if (new_dentry->d_name.len > VDFS4_FILE_NAME_LEN)
 		return -ENAMETOOLONG;
 
+	VT_IOPS_START(vt_data, vdfs_trace_iops_rename, old_dentry);
 	vdfs4_start_transaction(sbi);
 
 	if (new_dentry->d_inode) {
@@ -2148,7 +2397,7 @@ static int vdfs4_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	/* Find old record */
 	VDFS4_DEBUG_MUTEX("cattree mutex w lock");
-	mutex_w_lock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_lock(sbi);
 	VDFS4_DEBUG_MUTEX("cattree mutex w lock succ");
 
 	if (!is_vdfs4_inode_flag_set(mv_inode, HARD_LINK)) {
@@ -2195,7 +2444,7 @@ static int vdfs4_rename(struct inode *old_dir, struct dentry *old_dentry,
 		VDFS4_I(mv_inode)->name = saved_name;
 	}
 
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 
 	mv_inode->i_ctime = vdfs4_current_time(mv_inode);
 	mark_inode_dirty(mv_inode);
@@ -2205,13 +2454,16 @@ static int vdfs4_rename(struct inode *old_dir, struct dentry *old_dentry,
 		old_dir->i_size--;
 	else
 		VDFS4_DEBUG_INO("Files count mismatch");
+	old_dir->i_ctime = old_dir->i_mtime = vdfs4_current_time(old_dir);
 	mark_inode_dirty(old_dir);
 
 	vdfs4_assert_i_mutex(new_dir);
 	new_dir->i_size++;
+	new_dir->i_ctime = new_dir->i_mtime = vdfs4_current_time(new_dir);
 	mark_inode_dirty(new_dir);
 exit:
 	vdfs4_stop_transaction(sbi);
+	VT_FINISH(vt_data);
 	return ret;
 
 remove_record:
@@ -2219,10 +2471,179 @@ remove_record:
 			new_dentry->d_name.name, new_dentry->d_name.len,
 			VDFS4_I(mv_inode)->record_type);
 error:
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 	vdfs4_stop_transaction(sbi);
 	kfree(saved_name);
+	VT_FINISH(vt_data);
 	return ret;
+}
+
+/**
+ * @brief			Function cross rename.
+ * @param [in]	old_dir		Pointer to old dir struct
+ * @param [in]	old_dentry	Pointer to old dir entry struct
+ * @param [in]	new_dir		Pointer to new dir struct
+ * @param [in]	new_dentry	Pointer to new dir entry struct
+ * @return			Returns error codes
+ */
+static int vdfs4_cross_rename(struct inode *old_dir, struct dentry *old_dentry,
+			      struct inode *new_dir, struct dentry *new_dentry)
+{
+	struct vdfs4_sb_info *sbi = old_dir->i_sb->s_fs_info;
+	struct vdfs4_btree *tree = sbi->catalog_tree;
+	struct inode *old_inode = d_inode(old_dentry);
+	struct inode *new_inode = d_inode(new_dentry);
+	struct vdfs4_cattree_record *old_record, *new_record, *record;
+	u8 old_record_type, new_record_type;
+	char *old_saved_name = NULL;
+	char *new_saved_name = NULL;
+	int ret = -ENOENT;
+
+	VT_PREPARE_PARAM(vt_data);
+
+	VT_IOPS_START(vt_data, vdfs_trace_iops_rename2, old_dentry);
+
+	vdfs4_start_transaction(sbi);
+
+	/*
+	 * old/new_inode->i_mutex is not always locked here, but this seems ok.
+	 * We have source/destination dir i_mutex and catalog_tree which
+	 * protects everything.
+	 */
+	VDFS4_DEBUG_MUTEX("cattree mutex w lock");
+	vdfs4_cattree_w_lock(sbi);
+	VDFS4_DEBUG_MUTEX("cattree mutex w lock succ");
+
+	/* handle old record */
+	if (!is_vdfs4_inode_flag_set(old_inode, HARD_LINK)) {
+		new_saved_name = kstrdup(new_dentry->d_name.name, GFP_NOFS);
+		ret = -ENOMEM;
+		if (!new_saved_name)
+			goto error;
+	}
+	if (!is_vdfs4_inode_flag_set(new_inode, HARD_LINK)) {
+		old_saved_name = kstrdup(old_dentry->d_name.name, GFP_NOFS);
+		ret = -ENOMEM;
+		if (!old_saved_name)
+			goto error;
+	}
+
+	ret = __get_record_type_on_mode(old_inode, &old_record_type);
+	if (ret)
+		goto error;
+
+	ret = __get_record_type_on_mode(new_inode, &new_record_type);
+	if (ret)
+		goto error;
+
+	/* Insert old record to new entry */
+	old_record = vdfs4_cattree_place_record(tree, old_inode->i_ino,
+						new_dir->i_ino, new_dentry->d_name.name,
+						new_dentry->d_name.len, old_record_type);
+	if (IS_ERR(old_record)) {
+		ret = PTR_ERR(old_record);
+		goto error;
+	}
+
+	/* Insert new record to old entry */
+	new_record = vdfs4_cattree_place_record(tree, new_inode->i_ino,
+						old_dir->i_ino, old_dentry->d_name.name,
+						old_dentry->d_name.len, new_record_type);
+	if (IS_ERR(new_record)) {
+		ret = PTR_ERR(new_record);
+		goto remove_record1;
+	}
+
+	/* Full it just in case, writeback anyway will fill it again. */
+	vdfs4_fill_cattree_record(old_inode, old_record);
+	vdfs4_release_dirty_record((struct vdfs4_btree_gen_record *) old_record);
+	vdfs4_fill_cattree_record(new_inode, new_record);
+	vdfs4_release_dirty_record((struct vdfs4_btree_gen_record *) new_record);
+
+	/* Remove Ex-record */
+	ret = vdfs4_cattree_remove(tree, old_inode->i_ino,
+				   old_dir->i_ino, old_dentry->d_name.name,
+				   old_dentry->d_name.len,
+				   VDFS4_I(old_inode)->record_type);
+	if (ret)
+		goto remove_record2;
+
+	ret = vdfs4_cattree_remove(tree, new_inode->i_ino,
+				   new_dir->i_ino, new_dentry->d_name.name,
+				   new_dentry->d_name.len,
+				   VDFS4_I(new_inode)->record_type);
+	if (ret)
+		goto remove_record3;
+
+	if (!(is_vdfs4_inode_flag_set(old_inode, HARD_LINK))) {
+		VDFS4_I(old_inode)->parent_id = new_dir->i_ino;
+		kfree(VDFS4_I(old_inode)->name);
+		VDFS4_I(old_inode)->name = new_saved_name;
+	}
+
+	if (!(is_vdfs4_inode_flag_set(new_inode, HARD_LINK))) {
+		VDFS4_I(new_inode)->parent_id = old_dir->i_ino;
+		kfree(VDFS4_I(new_inode)->name);
+		VDFS4_I(new_inode)->name = old_saved_name;
+	}
+
+	vdfs4_cattree_w_unlock(sbi);
+
+	old_inode->i_ctime = vdfs4_current_time(old_inode);
+	mark_inode_dirty(old_inode);
+	new_inode->i_ctime = vdfs4_current_time(new_inode);
+	mark_inode_dirty(new_inode);
+
+	vdfs4_assert_i_mutex(old_dir);
+	old_dir->i_ctime = old_dir->i_mtime = vdfs4_current_time(old_dir);
+	mark_inode_dirty(old_dir);
+
+	vdfs4_assert_i_mutex(new_dir);
+	new_dir->i_ctime = new_dir->i_mtime = vdfs4_current_time(new_dir);
+	mark_inode_dirty(new_dir);
+
+	vdfs4_stop_transaction(sbi);
+	VT_FINISH(vt_data);
+	return ret;
+
+remove_record3:
+	record = vdfs4_cattree_place_record(tree, old_inode->i_ino,
+					    old_dir->i_ino, old_dentry->d_name.name,
+					    old_dentry->d_name.len,
+					    VDFS4_I(old_inode)->record_type);
+
+	vdfs4_fill_cattree_record(old_inode, record);
+	vdfs4_release_dirty_record((struct vdfs4_btree_gen_record *) record);
+
+remove_record2:
+	vdfs4_cattree_remove(tree, new_inode->i_ino,
+			     old_dir->i_ino, old_dentry->d_name.name,
+			     old_dentry->d_name.len, new_record_type);
+remove_record1:
+	vdfs4_cattree_remove(tree, old_inode->i_ino,
+			     new_dir->i_ino, new_dentry->d_name.name,
+			     new_dentry->d_name.len, old_record_type);
+error:
+	vdfs4_cattree_w_unlock(sbi);
+	vdfs4_stop_transaction(sbi);
+	kfree(old_saved_name);
+	kfree(new_saved_name);
+	VT_FINISH(vt_data);
+	return ret;
+}
+
+static int vdfs4_rename2(struct inode *old_dir, struct dentry *old_dentry,
+			 struct inode *new_dir, struct dentry *new_dentry,
+			 unsigned int flags)
+{
+	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
+		return -EINVAL;
+
+	if (flags & RENAME_EXCHANGE)
+		return vdfs4_cross_rename(old_dir, old_dentry,
+					  new_dir, new_dentry);
+
+	return vdfs4_rename(old_dir, old_dentry, new_dir, new_dentry);
 }
 
 /**
@@ -2230,6 +2651,7 @@ error:
  * @param [in]	cat_tree	Pointer to catalog tree
  * @param [in]	hlink_id	Hardlink id
  * @param [in]	par_ino_n	Parent inode number
+ * @param [in]	file_mode	file mode (socket,block,char,normal...)
  * @param [in]	name		Name
  * @return			Returns error codes
  */
@@ -2274,7 +2696,9 @@ static int transform_into_hlink(struct inode *inode)
 	if (ret)
 		goto out_ilink;
 
-	__get_record_type_on_mode(inode, &record_type);
+	ret = __get_record_type_on_mode(inode, &record_type);
+	if (ret)
+		goto out_hlink;
 
 	/*
 	 * Insert hard-link body
@@ -2316,8 +2740,8 @@ static int transform_into_hlink(struct inode *inode)
 out_record:
 	/* FIXME ugly */
 	vdfs4_release_record((struct vdfs4_btree_gen_record *) hlink);
-	vdfs4_cattree_remove(sbi->catalog_tree, inode->i_ino, inode->i_ino, NULL,
-			0, VDFS4_I(inode)->record_type);
+	vdfs4_cattree_remove(sbi->catalog_tree, inode->i_ino, inode->i_ino,
+			NULL, 0, VDFS4_I(inode)->record_type);
 out_hlink:
 	vdfs4_cattree_insert_ilink(sbi->catalog_tree, inode->i_ino,
 			VDFS4_I(inode)->parent_id, VDFS4_I(inode)->name,
@@ -2340,6 +2764,8 @@ static int vdfs4_link(struct dentry *old_dentry, struct inode *dir,
 	struct vdfs4_sb_info *sbi = inode->i_sb->s_fs_info;
 	int ret;
 
+	VT_PREPARE_PARAM(vt_data);
+
 	vdfs4_assert_i_mutex(inode);
 
 	if (dentry->d_name.len > VDFS4_FILE_NAME_LEN)
@@ -2348,8 +2774,9 @@ static int vdfs4_link(struct dentry *old_dentry, struct inode *dir,
 	if (inode->i_nlink >= VDFS4_LINK_MAX)
 		return -EMLINK;
 
+	VT_IOPS_START(vt_data, vdfs_trace_iops_link, dentry);
 	vdfs4_start_transaction(sbi);
-	mutex_w_lock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_lock(sbi);
 
 	if (!is_vdfs4_inode_flag_set(inode, HARD_LINK)) {
 		ret = transform_into_hlink(inode);
@@ -2363,7 +2790,7 @@ static int vdfs4_link(struct dentry *old_dentry, struct inode *dir,
 		goto err_exit;
 
 	VDFS4_DEBUG_MUTEX("cattree mutex w lock un");
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 
 	inode->i_ctime = vdfs4_current_time(inode);
 
@@ -2382,99 +2809,11 @@ static int vdfs4_link(struct dentry *old_dentry, struct inode *dir,
 	sbi->files_count++;
 exit:
 	vdfs4_stop_transaction(sbi);
+	VT_FINISH(vt_data);
 	return ret;
 err_exit:
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 	goto exit;
-}
-
-int vdfs4_data_link_create(struct dentry *parent, const char *name,
-		struct inode *data_inode, __u64 data_offset, __u64 data_length)
-{
-	struct inode *dir = parent->d_inode;
-	struct vdfs4_sb_info *sbi = dir->i_sb->s_fs_info;
-	struct vdfs4_layout_sb *vdfs4_sb = sbi->raw_superblock;
-	struct vdfs4_catalog_dlink_record *dlink;
-	struct vdfs4_cattree_record *record;
-	ino_t ino;
-	int err;
-
-	if (dir->i_sb != data_inode->i_sb || !S_ISREG(data_inode->i_mode) ||
-			is_dlink(data_inode))
-		return -EBADF;
-
-	/*
-	 * The same locking madness like in sys_link sequence.
-	 */
-	mutex_lock_nested(&dir->i_mutex, I_MUTEX_PARENT);
-	mutex_lock(&data_inode->i_mutex);
-	vdfs4_start_transaction(sbi);
-
-	err = vdfs4_get_free_inode(sbi, &ino, 1);
-	if (err)
-		goto err_alloc_ino;
-
-	mutex_w_lock(sbi->catalog_tree->rw_tree_lock);
-
-	if (!is_vdfs4_inode_flag_set(data_inode, HARD_LINK)) {
-		err = transform_into_hlink(data_inode);
-		if (err)
-			goto err_transform;
-	}
-
-	record = vdfs4_cattree_place_record(sbi->catalog_tree,
-			ino, dir->i_ino, name, strlen(name),
-			VDFS4_CATALOG_DLINK_RECORD);
-	err = PTR_ERR(record);
-	if (IS_ERR(record))
-		goto err_place_record;
-
-	dlink = (struct vdfs4_catalog_dlink_record *)record->val;
-
-	dlink->common.flags = 0;
-	dlink->common.file_mode = cpu_to_le16(S_IFREG |
-				(data_inode->i_mode & 0555));
-	dlink->common.uid = cpu_to_le32(i_uid_read(data_inode));
-	dlink->common.gid = cpu_to_le32(i_gid_read(data_inode));
-	dlink->common.total_items_count = cpu_to_le64(data_length);
-	dlink->common.links_count = cpu_to_le64(1);
-	dlink->common.creation_time = vdfs4_encode_time(data_inode->i_ctime);
-	dlink->common.access_time = vdfs4_encode_time(data_inode->i_atime);
-	dlink->common.modification_time = vdfs4_encode_time(data_inode->i_mtime);
-	dlink->common.generation = le32_to_cpu(vdfs4_sb->exsb.generation);
-
-	dlink->data_inode = le64_to_cpu(data_inode->i_ino);
-	dlink->data_offset = le64_to_cpu(data_offset);
-	dlink->data_length = le64_to_cpu(data_length);
-
-	vdfs4_release_dirty_record((struct vdfs4_btree_gen_record *)record);
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
-
-	inc_nlink(data_inode);
-	mark_inode_dirty(data_inode);
-
-	dir->i_ctime = vdfs4_current_time(dir);
-	dir->i_mtime = vdfs4_current_time(dir);
-	dir->i_size++;
-	mark_inode_dirty(dir);
-
-	vdfs4_stop_transaction(sbi);
-	mutex_unlock(&data_inode->i_mutex);
-	/* prune negative dentry */
-	shrink_dcache_parent(parent);
-	mutex_unlock(&dir->i_mutex);
-
-	return 0;
-
-err_place_record:
-err_transform:
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
-	vdfs4_free_inode_n(sbi, ino, 1);
-err_alloc_ino:
-	vdfs4_stop_transaction(sbi);
-	mutex_unlock(&data_inode->i_mutex);
-	mutex_unlock(&dir->i_mutex);
-	return err;
 }
 
 /**
@@ -2491,6 +2830,9 @@ static int vdfs4_mknod(struct inode *dir, struct dentry *dentry,
 	struct inode *created_ino;
 	int ret;
 
+	VT_PREPARE_PARAM(vt_data);
+
+	VT_IOPS_START(vt_data, vdfs_trace_iops_mknod, dentry);
 	vdfs4_start_transaction(VDFS4_SB(dir->i_sb));
 
 	if (!new_valid_dev(rdev)) {
@@ -2507,6 +2849,7 @@ static int vdfs4_mknod(struct inode *dir, struct dentry *dentry,
 	mark_inode_dirty(created_ino);
 exit:
 	vdfs4_stop_transaction(VDFS4_SB(dir->i_sb));
+	VT_FINISH(vt_data);
 	return ret;
 }
 
@@ -2522,22 +2865,59 @@ static int vdfs4_symlink(struct inode *dir, struct dentry *dentry,
 {
 	int ret;
 	struct inode *created_ino;
+	int blocks_allocated = 1;
 	int len = (int)strlen(symname);
+
+	VT_PREPARE_PARAM(vt_data);
 
 	if ((len > VDFS4_FULL_PATH_LEN) ||
 			(dentry->d_name.len > VDFS4_FILE_NAME_LEN))
 		return -ENAMETOOLONG;
 
+	VT_IOPS_START(vt_data, vdfs_trace_iops_symlink, dentry);
 	vdfs4_start_transaction(VDFS4_SB(dir->i_sb));
+
+	ret = vdfs4_reserve_space(dir, blocks_allocated);
+	if (ret)
+		goto err_reserve;
 
 	ret = vdfs4_create(dir, dentry, S_IFLNK | S_IRWXUGO, NULL);
 	if (ret)
-		goto exit;
-
+		goto err_create;
 	created_ino = dentry->d_inode;
+
+	mutex_lock(&VDFS4_I(created_ino)->truncate_mutex);
+	ret = vdfs4_runtime_extent_add(0, 0,
+			&VDFS4_I(created_ino)->runtime_extents);
+	if (ret)
+		goto err_ext_add;
+	mutex_unlock(&VDFS4_I(created_ino)->truncate_mutex);
+
 	ret = page_symlink(created_ino, symname, ++len);
-exit:
+	if (ret)
+		goto err_symlink;
+
 	vdfs4_stop_transaction(VDFS4_SB(dir->i_sb));
+	VT_FINISH(vt_data);
+	return 0;
+err_symlink:
+	/* There is no fail path in page_symlink() that clears
+	 * runtime_extents but for safety sake lets count them */
+	mutex_lock(&VDFS4_I(created_ino)->truncate_mutex);
+	blocks_allocated = vdfs4_truncate_runtime_blocks(0,
+			&VDFS4_I(created_ino)->runtime_extents);
+err_ext_add:
+	vdfs4_free_reserved_space(dir, blocks_allocated);
+	mutex_unlock(&VDFS4_I(created_ino)->truncate_mutex);
+	vdfs4_unlink(dir, dentry);
+	vdfs4_stop_transaction(VDFS4_SB(dir->i_sb));
+	VT_FINISH(vt_data);
+	return ret;
+err_create:
+	vdfs4_free_reserved_space(dir, blocks_allocated);
+err_reserve:
+	vdfs4_stop_transaction(VDFS4_SB(dir->i_sb));
+	VT_FINISH(vt_data);
 	return ret;
 }
 
@@ -2559,47 +2939,27 @@ const struct address_space_operations vdfs4_aops = {
 
 };
 
-const struct address_space_operations vdfs4_data_link_aops = {
-	.readpage	= vdfs4_data_link_readpage,
-};
-
-
-#ifdef CONFIG_VDFS4_RETRY
 const struct address_space_operations vdfs4_tuned_aops = {
 	.readpage	= vdfs4_readpage_tuned_sw_retry,
 };
-#else
-const struct address_space_operations vdfs4_tuned_aops = {
-	.readpage	= vdfs4_readpage_tuned_sw,
-};
-#endif
 
 
-#if (defined(CONFIG_VDFS4_USE_HW1_DECOMPRESS) \
-		|| defined (CONFIG_VDFS4_USE_HW2_DECOMPRESS))
-#ifdef CONFIG_VDFS4_RETRY
+#ifdef CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT
 const struct address_space_operations vdfs4_tuned_aops_hw = {
 	.readpage	= vdfs4_readpage_tuned_hw_retry,
 };
-#else
-const struct address_space_operations vdfs4_tuned_aops_hw = {
-	.readpage	= vdfs4_readpage_tuned_hw,
-};
-#endif /* CONFIG_VDFS4_RETRY */
 #endif /* VDFS4_HW_DECOMPRESS_SUPPORT */
 
 static int vdfs4_fail_migrate_page(struct address_space *mapping,
 			struct page *newpage, struct page *page,
 				enum migrate_mode mode)
 {
-#ifdef CONFIG_MIGRATION
-	return fail_migrate_page(mapping, newpage, page);
-#else
 	return -EIO;
-#endif
 }
 
-
+/**
+ * Special aops for meta inode.
+ */
 static const struct address_space_operations vdfs4_aops_special = {
 	.readpage	= vdfs4_readpage_special,
 	.readpages	= vdfs4_readpages_special,
@@ -2627,15 +2987,16 @@ static const struct inode_operations vdfs4_dir_inode_operations = {
 	.mkdir		= vdfs4_mkdir,
 	.rmdir		= vdfs4_rmdir,
 	.mknod		= vdfs4_mknod,
-	.rename		= vdfs4_rename,
+	.rename2	= vdfs4_rename2,
 	.setattr	= vdfs4_setattr,
 
 	.setxattr	= vdfs4_setxattr,
 	.getxattr	= vdfs4_getxattr,
 	.removexattr	= vdfs4_removexattr,
 	.listxattr	= vdfs4_listxattr,
-#ifdef VDFS4_POSIX_ACL
+#ifdef CONFIG_VDFS4_POSIX_ACL
 	.get_acl	= vdfs4_get_acl,
+	.set_acl	= vdfs4_set_acl,
 #endif
 };
 
@@ -2663,7 +3024,7 @@ const struct file_operations vdfs4_dir_operations = {
 	 * [vdfs4_dir_ops] add to vdfs4_dir_operations necessary methods */
 	.llseek		= vdfs4_llseek_dir,
 	.read		= generic_read_dir,
-	.readdir	= vdfs4_readdir,
+	.iterate	= vdfs4_iterate,
 	.release	= vdfs4_release_dir,
 	.unlocked_ioctl = vdfs4_dir_ioctl,
 	.fsync		= vdfs4_dir_fsync,
@@ -2681,9 +3042,16 @@ static int vdfs4_file_fsync(struct file *file, loff_t start, loff_t end,
 	struct super_block *sb = inode->i_sb;
 	int ret;
 
+	VT_PREPARE_PARAM(vt_data);
+
+	trace_vdfs4_file_fsync_enter(file, start, end, datasync);
+	VT_FOPS_START(vt_data, vdfs_trace_fops_fsync,
+		      inode->i_sb->s_bdev->bd_part,
+		      file->f_path.dentry->d_inode, file);
+
 	ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
 	if (ret)
-		return ret;
+		goto exit;
 
 	if (!datasync || (inode->i_state & I_DIRTY_DATASYNC)) {
 		down_read(&sb->s_umount);
@@ -2691,6 +3059,119 @@ static int vdfs4_file_fsync(struct file *file, loff_t start, loff_t end,
 		up_read(&sb->s_umount);
 	}
 
+	trace_vdfs4_file_fsync_exit(file, ret);
+exit:
+	VT_FINISH(vt_data);
+	return ret;
+}
+
+static long vdfs4_fallocate(struct file *file, int mode,
+			    loff_t offset, loff_t len)
+{
+	long ret = 0;
+	struct inode *inode = file_inode(file);
+	struct vdfs4_inode_info *i_info = VDFS4_I(inode);
+	struct vdfs4_sb_info *sbi = inode->i_sb->s_fs_info;
+	loff_t new_size = offset + len;
+	sector_t offset_alloc_hint = 0;
+	unsigned int i=0, lblk, max_blocks;
+	struct vdfs4_extent_info extent;
+
+	VDFS4_INFO("fallocate - filename:%s,mode:0x%08X,offset:%llu,len:%llu\n",
+		   file->f_path.dentry->d_iname, mode, offset, len);
+	if (!S_ISREG(inode->i_mode))
+		return -EINVAL;
+
+	/* vdfs fallocate support only KEEP_SIZE mode */
+	if (mode & ~(FALLOC_FL_KEEP_SIZE))
+		return -EOPNOTSUPP;
+
+	if (new_size <= i_size_read(inode))
+		return 0;
+
+	if (!(mode & FALLOC_FL_KEEP_SIZE)) {
+	    ret = inode_newsize_ok(inode, new_size);
+		if (ret)
+			return ret;
+	}
+
+	lblk = offset >> sbi->block_size_shift;
+	max_blocks = (ALIGN(new_size, sbi->block_size)
+		      >> sbi->block_size_shift) - lblk;
+
+	mutex_lock(&inode->i_mutex);
+	vdfs4_start_transaction(sbi);
+
+	if (!max_blocks)
+		goto out;
+
+	mutex_lock(&i_info->truncate_mutex);
+
+	if (vdfs4_check_meta_space(sbi))
+		goto err_reserve;
+
+	for (; i < max_blocks; i++) {
+		memset( &extent, 0x00, sizeof(struct vdfs4_extent_info));
+		ret = vdfs4_get_iblock_extent(inode, lblk+i,
+					      &extent, &offset_alloc_hint);
+		if (ret)
+			goto err_reserve;
+		if (extent.first_block)
+			continue;
+		ret = vdfs4_reserve_space(inode, 1);
+		if (ret)
+			goto err_reserve;
+		ret = vdfs4_runtime_extent_add(lblk+i, offset_alloc_hint,
+					       &i_info->runtime_extents);
+		if (ret) {
+			vdfs4_free_reserved_space(inode, 1);
+			goto err_reserve;
+		}
+	}
+	mutex_unlock(&i_info->truncate_mutex);
+	ret = vdfs4_allocate_space(i_info, 1);
+	if (ret)
+		goto err_allocate;
+
+out:
+	inode->i_ctime = vdfs4_current_time(inode);
+	if (!(mode & FALLOC_FL_KEEP_SIZE)) {
+		i_size_write(inode, new_size);
+		inode->i_mtime = vdfs4_current_time(inode);
+	}
+	mark_inode_dirty(inode);
+
+	vdfs4_stop_transaction(sbi);
+	mutex_unlock(&inode->i_mutex);
+	return ret;
+
+err_allocate:
+	mutex_lock(&i_info->truncate_mutex);
+err_reserve:
+	while (i-- > 0) {
+		u32 exist;
+		exist = vdfs4_runtime_extent_exists(lblk + i,
+						    &i_info->runtime_extents);
+		if (!exist)
+			continue;
+		if (vdfs4_runtime_extent_del(lblk + i,
+					     &i_info->runtime_extents)) {
+			VDFS4_ERR("Failed to delete runtime extent"
+				  "(rtn:%ld,iblk:%u)", ret, lblk+i);
+			continue;
+		}
+		vdfs4_free_reserved_space(inode, 1);
+	}
+	mutex_unlock(&i_info->truncate_mutex);
+	vdfs4_stop_transaction(sbi);
+	mutex_unlock(&inode->i_mutex);
+	if (ret == -ENOSPC)
+		VDFS4_WARNING("fallocate: len over avail size(%s:%llu,%llu)\n",
+		      i_info->name, len,
+		      (sbi->free_blocks_count << sbi->block_size_shift));
+	else
+		VDFS4_ERR("fallocate: failed(%ld)(%s,%llu,%llu)",
+			  ret, i_info->name, offset, len);
 	return ret;
 }
 
@@ -2706,6 +3187,7 @@ static int vdfs4_file_fsync(struct file *file, loff_t start, loff_t end,
 static inline loff_t get_real_writing_position(struct kiocb *iocb, loff_t pos)
 {
 	loff_t write_pos = 0;
+
 	if (iocb->ki_filp->f_flags & O_APPEND)
 		write_pos = i_size_read(INODE(iocb));
 
@@ -2718,37 +3200,41 @@ static inline loff_t get_real_writing_position(struct kiocb *iocb, loff_t pos)
 	iocb->ki_pos = write_pos;
  * @brief		VDFS4 function for aio write
  * @param [in]	iocb	Struct describing writing file
- * @param [in]	iov	Struct for writing data
- * @param [in]	nr_segs	Number of segs to write
- * @param [in]	pos	Position to write from
+ * @param [in]	iov_iter	Struct for writing data
  * @return		Returns number of bytes written or an error code
  */
-static ssize_t vdfs4_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
-		unsigned long nr_segs, loff_t pos)
+static ssize_t vdfs4_file_write_iter(struct kiocb *iocb,
+				     struct iov_iter *iov_iter)
 {
 	ssize_t ret = 0;
+	struct inode *inode = INODE(iocb);
 
-	/* We are trying to write iocb->ki_left bytes from iov->iov_base */
-	ret = generic_file_aio_write(iocb, iov, nr_segs, pos);
-
+	VT_PREPARE_PARAM(vt_data);
+	trace_vdfs4_file_write_iter(iocb, iov_iter);
+	VT_FOPS_RW_START(vt_data, vdfs_trace_fops_write_iter,
+			 iocb->ki_filp->f_inode->i_sb->s_bdev->bd_part,
+			 inode, iocb->ki_filp,
+			 iocb->ki_pos, iov_iter->count);
+	ret = generic_file_write_iter(iocb, iov_iter);
+	VT_FINISH(vt_data);
 	return ret;
 }
 
 /**
- * @brief		VDFS4 function for aio read
+ * @brief		VDFS4 function for read iter
  * @param [in]	iocb	Struct describing reading file
- * @param [in]	iov	Struct for read data
- * @param [in]	nr_segs	Number of segs to read
- * @param [in]	pos	Position to read from
+ * @param [in]	iov_iter	Struct for read data
  * @return		Returns number of bytes read or an error code
  */
-static ssize_t vdfs4_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
-		unsigned long nr_segs, loff_t pos)
+static ssize_t vdfs4_file_read_iter(struct kiocb *iocb,
+				    struct iov_iter *iov_iter)
 {
 	struct inode *inode = INODE(iocb);
 	ssize_t ret;
 
-#ifdef CONFIG_VDFS4_EXEC_ONLY_AUTHENTICATED
+	VT_PREPARE_PARAM(vt_data);
+
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 	if (current_reads_only_authenticated(inode, false)) {
 #ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
 		if (!VDFS4_I(inode)->informed_about_fail_read)
@@ -2763,54 +3249,81 @@ static ssize_t vdfs4_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
 	}
 #endif
 
-	ret = generic_file_aio_read(iocb, iov, nr_segs, pos);
-#if defined(CONFIG_VDFS4_DEBUG)
+	trace_vdfs4_file_read_iter(iocb, iov_iter);
+	VT_START(vt_data);
+
+	ret = generic_file_read_iter(iocb, iov_iter);
+
+#ifdef CONFIG_VDFS4_DEBUG
 	if (ret < 0 && ret != -EIOCBQUEUED && ret != -EINTR)
 		VDFS4_DEBUG_TMP("err = %d, ino#%lu name=%s",
 			(int)ret, inode->i_ino, VDFS4_I(inode)->name);
 #endif
+	VT_FOPS_RW_FINISH(vt_data, vdfs_trace_fops_read_iter,
+			 iocb->ki_filp->f_inode->i_sb->s_bdev->bd_part,
+			 inode, iocb->ki_filp,
+			 iocb->ki_pos - ((ret >= 0) ? ret : 0),
+			 (ret >= 0) ? ret : 0);
 	return ret;
 }
 
 static ssize_t vdfs4_file_splice_read(struct file *in, loff_t *ppos,
 		struct pipe_inode_info *pipe, size_t len, unsigned int flags)
 {
-#ifdef CONFIG_VDFS4_EXEC_ONLY_AUTHENTICATED
-	struct inode *inode = in->f_mapping->host;
+	ssize_t ret;
 
-	if (current_reads_only_authenticated(inode, false)) {
+	VT_PREPARE_PARAM(vt_data);
+	trace_vdfs4_file_splice_read(in, ppos, pipe, len, flags);
+
+#ifdef CONFIG_VDFS4_AUTHENTICATION
+	if (current_reads_only_authenticated(in->f_mapping->host, false)) {
 		VDFS4_ERR("read is not permited:  %lu:%s",
-				inode->i_ino, VDFS4_I(inode)->name);
+			  in->f_mapping->host->i_ino,
+			  VDFS4_I(in->f_mapping->host)->name);
 #ifndef CONFIG_VDFS4_DEBUG_AUTHENTICAION
 		return -EPERM;
 #endif
 	}
 #endif
-
-	return generic_file_splice_read(in, ppos, pipe, len, flags);
+	VT_START(vt_data);
+	ret = generic_file_splice_read(in, ppos, pipe, len, flags);
+	VT_FOPS_RW_FINISH(vt_data, vdfs_trace_fops_splice_read,
+			 in->f_inode->i_sb->s_bdev->bd_part,
+			 in->f_path.dentry->d_inode, in,
+			 *ppos - ((ret >= 0) ? ret : 0),
+			 (ret >= 0) ? ret : 0);
+	return ret;
 }
 
 
-#ifdef CONFIG_VDFS4_EXEC_ONLY_AUTHENTICATED
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 static int check_execution_available(struct inode *inode,
 		struct vm_area_struct *vma)
 {
 	if (!is_sbi_flag_set(VDFS4_SB(inode->i_sb), VOLUME_AUTH))
 		return 0;
+
 	if (!is_vdfs4_inode_flag_set(inode, VDFS4_AUTH_FILE)) {
 		if (vma->vm_flags & VM_EXEC) {
 #ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
 			if (!VDFS4_I(inode)->informed_about_fail_read) {
 				VDFS4_I(inode)->informed_about_fail_read = 1;
-				VDFS4_DEBUG_TMP("Try to execute non-auth file %lu:%s",
-						inode->i_ino,
-						VDFS4_I(inode)->name);
+				VDFS4_SECURITY_ERR("Security violation detected [task:%s(%d)]."
+						" Try to execute non-auth file %s(%lu).\n"
+						" As debug/perf image is used, the execution will be PERMITTED.\n",
+						current->comm,
+						current->pid,
+						VDFS4_I(inode)->name,
+						inode->i_ino);
 			}
 		}
 #else
-			VDFS4_ERR("Try to execute non-auth file %lu:%s",
-				inode->i_ino,
-				VDFS4_I(inode)->name);
+			VDFS4_SECURITY_ERR("Security violation detected [task:%s(%d)]."
+					" Try to execute non-auth file %s(%lu).\n",
+					current->comm,
+					current->pid,
+					VDFS4_I(inode)->name,
+					inode->i_ino);
 			return -EPERM;
 		}
 		/* Forbid remmaping to executable */
@@ -2831,9 +3344,14 @@ static int check_execution_available(struct inode *inode,
 
 static int vdfs4_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
-#ifdef CONFIG_VDFS4_EXEC_ONLY_AUTHENTICATED
-	struct inode *inode = file->f_dentry->d_inode;
-	int ret = check_execution_available(inode, vma);
+#ifdef CONFIG_VDFS4_AUTHENTICATION
+	struct inode *inode = file->f_path.dentry->d_inode;
+	int ret;
+#endif
+
+	trace_vdfs4_file_mmap(file, vma);
+#ifdef CONFIG_VDFS4_AUTHENTICATION
+	ret = check_execution_available(inode, vma);
 	if (ret)
 		return ret;
 #endif
@@ -2843,9 +3361,10 @@ static int vdfs4_file_mmap(struct file *file, struct vm_area_struct *vma)
 static int vdfs4_file_readonly_mmap(struct file *file,
 		struct vm_area_struct *vma)
 {
-#ifdef CONFIG_VDFS4_EXEC_ONLY_AUTHENTICATED
-	struct inode *inode = file->f_dentry->d_inode;
+#ifdef CONFIG_VDFS4_AUTHENTICATION
+	struct inode *inode = file->f_path.dentry->d_inode;
 	int ret = check_execution_available(inode, vma);
+
 	if (ret)
 		return ret;
 #endif
@@ -2858,10 +3377,8 @@ static int vdfs4_file_readonly_mmap(struct file *file,
  */
 static const struct file_operations vdfs4_file_operations = {
 	.llseek		= generic_file_llseek,
-	.read		= do_sync_read,
-	.aio_read	= vdfs4_file_aio_read,
-	.write		= do_sync_write,
-	.aio_write	= vdfs4_file_aio_write,
+	.read_iter	= vdfs4_file_read_iter,
+	.write_iter	= vdfs4_file_write_iter,
 	.mmap		= vdfs4_file_mmap,
 	.splice_read	= vdfs4_file_splice_read,
 	.open		= vdfs4_file_open,
@@ -2876,8 +3393,7 @@ static const struct file_operations vdfs4_file_operations = {
 
 static const struct file_operations vdfs4_tuned_file_operations = {
 	.llseek		= generic_file_llseek,
-	.read		= do_sync_read,
-	.aio_read	= vdfs4_file_aio_read,
+	.read_iter	= vdfs4_file_read_iter,
 	.mmap		= vdfs4_file_readonly_mmap,
 	.splice_read	= vdfs4_file_splice_read,
 	.open		= vdfs4_file_open,
@@ -2894,19 +3410,24 @@ const struct inode_operations vdfs4_special_inode_operations = {
 	.getxattr	= vdfs4_getxattr,
 	.listxattr	= vdfs4_listxattr,
 	.removexattr	= vdfs4_removexattr,
+#ifdef CONFIG_VDFS4_POSIX_ACL
+	.get_acl	= vdfs4_get_acl,
+	.set_acl	= vdfs4_set_acl,
+#endif
 };
 /**
  * The eMMCFS files inode operations.
  */
 static const struct inode_operations vdfs4_file_inode_operations = {
-		/* FIXME & TODO is this correct : use same function as in
-		vdfs4_dir_inode_operations? */
-		/*.truncate	= vdfs4_file_truncate, depricated*/
-		.setattr	= vdfs4_setattr,
-		.setxattr	= vdfs4_setxattr,
-		.getxattr	= vdfs4_getxattr,
-		.removexattr	= vdfs4_removexattr,
-		.listxattr	= vdfs4_listxattr,
+	.setattr	= vdfs4_setattr,
+	.setxattr	= vdfs4_setxattr,
+	.getxattr	= vdfs4_getxattr,
+	.removexattr	= vdfs4_removexattr,
+	.listxattr	= vdfs4_listxattr,
+#ifdef CONFIG_VDFS4_POSIX_ACL
+	.get_acl	= vdfs4_get_acl,
+	.set_acl	= vdfs4_set_acl,
+#endif
 };
 
 static int vdfs4_fill_inode(struct inode *inode,
@@ -2915,6 +3436,12 @@ static int vdfs4_fill_inode(struct inode *inode,
 	int ret = 0;
 
 	VDFS4_I(inode)->flags = le32_to_cpu(folder_val->flags);
+
+	/*
+	 * Force to clear AUTH_FILE flag. It should be set only from driver.
+	 */
+	clear_vdfs4_inode_flag(inode, VDFS4_AUTH_FILE);
+
 	vdfs4_set_vfs_inode_flags(inode);
 
 	atomic_set(&(VDFS4_I(inode)->open_count), 0);
@@ -2965,6 +3492,7 @@ static u32 calc_compext_table_crc(void *data, int offset, size_t table_len)
 	struct vdfs4_comp_file_descr *descr = NULL;
 	void *tmp_descr;
 	u32 crc = 0, stored_crc;
+
 	tmp_descr = ((char *)data + offset + table_len - sizeof(*descr));
 	descr = tmp_descr;
 	stored_crc = descr->crc;
@@ -2989,7 +3517,7 @@ int vdfs4_prepare_compressed_file_inode(struct vdfs4_inode_info *inode_i)
 
 	ret = get_file_descriptor(inode_i, &descr);
 	if (ret)
-		return ret;
+		goto ERROR_FBC;
 
 	switch (descr.magic[0]) {
 	case VDFS4_COMPR_DESCR_START:
@@ -2997,28 +3525,40 @@ int vdfs4_prepare_compressed_file_inode(struct vdfs4_inode_info *inode_i)
 	case VDFS4_MD5_AUTH:
 	case VDFS4_SHA1_AUTH:
 	case VDFS4_SHA256_AUTH:
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 		set_vdfs4_inode_flag(inode, VDFS4_AUTH_FILE);
 #endif
 		break;
 	default:
-		return -EINVAL;
+		ret = -EINVAL;
+		goto ERROR_FBC;
 	}
+
+	if (inode_i->fbc->comp_size <= (PAGE_SIZE*4))
+		inode_i->fbc->force_path = FORCE_SW;
+	else
+		inode_i->fbc->force_path = FORCE_NONE;
 
 	inode->i_size = (long long)le64_to_cpu(descr.unpacked_size);
 	inode->i_fop = &vdfs4_tuned_file_operations;
+	inode_i->fbc->sign_type = descr.sign_type;
 	/* deny_write_access() */
 	if (S_ISREG(inode->i_mode))
 		atomic_set(&inode->i_writecount, -1);
 
 	return ret;
+
+ERROR_FBC:
+	kfree(inode_i->fbc);
+	inode_i->fbc = NULL;
+	return ret;
 }
 
 static int vdfs4_init_hw_decompression(struct vdfs4_inode_info *inode_i)
 {
-#if (defined(CONFIG_VDFS4_USE_HW1_DECOMPRESS) \
-		|| defined(CONFIG_VDFS4_USE_HW2_DECOMPRESS))
+#ifdef CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT
 	const struct hw_capability hw_cap = get_hw_capability();
+
 	if (inode_i->fbc->log_chunk_size > hw_cap.max_size ||
 			inode_i->fbc->log_chunk_size < hw_cap.min_size)
 		return -EINVAL;
@@ -3034,12 +3574,35 @@ static int vdfs4_init_hw_decompression(struct vdfs4_inode_info *inode_i)
 #endif
 }
 
+#ifdef CONFIG_VDFS4_SQUEEZE
+static int vdfs4_init_squeeze_inode(struct vdfs4_inode_info *inode_i,
+		struct vdfs4_comp_file_descr *descr, void *data)
+{
+	unsigned i, extents_num = le16_to_cpu(descr->extents_num);
+	struct vdfs4_comp_extent *ext = (struct vdfs4_comp_extent *)data;
+
+	inode_i->sci = kmalloc(extents_num *
+					sizeof(struct vdfs4_squeeze_chunk_info), GFP_NOFS);
+	if (!inode_i->sci)
+		return -ENOMEM;
+
+	spin_lock(&inode_i->to_read_lock);
+	for (i = 0; i < extents_num; i++) {
+		inode_i->sci[i].order = le16_to_cpu(ext[i].profiled_prio);
+		if (ext[i].profiled_prio != VDFS4_SQUEEZE_PRIO_NON_PROFILED)
+			list_add_tail(&inode_i->sci[i].list, &inode_i->to_read_list);
+	}
+	spin_unlock(&inode_i->to_read_lock);
+	return 0;
+}
+#endif
+
 int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 {
 	struct inode *inode = &inode_i->vfs_inode;
 	struct page **pages;
 	struct vdfs4_comp_file_descr descr;
-	int ret = 0;
+	int ret = 0, descr_len, sign_len;
 	pgoff_t start_idx;
 	loff_t start_offset, unpacked_size;
 	enum compr_type compr_type;
@@ -3053,11 +3616,16 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 	if (ret)
 		return ret;
 
+	descr_len = get_file_descr_length(&descr);
+	if (descr_len < 0) {
+		VDFS4_BUG(VDFS4_SB(inode->i_sb));
+		return -EINVAL;
+	}
+
 	compr_type = get_comprtype_by_descr(&descr);
 
 	switch (compr_type) {
 	case VDFS4_COMPR_ZLIB:
-	case VDFS4_COMPR_ZHW:
 		inode_i->fbc->decomp_fn = vdfs4_unpack_chunk_zlib;
 		break;
 	case VDFS4_COMPR_GZIP:
@@ -3076,7 +3644,11 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 	extents_num = le16_to_cpu(descr.extents_num);
 	unpacked_size = (long long)le64_to_cpu(descr.unpacked_size);
 	table_size_bytes = extents_num * sizeof(struct vdfs4_comp_extent) +
-		sizeof(struct vdfs4_comp_file_descr);
+		descr_len;
+	sign_len = get_sign_length(descr.sign_type);
+
+	if (sign_len < 0)
+		return -EOPNOTSUPP;
 
 	switch (descr.magic[0]) {
 	case VDFS4_COMPR_DESCR_START:
@@ -3084,9 +3656,8 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 		break;
 	case VDFS4_MD5_AUTH:
 		table_size_bytes += (unsigned long)VDFS4_MD5_HASH_LEN *
-			(extents_num + 1lu) +
-			(unsigned long)VDFS4_CRYPTED_HASH_LEN;
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+			(extents_num + 1lu) + sign_len;
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 		if (is_sbi_flag_set(VDFS4_SB(inode->i_sb), VOLUME_AUTH))
 			inode_i->fbc->hash_fn = calculate_sw_hash_md5;
 #endif
@@ -3095,9 +3666,8 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 		break;
 	case VDFS4_SHA1_AUTH:
 		table_size_bytes += (unsigned long)VDFS4_SHA1_HASH_LEN *
-			(extents_num + 1lu) +
-			(unsigned long)VDFS4_CRYPTED_HASH_LEN;
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+			(extents_num + 1lu) + sign_len;
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 		if (is_sbi_flag_set(VDFS4_SB(inode->i_sb), VOLUME_AUTH))
 			inode_i->fbc->hash_fn = calculate_sw_hash_sha1;
 #endif
@@ -3106,9 +3676,8 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 		break;
 	case VDFS4_SHA256_AUTH:
 		table_size_bytes += (unsigned long)VDFS4_SHA256_HASH_LEN *
-			(extents_num + 1lu) +
-			(unsigned long)VDFS4_CRYPTED_HASH_LEN;
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+			(extents_num + 1lu) + sign_len;
+#ifdef CONFIG_VDFS4_AUTHENTICATION
 		if (is_sbi_flag_set(VDFS4_SB(inode->i_sb), VOLUME_AUTH))
 			inode_i->fbc->hash_fn = calculate_sw_hash_sha256;
 #endif
@@ -3121,11 +3690,11 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 		return (int)descr.magic[0];
 	}
 
-	start_idx = (long unsigned int)((inode_i->fbc->comp_size -
+	start_idx = (unsigned long int)((inode_i->fbc->comp_size -
 		table_size_bytes) >> PAGE_CACHE_SHIFT);
 	start_offset = inode_i->fbc->comp_size - table_size_bytes;
-	pages_num = (pgoff_t)(((inode_i->fbc->comp_size + PAGE_CACHE_SIZE - 1) >>
-			PAGE_CACHE_SHIFT)) - start_idx;
+	pages_num = (unsigned int)(((inode_i->fbc->comp_size +
+			PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT) - start_idx);
 
 	/* Now we can now how many pages do we need, read the rest of them */
 	pages = kmalloc(pages_num * sizeof(*pages), GFP_NOFS);
@@ -3147,48 +3716,67 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 	crc = calc_compext_table_crc(data, start_offset & (PAGE_SIZE - 1),
 			table_size_bytes);
 	if (crc != le32_to_cpu(descr.crc)) {
+		struct vdfs4_sb_info *sbi = VDFS4_SB(inode_i->vfs_inode.i_sb);
+
 		VDFS4_ERR("File based decompression crc mismatch: %s",
 				inode_i->name);
 		VDFS4_MDUMP("Original crc:", &descr.crc, sizeof(descr.crc));
 		VDFS4_MDUMP("Calculated crc:", &crc, sizeof(crc));
+#ifdef VDFS4_DEBUG_DUMP
+		mutex_lock(&sbi->dump_meta);
+		VDFS4_MDUMP("", (char *)data + (start_offset & (PAGE_SIZE - 1)),
+				table_size_bytes);
+		mutex_unlock(&sbi->dump_meta);
+#endif
+		vdfs4_print_volume_verification(sbi);
 		ret = -EINVAL;
 		goto out;
 	}
 	inode_i->fbc->comp_table_start_offset = start_offset;
 	inode_i->fbc->comp_extents_n = (__u32)extents_num;
-	inode_i->fbc->log_chunk_size = (int)le32_to_cpu(descr.log_chunk_size);
+	inode_i->fbc->log_chunk_size =
+					(size_t)le32_to_cpu(descr.log_chunk_size);
 
 	if (inode_i->fbc->hash_fn) {
-		ret = vdfs4_verify_file_signature(inode_i, data);
+		ret = vdfs4_verify_file_signature(inode_i, descr.sign_type, data);
 		if (ret)
 			goto out;
 		ret = vdfs4_check_hash_meta(inode_i, &descr);
 		if (ret)
 			goto out;
+		/* Note : it is already set in lookup sequence */
 		set_vdfs4_inode_flag(inode, VDFS4_AUTH_FILE);
 	}
 
 	inode->i_mapping->a_ops = &vdfs4_tuned_aops;
-
 	vdfs4_init_hw_decompression(inode_i);
+
+#ifdef CONFIG_VDFS4_SQUEEZE
+	if (is_vdfs4_inode_flag_set(inode, VDFS4_PROFILED_FILE)) {
+		ret = vdfs4_init_squeeze_inode(inode_i, &descr,
+				data + (start_offset & (PAGE_SIZE - 1)));
+		if (ret)
+			goto out;
+	}
+#endif
+
 out:
 	vunmap(data);
 
-#ifdef CONFIG_VDFS4_RETRY
-	if (ret) {
-		for (i = 0; i < pages_num; i++) {
+	for (i = 0; i < pages_num; i++) {
+		if (ret) {
 			lock_page(pages[i]);
 			ClearPageUptodate(pages[i]);
 			ClearPageChecked(pages[i]);
 			page_cache_release(pages[i]);
 			unlock_page(pages[i]);
+
+		} else {
+			mark_page_accessed(pages[i]);
+			page_cache_release(pages[i]);
 		}
-	} else
-#endif
-	for (i = 0; i < pages_num; i++) {
-		mark_page_accessed(pages[i]);
-		page_cache_release(pages[i]);
 	}
+
 	kfree(pages);
 	return ret;
 }
@@ -3210,6 +3798,32 @@ int vdfs4_disable_file_decompression(struct vdfs4_inode_info *inode_i)
 
 	if (S_ISREG(inode->i_mode))
 		atomic_set(&inode->i_writecount, 0);
+
+	return 0;
+}
+
+#define FREEING_INODE	(1 << 31)
+int vdfs4_inode_check(struct inode *inode, void *data)
+{
+	if (inode->i_ino != *(__u64 *)data)
+		return 0;
+
+	if (inode->i_state & I_FREEING) {
+		*(__u64 *)data |= FREEING_INODE;
+		return 0;
+	}
+
+	return 1;
+}
+
+int vdfs4_inode_set(struct inode *inode, void *data)
+{
+	__u64 ino = *(__u64*)data;
+
+	if (ino & FREEING_INODE)
+		return 1;
+	else
+		inode->i_ino = ino;
 
 	return 0;
 }
@@ -3236,10 +3850,14 @@ struct inode *vdfs4_get_inode_from_record(struct vdfs4_cattree_record *record,
 	if (tree->btree_type == VDFS4_BTREE_INST_CATALOG)
 		ino += tree->start_ino;
 
-	inode = iget_locked(sbi->sb, (unsigned long)ino);
+	if (parent)
+		inode = iget5_locked(sbi->sb, (unsigned long)ino, vdfs4_inode_check,
+				vdfs4_inode_set, &ino);
+	else
+		inode = iget_locked(sbi->sb, (unsigned long)ino);
 
 	if (!inode) {
-		inode = ERR_PTR(-ENOMEM);
+		inode = ERR_PTR((ino & FREEING_INODE) ? -EAGAIN : -ENOMEM);
 		goto exit;
 	}
 
@@ -3275,54 +3893,13 @@ struct inode *vdfs4_get_inode_from_record(struct vdfs4_cattree_record *record,
 	} else if (record->key->record_type == VDFS4_CATALOG_FOLDER_RECORD) {
 		folder_rec =
 			(struct vdfs4_catalog_folder_record *)record->val;
-	} else if (record->key->record_type == VDFS4_CATALOG_DLINK_RECORD) {
-		struct vdfs4_catalog_dlink_record *dlink = record->val;
-		struct vdfs4_cattree_record *data_record;
-		struct inode *data_inode;
-		__u64 dlink_ino = le64_to_cpu(dlink->data_inode);
-
-		if (tree->btree_type == VDFS4_BTREE_INST_CATALOG)
-			dlink_ino += tree->start_ino;
-
-		data_inode = ilookup(sbi->sb, (unsigned long)dlink_ino);
-		if (!data_inode) {
-			struct vdfs4_btree_record_info *rec_info =
-					VDFS4_BTREE_REC_I((void *) record);
-			struct vdfs4_btree *btree =
-					rec_info->rec_pos.bnode->host;
-			data_record = vdfs4_cattree_find_hlink(btree,
-					le64_to_cpu(dlink->data_inode),
-					VDFS4_BNODE_MODE_RO);
-			if (IS_ERR(data_record)) {
-				data_inode = ERR_CAST(data_record);
-			} else {
-				data_inode = vdfs4_get_inode_from_record(data_record,
-						parent);
-				vdfs4_release_record(
-				(struct vdfs4_btree_gen_record *)data_record);
-			}
-		}
-		if (IS_ERR(data_inode)) {
-			ret = PTR_ERR(data_inode);
-			goto error_exit;
-		}
-		if (!S_ISREG(data_inode->i_mode)) {
-			iput(data_inode);
-			ret = -EINVAL;
-			goto error_exit;
-		}
-
-		folder_rec = &dlink->common;
-		VDFS4_I(inode)->data_link.inode = data_inode;
-		inode->i_size = (loff_t)le64_to_cpu(dlink->data_length);
-		VDFS4_I(inode)->data_link.offset =
-				le64_to_cpu(dlink->data_offset);
 	} else {
 		if (!is_sbi_flag_set(sbi, IS_MOUNT_FINISHED)) {
 			ret = -EFAULT;
 			goto error_exit;
-		} else
-			VDFS4_BUG();
+		} else {
+			VDFS4_BUG(sbi);
+		}
 	}
 
 	ret = vdfs4_fill_inode(inode, folder_rec);
@@ -3360,7 +3937,7 @@ struct inode *vdfs4_get_inode_from_record(struct vdfs4_cattree_record *record,
 
 		memcpy(new_name, key->name, key->name_len);
 		new_name[key->name_len] = 0;
-		VDFS4_BUG_ON(VDFS4_I(inode)->name);
+		VDFS4_BUG_ON(VDFS4_I(inode)->name, sbi);
 		VDFS4_I(inode)->name = new_name;
 		VDFS4_I(inode)->parent_id = le64_to_cpu(key->parent_id);
 	}
@@ -3369,43 +3946,20 @@ struct inode *vdfs4_get_inode_from_record(struct vdfs4_cattree_record *record,
 	VDFS4_I(inode)->informed_about_fail_read = 0;
 #endif
 
-	if (record->key->record_type == VDFS4_CATALOG_DLINK_RECORD) {
-		struct inode *data_inode = VDFS4_I(inode)->data_link.inode;
-		struct vdfs4_inode_info *d_info = VDFS4_I(data_inode);
-
-		if (is_vdfs4_inode_flag_set(VDFS4_I(inode)->data_link.inode,
-				VDFS4_AUTH_FILE)) {
-			set_vdfs4_inode_flag(inode, VDFS4_AUTH_FILE);
-		}
-		if (is_vdfs4_inode_flag_set(VDFS4_I(inode)->data_link.inode,
-				VDFS4_READ_ONLY_AUTH))
-			set_vdfs4_inode_flag(inode, VDFS4_READ_ONLY_AUTH);
-		inode->i_mapping->a_ops = &vdfs4_data_link_aops;
-		atomic_set(&inode->i_writecount, -1); /* deny_write_access() */
-
-		if (S_ISLNK(inode->i_mode) && d_info->fbc &&
-			(d_info->fbc->compr_type == VDFS4_COMPR_UNDEF)) {
-			mutex_lock(&data_inode->i_mutex);
-			if (d_info->fbc->compr_type == VDFS4_COMPR_UNDEF)
-				ret = vdfs4_init_file_decompression(d_info, 1);
-			mutex_unlock(&data_inode->i_mutex);
-			if (ret)
-				goto error_exit;
-		}
-	}
-
 	if (is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE)) {
 		ret = vdfs4_prepare_compressed_file_inode(VDFS4_I(inode));
 		if (ret)
 			goto error_exit;
 	}
+
 	if (hlink_rec)
 		vdfs4_release_record((struct vdfs4_btree_gen_record *)hlink_rec);
 
 	unlock_new_inode(inode);
 
 exit:
-	if (tree->btree_type != VDFS4_BTREE_CATALOG) /*parent - install point*/
+	/* parent - install point */
+	if (tree->btree_type != VDFS4_BTREE_CATALOG)
 		VDFS4_I(inode)->parent_id += (VDFS4_I(inode)->parent_id ==
 				VDFS4_ROOT_INO) ? (tree->start_ino - 1) :
 						tree->start_ino;
@@ -3470,7 +4024,7 @@ static struct inode *vdfs4_new_inode(struct inode *dir, umode_t mode)
 	vdfs4_set_vfs_inode_flags(inode);
 
 	if (S_ISDIR(mode))
-		inode->i_op =  &vdfs4_dir_inode_operations;
+		inode->i_op = &vdfs4_dir_inode_operations;
 	else if (S_ISLNK(mode))
 		inode->i_op = &vdfs4_symlink_inode_operations;
 	else
@@ -3521,6 +4075,8 @@ static int vdfs4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	struct vdfs4_cattree_record *record;
 	u8 record_type;
 
+	VT_PREPARE_PARAM(vt_data);
+
 	VDFS4_DEBUG_INO("'%s' dir = %ld", dentry->d_name.name, dir->i_ino);
 
 	if (dentry->d_name.len > VDFS4_FILE_NAME_LEN)
@@ -3530,6 +4086,7 @@ static int vdfs4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	if (!saved_name)
 		return -ENOMEM;
 
+	VT_IOPS_START(vt_data, vdfs_trace_iops_create, dentry);
 	vdfs4_start_transaction(sbi);
 	inode = vdfs4_new_inode(dir, mode);
 
@@ -3543,7 +4100,7 @@ static int vdfs4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 
 	VDFS4_I(inode)->name = saved_name;
 	VDFS4_I(inode)->parent_id = dir->i_ino;
-	mutex_w_lock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_lock(sbi);
 	ret = __get_record_type_on_mode(inode, &record_type);
 	if (ret)
 		goto err_notree;
@@ -3556,7 +4113,7 @@ static int vdfs4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	}
 	vdfs4_fill_cattree_record(inode, record);
 	vdfs4_release_dirty_record((struct vdfs4_btree_gen_record *) record);
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 
 #ifdef CONFIG_VDFS4_POSIX_ACL
 	ret = vdfs4_init_acl(inode, dir);
@@ -3585,16 +4142,17 @@ static int vdfs4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	mark_inode_dirty(dir);
 	d_instantiate(dentry, inode);
 #ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
-		VDFS4_I(inode)->informed_about_fail_read = 0;
+	VDFS4_I(inode)->informed_about_fail_read = 0;
 #endif
 	unlock_new_inode(inode);
 	/* some fields are updated after insering into tree */
 	mark_inode_dirty(inode);
 	vdfs4_stop_transaction(sbi);
+	VT_FINISH(vt_data);
 	return ret;
 
 err_notree:
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 	vdfs4_free_inode_n(sbi, inode->i_ino, 1);
 	inode->i_ino = 0;
 err_unlock:
@@ -3602,6 +4160,7 @@ err_unlock:
 	iput(inode);
 err_trans:
 	vdfs4_stop_transaction(sbi);
+	VT_FINISH(vt_data);
 	return ret;
 }
 
@@ -3620,6 +4179,8 @@ int __vdfs4_write_inode(struct vdfs4_sb_info *sbi, struct inode *inode)
 				VDFS4_BNODE_MODE_RW);
 	if (IS_ERR(record)) {
 		vdfs4_fatal_error(sbi, "fail to update inode %lu", inode->i_ino);
+		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_WRITE,
+				inode->i_ino, 0, "fail update inode", NULL, 0);
 		return PTR_ERR(record);
 	}
 	vdfs4_fill_cattree_value(inode, record->val);
@@ -3638,13 +4199,14 @@ int vdfs4_write_inode(struct inode *inode, struct writeback_control *wbc)
 	struct vdfs4_sb_info *sbi = sb->s_fs_info;
 	int ret;
 
+	trace_vdfs4_write_inode(inode, wbc);
+
 	if (inode->i_ino < VDFS4_1ST_FILE_INO && inode->i_ino != VDFS4_ROOT_INO)
 		return 0;
-
 	vdfs4_start_writeback(sbi);
-	mutex_w_lock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_lock(sbi);
 	ret = __vdfs4_write_inode(sbi, inode);
-	mutex_w_unlock(sbi->catalog_tree->rw_tree_lock);
+	vdfs4_cattree_w_unlock(sbi);
 	vdfs4_stop_writeback(sbi);
 
 	return ret;
@@ -3719,27 +4281,4 @@ void vdfs4_set_vfs_inode_flags(struct inode *inode)
 	inode->i_flags &= ~(unsigned long)S_IMMUTABLE;
 	if (VDFS4_I(inode)->flags & (1lu << (unsigned long)VDFS4_IMMUTABLE))
 		inode->i_flags |= S_IMMUTABLE;
-}
-
-struct inode *vdfs4_get_image_inode(struct vdfs4_sb_info *sbi,
-		__u64 parent_id, __u8 *name, size_t name_len)
-{
-	struct inode *inode;
-	struct vdfs4_cattree_record *record;
-
-	mutex_r_lock(sbi->catalog_tree->rw_tree_lock);
-	record = vdfs4_cattree_find(sbi->catalog_tree, parent_id, name, name_len,
-			VDFS4_BNODE_MODE_RO);
-
-	if (IS_ERR(record)) {
-		/* Pass error code to return value */
-		inode = (void *)record;
-		goto err_exit;
-	}
-
-	inode = vdfs4_get_inode_from_record(record, NULL);
-	vdfs4_release_record((struct vdfs4_btree_gen_record *) record);
-err_exit:
-	mutex_r_unlock(sbi->catalog_tree->rw_tree_lock);
-	return inode;
 }

@@ -61,8 +61,9 @@ static void vdfs4_btree_inc_height(struct vdfs4_btree *btree)
 static void vdfs4_btree_dec_height(struct vdfs4_btree *btree)
 {
 	u16 btree_height = le16_to_cpu(VDFS4_BTREE_HEAD(btree)->btree_height);
+
 	btree_height--;
-	VDFS4_BUG_ON(btree_height == 0);
+	VDFS4_BUG_ON(btree_height == 0, btree->sbi);
 	VDFS4_BTREE_HEAD(btree)->btree_height = cpu_to_le16(btree_height);
 	vdfs4_mark_bnode_dirty(btree->head_bnode);
 
@@ -76,6 +77,7 @@ static void vdfs4_btree_dec_height(struct vdfs4_btree *btree)
 u16 vdfs4_btree_get_height(struct vdfs4_btree *btree)
 {
 	u16 ret;
+
 	ret = le16_to_cpu(VDFS4_BTREE_HEAD(btree)->btree_height);
 	return ret;
 }
@@ -88,6 +90,7 @@ u16 vdfs4_btree_get_height(struct vdfs4_btree *btree)
 u32 vdfs4_btree_get_root_id(struct vdfs4_btree *btree)
 {
 	u32 ret;
+
 	ret = le32_to_cpu(VDFS4_BTREE_HEAD(btree)->root_bnode_id);
 	return ret;
 }
@@ -125,9 +128,11 @@ struct path_container {
  * @param [in]	index	Index of offset to receive
  * @return		Returns address in memory of offset place
  */
-static void *vdfs4_get_offset_addr(struct vdfs4_bnode *bnode, unsigned int index)
+static void *vdfs4_get_offset_addr(struct vdfs4_bnode *bnode,
+								unsigned int index)
 {
 	void *ret;
+
 	ret = (char *)bnode->data + bnode->host->node_size_bytes -
 		VDFS4_BNODE_FIRST_OFFSET -
 		sizeof(vdfs4_bt_off_t) * (index + 1);
@@ -136,8 +141,8 @@ static void *vdfs4_get_offset_addr(struct vdfs4_bnode *bnode, unsigned int index
 			>= bnode->host->node_size_bytes) {
 		if (!is_sbi_flag_set(bnode->host->sbi, IS_MOUNT_FINISHED))
 			return ERR_PTR(-EFAULT);
-		else
-			VDFS4_BUG();
+
+		VDFS4_BUG(bnode->host->sbi);
 	}
 	return ret;
 }
@@ -153,6 +158,7 @@ static vdfs4_bt_off_t __get_offset(struct vdfs4_bnode *bnode,
 		unsigned int index)
 {
 	vdfs4_bt_off_t *p_ret;
+
 	p_ret = vdfs4_get_offset_addr(bnode, index);
 	if (IS_ERR(p_ret))
 		return VDFS4_BT_INVALID_OFFSET;
@@ -223,14 +229,16 @@ static int check_set_offset(struct vdfs4_bnode *bnode, unsigned int index,
 	vdfs4_bt_off_t *offset = vdfs4_get_offset_addr(bnode, index);
 
 	if (IS_ERR(offset) || !offset) {
-		vdfs4_dump_panic_remount(bnode, "offset is wrong %llu",
-				offset);
+		vdfs4_dump_panic_remount(
+			bnode, VDFS4_DEBUG_ERR_NONE,
+			"offset is wrong %llu", offset);
 		return -EFAULT;
 	}
 
 	if (!is_offset_correct(bnode, new_val)) {
-		vdfs4_dump_panic_remount(bnode, "new offset is wrong %llu",
-				new_val);
+		vdfs4_dump_panic_remount(
+			bnode, VDFS4_DEBUG_ERR_BNODE_OFFSET,
+			"new offset is wrong %llu", new_val);
 		return -EFAULT;
 	}
 	*offset = new_val;
@@ -247,6 +255,7 @@ static int check_set_offset(struct vdfs4_bnode *bnode, unsigned int index,
 void *vdfs4_get_btree_record(struct vdfs4_bnode *bnode, int index)
 {
 	void *ret;
+
 	ret = get_record(bnode, index);
 	return ret;
 }
@@ -294,7 +303,7 @@ void *__vdfs4_get_next_btree_record(struct vdfs4_bnode **__bnode, int *index)
 	struct vdfs4_bnode *next_bnode;
 	void *ret;
 
-	VDFS4_BUG_ON(!bnode);
+	VDFS4_BUG_ON(!bnode, NULL);
 
 	if (*index+1 < VDFS4_BNODE_DSCR(bnode)->recs_count) {
 		(*index)++;
@@ -316,7 +325,7 @@ void *__vdfs4_get_next_btree_record(struct vdfs4_bnode **__bnode, int *index)
 	return ret;
 }
 
-#if defined(CONFIG_VDFS4_META_SANITY_CHECK)
+#ifdef CONFIG_VDFS4_META_SANITY_CHECK
 void vdfs4_bnode_sanity_check(struct vdfs4_bnode *bnode)
 {
 	struct vdfs4_gen_node_descr *bnode_desc = VDFS4_BNODE_DSCR(bnode);
@@ -332,25 +341,32 @@ void vdfs4_bnode_sanity_check(struct vdfs4_bnode *bnode)
 
 	if (record_count == 0) {
 		if (__get_offset(bnode, 0) !=
-				sizeof(struct vdfs4_gen_node_descr))
-			vdfs4_dump_panic_remount(bnode,
-					"zero offset is broken");
+			sizeof(struct vdfs4_gen_node_descr)) {
+			vdfs4_dump_panic_remount(
+				bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+				"zero offset is broken");
+		}
 		return;
 	}
 
-	if (le16_to_cpu(bnode_desc->free_space) > max_bnode_size)
-		vdfs4_dump_panic_remount(bnode, "free is bigger than bnode %u",
-			bnode_desc->free_space);
-	if (record_count > 1000)
-		vdfs4_dump_panic_remount(bnode, "records count toooo big %d",
-			record_count);
+	if (le16_to_cpu(bnode_desc->free_space) > max_bnode_size) {
+		vdfs4_dump_panic_remount(
+			bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+			"free is bigger than bnode (%u, %u)",
+			bnode_desc->free_space, max_bnode_size);
+	}
+	if (record_count > 1000) {
+		vdfs4_dump_panic_remount(
+			bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+			"records count toooo big %d", record_count);
+	}
 
 	for (count = 0; count < record_count; count++) {
 		offset = __get_offset(bnode, (unsigned)count);
 		if (!is_offset_correct(bnode, offset)) {
-			vdfs4_dump_panic_remount(bnode,
-					"offset is broken %d %u",
-					count, offset);
+			vdfs4_dump_panic_remount(
+				bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+				"offset is broken %d %u", count, offset);
 			return;
 		}
 		min_offset = (min_offset > offset) ? offset : min_offset;
@@ -360,20 +376,24 @@ void vdfs4_bnode_sanity_check(struct vdfs4_bnode *bnode)
 
 	for (count = 0; count < record_count; count++) {
 		void *addr = (char *)bnode->data + offset;
+
 		key = addr;
 		offset += key->record_len;
 		if (!is_offset_correct(bnode, offset)) {
-			vdfs4_dump_panic_remount(bnode,
-					"record is broken %d %d",
-					count, key->record_len);
+			vdfs4_dump_panic_remount(
+				bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+				"record is broken %d %d", count, key->record_len);
 			return;
 		}
 	}
 
-	if (offset != __get_offset(bnode, (unsigned)record_count))
-		vdfs4_dump_panic_remount(bnode,
-				"free space offset is broken %u",
-				offset);
+	if (offset != __get_offset(bnode, (unsigned)record_count)) {
+		vdfs4_dump_panic_remount(
+			bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+			"free space offset is broken %u, %u, %u",
+			offset, record_count,
+			__get_offset(bnode, (unsigned)record_count));
+	}
 }
 struct __vdfs4_bnode {
 	struct vdfs4_bnode bnode;
@@ -408,6 +428,7 @@ static inline int form_gen_record(
 		struct vdfs4_btree_record_info *rec_info, int pos)
 {
 	int err_ret = 0;
+
 	rec_info->rec_pos.bnode = bnode;
 	rec_info->rec_pos.pos = pos;
 	rec_info->gen_record.key = raw_record;
@@ -464,8 +485,8 @@ static struct vdfs4_bnode *get_child_bnode(struct vdfs4_btree *btree,
 	if (value->node_id == 0) {
 		if (!is_sbi_flag_set(btree->sbi, IS_MOUNT_FINISHED))
 			return ERR_PTR(-EFAULT);
-		else
-			VDFS4_BUG();
+
+		VDFS4_BUG(btree->sbi);
 	}
 	ret = __vdfs4_get_bnode(btree, value->node_id, mode);
 	return ret;
@@ -509,8 +530,9 @@ void vdfs4_init_new_node_descr(struct vdfs4_bnode *bnode,
 	node_descr->next_node_id = VDFS4_INVALID_NODE_ID;
 	node_descr->prev_node_id = VDFS4_INVALID_NODE_ID;
 
-	BUG_ON(check_set_offset(bnode, 0,
-				sizeof(struct vdfs4_gen_node_descr)));
+	VDFS4_BUG_ON(check_set_offset(bnode, 0,
+				sizeof(struct vdfs4_gen_node_descr)),
+				bnode->host->sbi);
 
 }
 
@@ -532,7 +554,9 @@ int vdfs4_insert_into_node(struct vdfs4_bnode *bnode,
 	int moving_offsets_num;
 	int err = 0;
 	unsigned int node_free_space = 0;
-	VDFS4_BUG_ON(node_descr_ptr->free_space < new_key->record_len);
+
+	VDFS4_BUG_ON(node_descr_ptr->free_space < new_key->record_len,
+					bnode->host->sbi);
 
 	offset = vdfs4_get_offset_addr(bnode, node_descr_ptr->recs_count);
 	if (IS_ERR(offset))
@@ -556,7 +580,9 @@ int vdfs4_insert_into_node(struct vdfs4_bnode *bnode,
 		return err;
 
 	/* Check if node have room for another one offset (to free space) */
-	VDFS4_BUG_ON(node_descr_ptr->free_space < sizeof(vdfs4_bt_off_t));
+	VDFS4_BUG_ON(node_descr_ptr->free_space <
+					new_key->record_len + sizeof(vdfs4_bt_off_t),
+					bnode->host->sbi);
 
 	node_descr_ptr->recs_count++;
 	node_free_space = node_descr_ptr->free_space - (new_key->record_len +
@@ -587,7 +613,7 @@ static void *__place_into_node(struct vdfs4_bnode *bnode,
 	__u16 recs_count = le16_to_cpu(node_descr_ptr->recs_count);
 	/* Check if node have room for another one offset (to free space) */
 	VDFS4_BUG_ON(free_space < ((unsigned)new_rec_len +
-				sizeof(vdfs4_bt_off_t)));
+				sizeof(vdfs4_bt_off_t)), bnode->host->sbi);
 
 	offset = vdfs4_get_offset_addr(bnode, recs_count);
 	if (IS_ERR(offset))
@@ -677,12 +703,13 @@ static void form_new_adding_record(struct vdfs4_bnode *new_node,
 	void *addr = NULL;
 
 	/* Possible wrong new_key isn't checked*/
-	BUG_ON(!new_key || IS_ERR(new_key));
+	VDFS4_BUG_ON(IS_ERR_OR_NULL(new_key), new_node->host->sbi);
 	forming_key = (struct vdfs4_generic_key *)adding_record;
 	addr = (char *)adding_record + new_key->key_len;
 	value = addr;
 
-	VDFS4_BUG_ON(new_key->record_len > new_node->host->max_record_len);
+	VDFS4_BUG_ON(new_key->record_len > new_node->host->max_record_len,
+					new_node->host->sbi);
 	memcpy(adding_record, new_key, new_key->key_len);
 	forming_key->record_len = (u16)(new_key->key_len +
 			sizeof(struct generic_index_value));
@@ -711,8 +738,7 @@ static int delete_from_node(struct vdfs4_bnode *bnode, int del_index)
 	if (!del_key || IS_ERR(del_key)) {
 		if (!is_sbi_flag_set(bnode->host->sbi, IS_MOUNT_FINISHED))
 			return -EFAULT;
-		else
-			BUG();
+		VDFS4_BUG(bnode->host->sbi);
 	}
 
 	rec_len = del_key->record_len;
@@ -721,16 +747,16 @@ static int delete_from_node(struct vdfs4_bnode *bnode, int del_index)
 
 	if (!is_offset_correct(bnode, free_space_offset) ||
 			!is_offset_correct(bnode, del_offset)) {
-		vdfs4_dump_panic_remount(bnode, "free space offset is broken %u",
-				free_space_offset);
+		vdfs4_dump_panic_remount(
+			bnode, VDFS4_DEBUG_ERR_BNODE_DELETE,
+			"free space offset is broken %u", free_space_offset);
 		return -EFAULT;
 	}
 
 	if (rec_len > VDFS4_MAX_BTREE_REC_LEN) {
 		if (!is_sbi_flag_set(bnode->host->sbi, IS_MOUNT_FINISHED))
 			return -EFAULT;
-		else
-			BUG();
+		VDFS4_BUG(bnode->host->sbi);
 	}
 
 	memmove((void *)del_key, (char *)del_key + rec_len,
@@ -746,6 +772,7 @@ static int delete_from_node(struct vdfs4_bnode *bnode, int del_index)
 	 */
 	for (i = 0; i < node->recs_count; i++) {
 		vdfs4_bt_off_t cur_offs = __get_offset(bnode, (unsigned)i);
+
 		if (cur_offs > del_offset) {
 			err = check_set_offset(bnode, (unsigned)i,
 					cur_offs - rec_len);
@@ -770,7 +797,7 @@ static int delete_from_node(struct vdfs4_bnode *bnode, int del_index)
 	if (err)
 		return err;
 
-#if defined(CONFIG_VDFS4_DEBUG)
+#ifdef CONFIG_VDFS4_DEBUG
 {
 	vdfs4_bt_off_t *offset;
 	void *free_spc_pointer = NULL;
@@ -784,12 +811,11 @@ static int delete_from_node(struct vdfs4_bnode *bnode, int del_index)
 
 	free_spc_pointer = (char *) node + *offset;
 	VDFS4_BUG_ON(node->free_space != (char *)offset
-			- (char *)free_spc_pointer);
+			- (char *)free_spc_pointer, bnode->host->sbi);
 
 	memset(free_spc_pointer, 0xA5, node->free_space);
 }
 #endif
-
 	vdfs4_mark_bnode_dirty(bnode);
 
 	return 0;
@@ -1036,7 +1062,7 @@ static struct vdfs4_bnode *btree_traverse_level(struct vdfs4_btree *btree,
 
 				/* If todo stack is present, stack stack has
 				 * to be present */
-				VDFS4_BUG_ON(!stack);
+				VDFS4_BUG_ON(!stack, btree->sbi);
 				if (!list_empty(stack))
 					traverse_data = list_first_entry(stack,
 							typeof(*traverse_data),
@@ -1161,7 +1187,7 @@ static int split_bnode(struct vdfs4_bnode *left_bnode,
 
 	used_space = btree->node_size_bytes -
 			VDFS4_BNODE_DSCR(left_bnode)->free_space;
-	VDFS4_BUG_ON(recs_count == 0);
+	VDFS4_BUG_ON(recs_count == 0, btree->sbi);
 
 	i = 0;
 	while (i < recs_count || !inserted) {
@@ -1812,10 +1838,16 @@ static int btree_merge(struct vdfs4_btree *tree, unsigned int left_bnode_id,
 	if (check_bnode_offset_area(left_bnode) ||
 			check_bnode_offset_area(right_bnode)) {
 
-		if (check_bnode_offset_area(left_bnode))
-			vdfs4_dump_panic_remount(left_bnode, "offset area brk");
-		if (check_bnode_offset_area(right_bnode))
-			vdfs4_dump_panic_remount(right_bnode, "offset area brk");
+		if (check_bnode_offset_area(left_bnode)) {
+			vdfs4_dump_panic_remount(
+				left_bnode, VDFS4_DEBUG_ERR_BNODE_MERGE,
+				"offset area brk(L)");
+		}
+		if (check_bnode_offset_area(right_bnode)) {
+			vdfs4_dump_panic_remount(
+				right_bnode, VDFS4_DEBUG_ERR_BNODE_MERGE,
+				"offset area brk(R)");
+		}
 
 		vdfs4_put_bnode(right_bnode);
 		vdfs4_put_bnode(left_bnode);
@@ -1849,9 +1881,9 @@ static int btree_merge(struct vdfs4_btree *tree, unsigned int left_bnode_id,
 
 		if (check_set_offset(left_bnode, record_index,
 					record_offset)) {
-			vdfs4_dump_panic_remount(left_bnode,
-					"offset is wrong %d - %u",
-					record_index, record_offset);
+			vdfs4_dump_panic_remount(
+				left_bnode, VDFS4_DEBUG_ERR_BNODE_MERGE,
+				"offset is wrong %d - %u", record_index, record_offset);
 			return -EFAULT;
 		}
 	}
@@ -2050,7 +2082,7 @@ static int __btree_remove(struct vdfs4_btree *tree,
 	int pos;
 	int err = 0;
 
-	VDFS4_BUG_ON(!tree->comp_fn);
+	VDFS4_BUG_ON(!tree->comp_fn, tree->sbi);
 
 	/*
 	 * TODO: something strange is happening here
@@ -2061,7 +2093,7 @@ static int __btree_remove(struct vdfs4_btree *tree,
 		return 0;
 	}
 	*/
-	VDFS4_BUG_ON(level > vdfs4_btree_get_height(tree));
+	VDFS4_BUG_ON(level > vdfs4_btree_get_height(tree), tree->sbi);
 
 	bnode = btree_find(tree, key, level, &pos, VDFS4_BNODE_MODE_RW);
 	if (IS_ERR(bnode))
@@ -2103,7 +2135,7 @@ static int __btree_remove(struct vdfs4_btree *tree,
 						VDFS4_BNODE_MODE_RW);
 
 			/* TODO: error path */
-			VDFS4_BUG_ON(IS_ERR(prev_bnode));
+			VDFS4_BUG_ON(IS_ERR(prev_bnode), tree->sbi);
 
 			VDFS4_BNODE_DSCR(prev_bnode)->next_node_id =
 				node->next_node_id;
@@ -2118,7 +2150,7 @@ static int __btree_remove(struct vdfs4_btree *tree,
 						VDFS4_BNODE_MODE_RW);
 
 			/* TODO: error path */
-			VDFS4_BUG_ON(IS_ERR(next_bnode));
+			VDFS4_BUG_ON(IS_ERR(next_bnode), tree->sbi);
 
 			VDFS4_BNODE_DSCR(next_bnode)->prev_node_id =
 				node->prev_node_id;
@@ -2128,7 +2160,7 @@ static int __btree_remove(struct vdfs4_btree *tree,
 		}
 
 		VDFS4_BUG_ON(bnode->node_id ==
-				vdfs4_btree_get_root_id(tree));
+				vdfs4_btree_get_root_id(tree), tree->sbi);
 
 		err = vdfs4_destroy_bnode(bnode);
 		if (err)
@@ -2170,13 +2202,14 @@ static int __btree_remove(struct vdfs4_btree *tree,
 			err = rebalance(tree, key, level, node_id, node_fs);
 			if (err && is_sbi_flag_set(tree->sbi,
 						IS_MOUNT_FINISHED))
-				BUG();
+				VDFS4_BUG(tree->sbi);
 			goto exit;
 		} else if (node->recs_count == 1) {
 			/* It is a root bnode and now it contains the only
 			 * pointer. If we are here we have to decrease btree
 			 * height */
 			struct vdfs4_bnode *bnode_n;
+
 			if (vdfs4_btree_get_height(tree) <= 1)
 				goto exit_put_bnode;
 
@@ -2219,6 +2252,7 @@ int vdfs4_btree_remove(struct vdfs4_btree *tree,
 			struct vdfs4_generic_key *key)
 {
 	int ret;
+
 	ret = __btree_remove(tree, key, 1);
 	return ret;
 }
@@ -2260,10 +2294,9 @@ static int check_ordering_at_level(struct vdfs4_bnode *bnode)
 			vdfs4_release_record(new_record);
 			if (ret == -ENOENT)
 				return check_ret;
-			else {
-				VDFS4_ERR("can't get record\n");
-				return -EINVAL;
-			}
+
+			VDFS4_ERR("can't get record\n");
+			return -EINVAL;
 		}
 		cmp_res = comp_fn((struct vdfs4_generic_key *) old_record.key,
 			(struct vdfs4_generic_key *) new_record->key);
@@ -2439,6 +2472,7 @@ int vdfs4_check_btree_links(struct vdfs4_btree *btree, int *dang_num)
 	struct vdfs4_bnode *bnode;
 	int level, ret;
 	__u32 bnode_id = vdfs4_btree_get_root_id(btree);
+
 	if (dang_num)
 		*dang_num = 0;
 

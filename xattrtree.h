@@ -27,12 +27,9 @@
 #define XATTRTREE_LEAF "XAle"
 #define VDFS4_XATTRTREE_ROOT_REC_NAME "xattr_root"
 
-
 struct vdfs4_xattrtree_record {
 	struct vdfs4_xattrtree_key *key;
-	void *val;
+	char *val;
 };
 
-
 #endif
-

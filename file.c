@@ -92,6 +92,7 @@ static int truncate_exttree(struct vdfs4_inode_info *inode_info,
 			continue;
 		} else if ((iblock + ext_len) > new_size) {
 			u32 delta = (u32)(iblock + ext_len - new_size);
+
 			ret = vdfs4_fsm_put_free_block(inode_info,
 					ext_off + ext_len - delta, delta, 0);
 			if (ret) {
@@ -133,7 +134,8 @@ static int truncate_fork(struct vdfs4_inode_info *inode_info,
 {
 	struct vdfs4_fork_info *fork = &inode_info->fork;
 	struct vdfs4_sb_info *sbi = inode_info->vfs_inode.i_sb->s_fs_info;
-	int err = 0, i;
+	int err = 0;
+	unsigned int i;
 	struct vdfs4_extent_info *extent = NULL;
 
 	if (fork->used_extents == 0 ||
@@ -142,8 +144,8 @@ static int truncate_fork(struct vdfs4_inode_info *inode_info,
 						  new_size_iblocks)
 		return 0;
 
-	for (i = (int)fork->used_extents - 1; i >= 0; i--) {
-		extent = &fork->extents[i];
+	for (i = fork->used_extents; i > 0; i--) {
+		extent = &fork->extents[i-1];
 		if (extent->iblock >= new_size_iblocks) {
 			err = vdfs4_fsm_put_free_block(inode_info,
 				extent->first_block, extent->block_count, 0);
@@ -204,7 +206,7 @@ int vdfs4_truncate_blocks(struct inode *inode, loff_t new_size)
 	sector_t freed_runtime_iblocks;
 
 	if (inode->i_ino < VDFS4_1ST_FILE_INO)
-		VDFS4_BUG();
+		VDFS4_BUG(sbi);
 	if (!(S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode)))
 		return -EPERM;
 

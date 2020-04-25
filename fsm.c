@@ -157,7 +157,7 @@ static inline __u32 fsm_max_length(struct fsm_node *node, __u64 start)
  */
 static int fsm_order(__u32 length)
 {
-	return min_t(int, __fls((int)length), VDFS4_FSM_MAX_ORDER);
+	return min_t(int, __fls(length), VDFS4_FSM_MAX_ORDER);
 }
 
 static void fsm_hash(struct vdfs4_fsm_info *fsm, struct fsm_node *node)
@@ -225,19 +225,19 @@ static int fsm_check_node(struct fsm_node *node, struct fsm_node *prev)
 	if (prev && prev->start + prev->length >= node->start) {
 		VDFS4_ERR("prev->start + prev->length >= node->start."
 				"prev->start = %lu, prev->length = %u,"
-				"node->start = %lu", (long unsigned int)
+				"node->start = %lu", (unsigned long int)
 				prev->start, (unsigned int)prev->length,
-				(long unsigned int)node->start);
+				(unsigned long int)node->start);
 		return -1;
 	}
 	if (prev && fsm_intersects(prev, node->start, node->length)) {
 		VDFS4_ERR("fsm_intersects(prev, node->start,"
 				" node->length). prev->start - %lu,"
 				"prev->length = %u, node->start = %lu,"
-				"node->length = %u.", (long unsigned int)
+				"node->length = %u.", (unsigned long int)
 				prev->start,
 				(unsigned int)prev->length,
-				(long unsigned int)node->start,
+				(unsigned long int)node->start,
 				(unsigned int)node->length);
 		return -1;
 	}
@@ -323,7 +323,7 @@ static void fsm_verify_state(struct vdfs4_fsm_info *fsm)
 	return;
 dump_state:
 	fsm_dump_state(fsm);
-	BUG();
+	VDFS4_BUG(fsm->sbi);
 }
 
 
@@ -377,6 +377,9 @@ static void fsm_add_free_space(struct vdfs4_fsm_info *fsm,
 			vdfs4_fatal_error(fsm->sbi, "freeing already free "
 					"space: %lld +%lld, %lld +%d",
 					start, length, cur->start, cur->length);
+			vdfs4_record_err_dump_disk(fsm->sbi,
+					VDFS4_DEBUG_ERR_BITMAP_FREE,
+					0, 0, "freeing already free", NULL, 0);
 			return;
 		}
 
@@ -404,9 +407,7 @@ static void fsm_add_free_space(struct vdfs4_fsm_info *fsm,
 
 	fsm->next_free_blocks += (long long)length;
 
-	if (fsm->next_free_nodes < VDFS4_FSM_MAX_NEXT_NODES)
-		node = fsm_alloc_node(fsm);
-
+	node = fsm_alloc_node(fsm);
 	if (!node) {
 		fsm->untracked_next_free += (long long)length;
 		return;
@@ -458,6 +459,49 @@ fsm_append_free_space(struct vdfs4_fsm_info *fsm, struct fsm_node *last,
 	return node;
 }
 
+static int fsm_discard_free_space(struct vdfs4_fsm_info *fsm,
+				  struct fsm_node *cur)
+{
+	int rtn;
+	unsigned int i;
+	__u64 total_size = fsm->sbi->volume_blocks_count * fsm->sbi->block_size;
+
+	for (i = 0; i < cur->length; i++) {
+		__u64 index = cur->start + i;
+		__u64 erase_block_num = index
+			>> fsm->sbi->log_erase_block_size_in_blocks;
+
+		if (!--fsm->sbi->erase_blocks_counters[erase_block_num]) {
+			u64 erase_blk_size_in_sector = 1llu <<
+				(fsm->sbi->log_erase_block_size
+				 - SECTOR_SIZE_SHIFT);
+			u64 last_block = ((erase_block_num <<
+					   fsm->sbi->log_erase_block_size)
+					  + fsm->sbi->erase_block_size);
+
+			if (last_block > total_size)
+				continue;
+
+			rtn = blkdev_issue_discard(fsm->sbi->sb->s_bdev,
+				   erase_block_num * erase_blk_size_in_sector,
+				   erase_blk_size_in_sector, GFP_NOFS, 0);
+
+			VDFS4_INFO("discard %s : %d %llu %llu\n",
+				   fsm->sbi->sb->s_id, rtn,
+				   erase_block_num, erase_blk_size_in_sector);
+
+			if (rtn && rtn != -EOPNOTSUPP) {
+				VDFS4_ERR("discard %s : %d %llu %llu",
+					  fsm->sbi->sb->s_id, rtn,
+					  erase_block_num,
+					  erase_blk_size_in_sector);
+				VDFS4_BUG(fsm->sbi);
+			}
+		}
+	}
+	return rtn;
+}
+
 /*
  * This moves free space extents from next_free_area to free_area.
  */
@@ -473,15 +517,19 @@ static void fsm_commit_free_space(struct vdfs4_fsm_info *fsm)
 
 		fsm->sbi->free_blocks_count += node->length;
 
+		fsm_discard_free_space(fsm, node);
+
 		while (*p) {
 			cur = container_of(*p, struct fsm_node, node);
-
 			if (fsm_intersects(cur, node->start, node->length)) {
 				vdfs4_fatal_error(fsm->sbi,
 						"freeing already free "
 						"space: %lld +%d, %lld +%d",
 						node->start, node->length,
 						cur->start, cur->length);
+				vdfs4_record_err_dump_disk(fsm->sbi, VDFS4_DEBUG_ERR_BITMAP_FREE,
+						0, 0, "freeing already free", NULL, 0);
+
 				fsm->sbi->free_blocks_count -= node->length;
 				fsm->untracked_blocks += node->length;
 				fsm_free_node(node);
@@ -581,7 +629,8 @@ fsm_choose_node(struct vdfs4_fsm_info *fsm, __u32 length)
 {
 	int order = fsm_order(length);
 
-	while (list_empty(fsm->free_list + order) && order < VDFS4_FSM_MAX_ORDER)
+	while (list_empty(fsm->free_list + order) && order
+			< VDFS4_FSM_MAX_ORDER)
 		order++;
 
 	while (list_empty(fsm->free_list + order) && order > 0)
@@ -602,9 +651,9 @@ static void fsm_allocate_from_node(struct vdfs4_fsm_info *fsm,
 	__u32 max_length = fsm_max_length(node, start);
 
 	/* allocation must be inside */
-	BUG_ON(start < node->start ||
+	VDFS4_BUG_ON(start < node->start ||
 	       start >= node->start + node->length ||
-	       length > max_length);
+	       length > max_length, fsm->sbi);
 
 	fsm_unhash(fsm, node);
 
@@ -637,6 +686,21 @@ static void fsm_allocate_from_node(struct vdfs4_fsm_info *fsm,
 		fsm_hash(fsm, node);
 	else
 		fsm_drop(fsm, node);
+}
+
+static struct fsm_node *
+fsm_get_longest_node(struct vdfs4_fsm_info *fsm)
+{
+	struct fsm_node *prev, *node;
+	struct fsm_node *return_node;
+
+	for (prev = NULL, node = fsm_first(&fsm->free_area),
+			return_node = node; node;
+			prev = node, node = fsm_next(node)) {
+		if (node->length > return_node->length)
+			return_node = node;
+	}
+	return return_node;
 }
 
 static __u64 fsm_allocate_space(struct vdfs4_fsm_info *fsm,
@@ -696,8 +760,9 @@ nospace:
  *					already used by file system), 0 if
  *					function fails (no free space).
  */
-__u64 vdfs4_fsm_get_free_block(struct vdfs4_sb_info *sbi, __u64 block_offset,
-		__u32 *length_in_blocks, int fsm_flags)
+__u64 vdfs4_fsm_get_free_block(struct vdfs4_sb_info *sbi,
+		__u64 block_offset, __u32 *length_in_blocks,
+		unsigned int min_blk_count, int fsm_flags)
 {
 	struct vdfs4_fsm_info *fsm = sbi->fsm_info;
 	__u64 start_page = 0, end_page = 0, index;
@@ -719,17 +784,43 @@ __u64 vdfs4_fsm_get_free_block(struct vdfs4_sb_info *sbi, __u64 block_offset,
 		/* align metadata to superpage size */
 		__u32 blocks_per_superpage = 1U << (sbi->log_super_page_size -
 				sbi->log_block_size);
-		__u32 length = *length_in_blocks + blocks_per_superpage;
+		__u32 optimal_length = *length_in_blocks + blocks_per_superpage;
+		__u32 minimal_length = min_blk_count + blocks_per_superpage;
+		__u32 length = optimal_length;
 
-		VDFS4_BUG_ON(*length_in_blocks & (blocks_per_superpage - 1));
+		VDFS4_BUG_ON(*length_in_blocks & (blocks_per_superpage - 1), sbi);
 
+		/* try to allocate length desired by caller first */
 		block_offset = fsm_allocate_space(fsm, (u32)block_offset,
 						  length, &length);
-		if (!block_offset)
-			goto exit;
+		if (!block_offset) {
+			struct fsm_node *longest_node;
 
-		VDFS4_BUG_ON(length !=
-				(*length_in_blocks + blocks_per_superpage));
+			/* Space is so fragmented that our attempt
+			failed. Find longest possible free chunk and
+			try to get as much as possible from it */
+			longest_node = fsm_get_longest_node(fsm);
+			if (!longest_node)
+				goto exit;
+
+			length = round_down(longest_node->length, blocks_per_superpage);
+			if (length > optimal_length)
+				length = optimal_length;
+
+			/* found chunk size must be at least of minimal
+			length acceptable for caller (min_blk_count).
+			Usually it will be much longer than minimum */
+			if (length < minimal_length + blocks_per_superpage)
+				goto exit;
+
+			block_offset = longest_node->start;
+			fsm_allocate_from_node(fsm, longest_node, block_offset, length);
+			/* neccessary to align physical block num */
+			*length_in_blocks = length - blocks_per_superpage;
+		}
+
+		VDFS4_BUG_ON((length < minimal_length) ||
+				(length > optimal_length), sbi);
 		fsm->untracked_blocks += blocks_per_superpage;
 		block_offset = ALIGN(block_offset, blocks_per_superpage);
 	} else {
@@ -741,6 +832,7 @@ __u64 vdfs4_fsm_get_free_block(struct vdfs4_sb_info *sbi, __u64 block_offset,
 		int ret = 0;
 		start_page = block_offset;
 		end_page = block_offset + *length_in_blocks;
+
 		/* calculate start block */
 		do_div(start_page, VDFS4_BIT_BLKSIZE(sbi->block_size,
 				FSM_BMP_MAGIC_LEN));
@@ -760,21 +852,21 @@ __u64 vdfs4_fsm_get_free_block(struct vdfs4_sb_info *sbi, __u64 block_offset,
 			fsm->sbi->free_blocks_count -= *length_in_blocks;
 
 		VDFS4_BUG_ON(block_offset + *length_in_blocks >
-					(fsm->sbi->volume_blocks_count));
+					(fsm->sbi->volume_blocks_count), sbi);
 
 		ret = vdfs4_set_bits(fsm->data, (int)(fsm->page_count *
 			PAGE_SIZE), (unsigned int)block_offset,
 			*length_in_blocks, FSM_BMP_MAGIC_LEN, sbi->block_size);
 		if (ret != 0) {
 			destroy_layout(sbi);
-			VDFS4_BUG_ON(1);
+			VDFS4_BUG_ON(1, sbi);
 		}
 		for (index = 0; index < *length_in_blocks; index++) {
 			int erase_block_num = (int)((block_offset + index) >>
 				sbi->log_erase_block_size_in_blocks);
 			sbi->erase_blocks_counters[erase_block_num]++;
-			BUG_ON(sbi->erase_blocks_counters[erase_block_num] >
-				sbi->erase_block_size_in_blocks);
+			VDFS4_BUG_ON(sbi->erase_blocks_counters[erase_block_num] >
+				sbi->erase_block_size_in_blocks, sbi);
 		}
 	}
 exit:
@@ -812,10 +904,10 @@ static int fsm_free_block_chunk(struct vdfs4_fsm_info *fsm,
 	do_div(end_page, VDFS4_BIT_BLKSIZE(fsm->sbi->block_size,
 			FSM_BMP_MAGIC_LEN));
 	/* index of start page */
-	start_page = (unsigned int)start_page >>\
+	start_page = (unsigned int)start_page >>
 			(PAGE_SHIFT - fsm->sbi->block_size_shift);
 	/* index of end page */
-	end_page = (unsigned int)end_page >>\
+	end_page = (unsigned int)end_page >>
 			(PAGE_SHIFT - fsm->sbi->block_size_shift);
 
 
@@ -826,8 +918,11 @@ static int fsm_free_block_chunk(struct vdfs4_fsm_info *fsm,
 		if (!is_sbi_flag_set(fsm->sbi, IS_MOUNT_FINISHED)) {
 			mutex_unlock(&fsm->lock);
 			return err;
-		} else
-			VDFS4_BUG();
+		}
+		VDFS4_ERR("[boundary check] offset:%lld, length:%u, count:%llu\n",
+				block_offset, length_in_blocks,
+				fsm->sbi->volume_blocks_count);
+		VDFS4_BUG(fsm->sbi);
 	}
 	/* clear bits */
 	err = (int)vdfs4_clear_bits(fsm->data, (int)
@@ -839,10 +934,10 @@ static int fsm_free_block_chunk(struct vdfs4_fsm_info *fsm,
 		if (!is_sbi_flag_set(fsm->sbi, IS_MOUNT_FINISHED)) {
 			mutex_unlock(&fsm->lock);
 			return err;
-		} else {
-			destroy_layout(fsm->sbi);
-			VDFS4_BUG();
 		}
+
+		destroy_layout(fsm->sbi);
+		VDFS4_BUG(fsm->sbi);
 	}
 
 	/* return failed delayed-allocation back to reserve */
@@ -857,36 +952,6 @@ static int fsm_free_block_chunk(struct vdfs4_fsm_info *fsm,
 	else
 		fsm_add_free_space(fsm, block_offset, length_in_blocks);
 
-	for (i = 0; i < length_in_blocks; i++) {
-		__u32 index = (u32)block_offset + i;
-		__u64 erase_block_num = index >>
-				fsm->sbi->log_erase_block_size_in_blocks;
-
-		if (!--fsm->sbi->erase_blocks_counters[erase_block_num]) {
-			int rc;
-			u64 erase_block_size_in_secors = 1llu <<
-					(fsm->sbi->log_erase_block_size -
-					SECTOR_SIZE_SHIFT);
-
-			if ((erase_block_num << fsm->sbi->log_erase_block_size)
-				+ fsm->sbi->erase_block_size > total_size)
-				continue;
-
-
-			rc = blkdev_issue_discard(fsm->sbi->sb->s_bdev,
-				erase_block_num * erase_block_size_in_secors,
-				erase_block_size_in_secors, GFP_NOFS, 0);
-			/*if (rc == -EOPNOTSUPP)
-				VDFS4_ERR("TRIM doesn't support"); */
-			if (rc && rc != -EOPNOTSUPP) {
-				VDFS4_ERR("sb_issue_discard %d %llu %u", rc,
-						erase_block_num,
-						fsm->sbi->erase_block_size);
-				BUG();
-			}
-
-		}
-	}
 	mutex_unlock(&fsm->lock);
 	for (page_index = start_page; page_index <= end_page; page_index++)
 		vdfs4_add_chunk_bitmap(fsm->sbi, fsm->pages[page_index], 1);
@@ -962,8 +1027,8 @@ static void fsm_build_tree(struct vdfs4_fsm_info *fsm)
 		block_size = min_t(__u64, block_size, bits_count - block_start);
 
 		free_start = block_start + find_next_zero_bit(block,
-				(int)block_size,
-				(int)(data_start - block_start));
+				block_size,
+				(data_start - block_start));
 
 		/* count erase blocks */
 		for (bit = data_start; bit < free_start;) {
@@ -972,13 +1037,13 @@ static void fsm_build_tree(struct vdfs4_fsm_info *fsm)
 				sbi->log_erase_block_size_in_blocks) - bit;
 
 			sbi->erase_blocks_counters[leb] += (u32)len;
-			BUG_ON(sbi->erase_blocks_counters[leb] >
-					sbi->erase_block_size_in_blocks);
+			VDFS4_BUG_ON(sbi->erase_blocks_counters[leb] >
+					sbi->erase_block_size_in_blocks, sbi);
 			bit += len;
 		}
 
-		data_start = block_start + find_next_bit(block, (int)block_size,
-					(int)(free_start - block_start));
+		data_start = block_start + find_next_bit(block, block_size,
+					(free_start - block_start));
 
 		/* switch to next bitmap block */
 		if (data_start == block_start + block_size) {
@@ -1006,13 +1071,14 @@ static void fsm_cut_next_free(struct vdfs4_fsm_info *fsm)
 		node = fsm_find_node(fsm, next->start);
 		if (!node) {
 			/* it might absent only if something off a tree */
-			BUG_ON(fsm->untracked_blocks < next->length);
+			VDFS4_BUG_ON(fsm->untracked_blocks < next->length, fsm->sbi);
 			fsm->untracked_blocks -= next->length;
 			continue;
 		}
 
 		/* otherwise whole extent must be in the tree */
-		BUG_ON(fsm_max_length(node, next->start) < next->length);
+		VDFS4_BUG_ON(fsm_max_length(node, next->start) <
+				next->length, fsm->sbi);
 		fsm_allocate_from_node(fsm, node, next->start, next->length);
 	}
 }
@@ -1078,6 +1144,7 @@ int vdfs4_fsm_build_management(struct super_block *sb)
 	unsigned int page_index = 0;
 	__u64 page_count;
 	u64 total_size = sbi->volume_blocks_count * sbi->block_size;
+
 	if (sbi->log_erase_block_size == 0) {
 		VDFS4_ERR("wrong erase block size");
 		return -EINVAL;
@@ -1127,7 +1194,8 @@ int vdfs4_fsm_build_management(struct super_block *sb)
 	if (err)
 		goto fail_no_release;
 
-	fsm->data = vdfs4_vmap(fsm->pages, fsm->page_count, VM_MAP, PAGE_KERNEL);
+	fsm->data = vdfs4_vmap(fsm->pages, fsm->page_count,
+					VM_MAP, PAGE_KERNEL);
 
 	if (!fsm->data) {
 		VDFS4_ERR("can't map pages\n");
@@ -1169,7 +1237,7 @@ void vdfs4_fsm_destroy_management(struct super_block *sb)
 	struct vdfs4_fsm_info *fsm = sbi->fsm_info;
 	unsigned int page_index = 0;
 
-	VDFS4_BUG_ON(!fsm->data || !fsm->pages);
+	VDFS4_BUG_ON(!fsm->data || !fsm->pages, sbi);
 
 	fsm_verify_state(fsm);
 	fsm_free_tree(fsm);
