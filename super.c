@@ -31,7 +31,6 @@
 #include <linux/exportfs.h>
 #include <linux/vmalloc.h>
 #include <linux/writeback.h>
-#include <linux/bootmem.h>
 #include <linux/mutex.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
