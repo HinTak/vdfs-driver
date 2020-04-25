@@ -24,7 +24,7 @@
 #include <linux/compat.h>
 #include <linux/version.h>
 #include <linux/file.h>
-#include <../fs/internal.h>
+#include <fs/internal.h>
 #include <linux/namei.h>
 #include <linux/buffer_head.h>
 
