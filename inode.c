@@ -38,6 +38,7 @@
 #include <linux/crypto.h>
 
 #ifdef CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT
+#include <crypto/crypto_wrapper.h>
 #include <mach/hw_decompress.h>
 #endif
 
@@ -604,10 +605,6 @@ static int vdfs4_unlink(struct inode *dir, struct dentry *dentry)
 	struct super_block *sb = inode->i_sb;
 	struct vdfs4_sb_info *sbi = sb->s_fs_info;
 	int ret = 0;
-
-	ret = vdfs4_check_permissions(inode);
-	if (ret)
-		return ret;
 
 	VDFS4_DEBUG_INO("unlink '%s', ino = %lu", dentry->d_iname,
 			inode->i_ino);
@@ -1243,7 +1240,7 @@ static int current_reads_only_authenticated(struct inode *inode, bool mm_locked)
 #endif
 			unsigned int len;
 			char *buffer = kzalloc(PAGE_SIZE, GFP_NOFS);
-			pr_err("mmap is not permited for:"
+			VDFS4_ERR("mmap is not permited for:"
 					" ino - %lu: name -%s, pid - %d,"
 					" Can't read "
 					"non-auth data from ino - %lu,"
@@ -1256,7 +1253,7 @@ static int current_reads_only_authenticated(struct inode *inode, bool mm_locked)
 			len = get_pid_cmdline(mm, buffer);
 			if (len > 0) {
 				size_t i = 0;
-				pr_err("Pid %d cmdline - ", task_pid_nr(task));
+				VDFS4_ERR("Pid %d cmdline - ", task_pid_nr(task));
 				for (i = 0; i <= len;
 						i += strlen(buffer + i) + 1)
 					pr_cont("%s ", buffer + i);
@@ -1323,6 +1320,75 @@ static int vdfs4_readpages_special(struct file *file,
 	BUG();
 }
 
+static enum compr_type get_comprtype_by_descr(
+		struct vdfs4_comp_file_descr *descr)
+{
+	if (!memcmp(descr->magic + 1, VDFS4_COMPR_LZO_FILE_DESCR_MAGIC,
+			sizeof(descr->magic) - 1))
+		return VDFS4_COMPR_LZO;
+
+	if (!memcmp(descr->magic + 1, VDFS4_COMPR_ZIP_FILE_DESCR_MAGIC,
+			sizeof(descr->magic) - 1))
+		return VDFS4_COMPR_ZLIB;
+
+	if (!memcmp(descr->magic + 1, VDFS4_COMPR_GZIP_FILE_DESCR_MAGIC,
+			sizeof(descr->magic) - 1))
+		return VDFS4_COMPR_GZIP;
+
+	if (!memcmp(descr->magic + 1, VDFS4_COMPR_ZHW_FILE_DESCR_MAGIC,
+			sizeof(descr->magic) - 1))
+		return VDFS4_COMPR_ZHW;
+	return -EINVAL;
+}
+
+static int vdfs4_file_descriptor_verify(struct vdfs4_inode_info *inode_i,
+		struct vdfs4_comp_file_descr *descr)
+{
+	int ret = 0;
+	enum compr_type compr_type;
+	if (le32_to_cpu(descr->layout_version) != VDFS4_COMPR_LAYOUT_VER) {
+		VDFS4_ERR("Wrong descriptor layout version %d (expected %d) file %s",
+				le32_to_cpu(descr->layout_version), VDFS4_COMPR_LAYOUT_VER,
+				INODEI_NAME(inode_i));
+		ret = -EINVAL;
+		goto err;
+	}
+
+	switch(descr->magic[0]) {
+	case VDFS4_COMPR_DESCR_START:
+	case VDFS4_SHA1_AUTH:
+	case VDFS4_SHA256_AUTH:
+	case VDFS4_MD5_AUTH:
+		break;
+	default:
+		VDFS4_ERR("Wrong descriptor magic start %c "
+			"in compressed file %s",
+			descr->magic[0], INODEI_NAME(inode_i));
+		ret = -EINVAL;
+		goto err;
+	}
+
+	compr_type = get_comprtype_by_descr(descr);
+	switch (compr_type) {
+	case VDFS4_COMPR_ZLIB:
+	case VDFS4_COMPR_ZHW:
+	case VDFS4_COMPR_GZIP:
+	case VDFS4_COMPR_LZO:
+		break;
+	default:
+		VDFS4_ERR("Wrong descriptor magic (%.*s) "
+				"in compressed file %s",
+			(int)sizeof(descr->magic), descr->magic,
+			INODEI_NAME(inode_i));
+		ret = -EOPNOTSUPP;
+		goto err;
+	}
+
+err:
+	if(ret)
+		VDFS4_MDUMP("Bad descriptor dump:", descr, sizeof(*descr));
+	return ret;
+}
 
 static int get_file_descriptor(struct vdfs4_inode_info *inode_i,
 		struct vdfs4_comp_file_descr *descr)
@@ -1332,6 +1398,7 @@ static int get_file_descriptor(struct vdfs4_inode_info *inode_i,
 	int pos;
 	loff_t descr_offset;
 	int ret = 0;
+	struct page *pages[2] = {0};
 	if (inode_i->fbc->comp_size < sizeof(*descr))
 		return -EINVAL;
 	descr_offset = inode_i->fbc->comp_size - sizeof(*descr);
@@ -1341,32 +1408,40 @@ static int get_file_descriptor(struct vdfs4_inode_info *inode_i,
 	if (PAGE_CACHE_SIZE - (descr_offset -
 			((descr_offset >> PAGE_CACHE_SHIFT)
 			<< PAGE_CACHE_SHIFT)) < sizeof(*descr)) {
-		struct page *pages[2];
 		ret = vdfs4_read_comp_pages(&inode_i->vfs_inode, page_idx,
 			2, pages, VDFS4_FBASED_READ_M);
 		if (ret)
 			return ret;
 
 		data = vdfs4_vmap(pages, 2, VM_MAP, PAGE_KERNEL);
+		if(!data) {
+			ret = -ENOMEM;
+			goto err;
+		}
 		memcpy(descr, (char *)data + pos, sizeof(*descr));
 		vunmap(data);
-		for (page_idx = 0; page_idx < 2; page_idx++) {
+	} else {
+		ret = vdfs4_read_comp_pages(&inode_i->vfs_inode, page_idx,
+			1, pages, VDFS4_FBASED_READ_M);
+		if (ret)
+			return ret;
+
+		data = kmap_atomic(pages[0]);
+		memcpy(descr, (char *)data + pos, sizeof(*descr));
+		kunmap_atomic(data);
+	}
+	ret = vdfs4_file_descriptor_verify(inode_i, descr);
+err:
+	for (page_idx = 0; page_idx < 2; page_idx++) {
+		if(pages[page_idx]) {
+			if(ret && ret != -ENOMEM) {
+				lock_page(pages[page_idx]);
+				ClearPageChecked(pages[page_idx]);
+				unlock_page(pages[page_idx]);
+			}
 			mark_page_accessed(pages[page_idx]);
 			page_cache_release(pages[page_idx]);
 		}
-	} else {
-		struct page *page;
-		ret = vdfs4_read_comp_pages(&inode_i->vfs_inode, page_idx,
-			1, &page, VDFS4_FBASED_READ_M);
-		if (ret)
-			return ret;
-		data = kmap_atomic(page);
-		memcpy(descr, (char *)data + pos, sizeof(*descr));
-
-		kunmap_atomic(data);
-
-		mark_page_accessed(page);
-		page_cache_release(page);
 	}
 	return ret;
 }
@@ -1565,7 +1640,7 @@ static int vdfs4_readpage_tuned_sw_retry(struct file *file, struct page *page)
 	} while (ret && (i < 3));
 
 	if (i && !ret)
-		VDFS4_ERR("decomression retry successfully done");
+		VDFS4_DEBUG_TMP("decomression retry successfully done");
 	return ret;
 }
 
@@ -1583,7 +1658,7 @@ static int vdfs4_readpage_tuned_hw_retry(struct file *file, struct page *page)
 	} while (ret && (i < 3));
 
 	if (i && !ret)
-		VDFS4_ERR("decomression retry successfully done");
+		VDFS4_DEBUG_TMP("decomression retry successfully done");
 	return ret;
 }
 #endif
@@ -1763,81 +1838,63 @@ static int vdfs4_write_end(struct file *file, struct address_space *mapping,
 /**
  * @brief		Called during file opening process.
  * @param [in]	inode	Pointer to inode information
+ * @return		Returns error codes
+ */
+static int vdfs4_file_open_init_compressed(struct inode *inode)
+{
+	int rc = 0;
+	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
+
+	if (inode_info->fbc) {
+		mutex_lock(&inode->i_mutex);
+		if ((inode_info->fbc) &&
+			(inode_info->fbc->compr_type == VDFS4_COMPR_UNDEF)) {
+#ifdef CONFIG_VDFS4_RETRY
+				int retry_count = 1;
+				do {
+#endif
+					rc = vdfs4_init_file_decompression(inode_info, 1);
+#ifdef CONFIG_VDFS4_RETRY
+					if (rc)
+						VDFS4_ERR("init decompression retry %d", retry_count);
+				} while (rc && (retry_count++ < 3));
+#endif
+		}
+		mutex_unlock(&inode->i_mutex);
+	}
+	return rc;
+}
+
+/**
+ * @brief		Called during file opening process.
+ * @param [in]	inode	Pointer to inode information
  * @param [in]	file	Pointer to file structure
  * @return		Returns error codes
  */
 static int vdfs4_file_open(struct inode *inode, struct file *filp)
 {
 	int rc = 0;
-	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
 
-	mutex_lock(&inode->i_mutex);
-
-	if (is_dlink(inode) && is_vdfs4_inode_flag_set(
-			inode_info->data_link.inode, VDFS4_COMPRESSED_FILE)) {
-		struct inode *data_inode = VDFS4_I(inode)->data_link.inode;
-		struct vdfs4_inode_info *data_inode_info = VDFS4_I(data_inode);
-#ifdef CONFIG_VDFS4_RETRY
-		int retry_count = 0;
-retry_dlink:
-#endif
-		if (data_inode_info->fbc->compr_type == VDFS4_COMPR_UNDEF) {
-			mutex_lock(&data_inode->i_mutex);
-			if (data_inode_info->fbc->compr_type == VDFS4_COMPR_UNDEF)
-				rc = vdfs4_init_file_decompression(
-						data_inode_info, 1);
-			mutex_unlock(&data_inode->i_mutex);
-		}
-		if (rc) {
-#ifdef CONFIG_VDFS4_RETRY
-			if (retry_count < 3) {
-				retry_count++;
-				VDFS4_ERR("init decompression retry %d",
-						retry_count);
-				goto retry_dlink;
-			}
-#endif
-			goto unlock_exit;
-		}
+	if (is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE))
+	{
+		if (filp->f_flags & (O_CREAT | O_TRUNC | O_WRONLY | O_RDWR))
+			rc = -EPERM;
+		else
+			rc = vdfs4_file_open_init_compressed(inode);
 	}
 
-	if (is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE) &&
-			inode_info->fbc->compr_type == VDFS4_COMPR_UNDEF) {
-#ifdef CONFIG_VDFS4_RETRY
-		int retry_count = 0;
-retry:
-#endif
-		rc = vdfs4_init_file_decompression(VDFS4_I(inode), 1);
-		if (rc) {
-#ifdef CONFIG_VDFS4_RETRY
-			if (retry_count < 3) {
-				retry_count++;
-				VDFS4_ERR("init decompression retry %d",
-						retry_count);
-				goto retry;
-			}
-#endif
-			goto unlock_exit;
-		}
-	}
+	/* dlink should never have COMPRESSED_FILE set, only link inode can */
+	if (!rc && is_dlink(inode) && is_vdfs4_inode_flag_set(
+			VDFS4_I(inode)->data_link.inode, VDFS4_COMPRESSED_FILE))
+		rc = vdfs4_file_open_init_compressed(VDFS4_I(inode)->data_link.inode);
 
-	if ((is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE))
-			&&
-			(filp->f_flags &
-			(O_CREAT | O_TRUNC | O_WRONLY | O_RDWR))) {
-		rc = -EPERM;
-		goto unlock_exit;
-	}
+	if (rc)
+		return rc;
 
 	rc = generic_file_open(inode, filp);
-	if (rc) {
-		goto unlock_exit;
-	}
+	if (!rc)
+		atomic_inc(&(VDFS4_I(inode)->open_count));
 
-	atomic_inc(&(inode_info->open_count));
-
-unlock_exit:
-	mutex_unlock(&inode->i_mutex);
 	return rc;
 }
 
@@ -2069,9 +2126,6 @@ static int vdfs4_rename(struct inode *old_dir, struct dentry *old_dentry,
 	u8 record_type;
 	int ret;
 
-	ret = vdfs4_check_permissions(mv_inode);
-	if (ret)
-		return ret;
 	if (new_dentry->d_name.len > VDFS4_FILE_NAME_LEN)
 		return -ENAMETOOLONG;
 
@@ -2287,10 +2341,6 @@ static int vdfs4_link(struct dentry *old_dentry, struct inode *dir,
 	int ret;
 
 	vdfs4_assert_i_mutex(inode);
-
-	ret = vdfs4_check_permissions(inode);
-	if (ret)
-		return ret;
 
 	if (dentry->d_name.len > VDFS4_FILE_NAME_LEN)
 		return -ENAMETOOLONG;
@@ -2676,12 +2726,7 @@ static inline loff_t get_real_writing_position(struct kiocb *iocb, loff_t pos)
 static ssize_t vdfs4_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 		unsigned long nr_segs, loff_t pos)
 {
-	struct inode *inode = INODE(iocb);
 	ssize_t ret = 0;
-
-	ret = vdfs4_check_permissions(inode);
-	if (ret)
-		return ret;
 
 	/* We are trying to write iocb->ki_left bytes from iov->iov_base */
 	ret = generic_file_aio_write(iocb, iov, nr_segs, pos);
@@ -2703,16 +2748,12 @@ static ssize_t vdfs4_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
 	struct inode *inode = INODE(iocb);
 	ssize_t ret;
 
-	ret = vdfs4_check_permissions(inode);
-	if (ret)
-		return ret;
-
 #ifdef CONFIG_VDFS4_EXEC_ONLY_AUTHENTICATED
 	if (current_reads_only_authenticated(inode, false)) {
 #ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
 		if (!VDFS4_I(inode)->informed_about_fail_read)
 #endif
-			pr_err("read is not permited: %lu:%s",
+			VDFS4_ERR("read is not permited: %lu:%s",
 				inode->i_ino, VDFS4_I(inode)->name);
 #ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
 		VDFS4_I(inode)->informed_about_fail_read = 1;
@@ -2725,7 +2766,7 @@ static ssize_t vdfs4_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
 	ret = generic_file_aio_read(iocb, iov, nr_segs, pos);
 #if defined(CONFIG_VDFS4_DEBUG)
 	if (ret < 0 && ret != -EIOCBQUEUED && ret != -EINTR)
-		VDFS4_ERR("err = %d, ino#%lu name=%s",
+		VDFS4_DEBUG_TMP("err = %d, ino#%lu name=%s",
 			(int)ret, inode->i_ino, VDFS4_I(inode)->name);
 #endif
 	return ret;
@@ -2738,7 +2779,7 @@ static ssize_t vdfs4_file_splice_read(struct file *in, loff_t *ppos,
 	struct inode *inode = in->f_mapping->host;
 
 	if (current_reads_only_authenticated(inode, false)) {
-		pr_err("read is not permited:  %lu:%s",
+		VDFS4_ERR("read is not permited:  %lu:%s",
 				inode->i_ino, VDFS4_I(inode)->name);
 #ifndef CONFIG_VDFS4_DEBUG_AUTHENTICAION
 		return -EPERM;
@@ -2761,7 +2802,7 @@ static int check_execution_available(struct inode *inode,
 #ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
 			if (!VDFS4_I(inode)->informed_about_fail_read) {
 				VDFS4_I(inode)->informed_about_fail_read = 1;
-				pr_err("Try to execute non-auth file %lu:%s",
+				VDFS4_DEBUG_TMP("Try to execute non-auth file %lu:%s",
 						inode->i_ino,
 						VDFS4_I(inode)->name);
 			}
@@ -2919,27 +2960,6 @@ static int vdfs4_fill_inode(struct inode *inode,
 	return ret;
 }
 
-static enum compr_type get_comprtype_by_descr(
-		struct vdfs4_comp_file_descr *descr)
-{
-	if (!memcmp(descr->magic + 1, VDFS4_COMPR_LZO_FILE_DESCR_MAGIC,
-			sizeof(descr->magic) - 1))
-		return VDFS4_COMPR_LZO;
-
-	if (!memcmp(descr->magic + 1, VDFS4_COMPR_ZIP_FILE_DESCR_MAGIC,
-			sizeof(descr->magic) - 1))
-		return VDFS4_COMPR_ZLIB;
-
-	if (!memcmp(descr->magic + 1, VDFS4_COMPR_GZIP_FILE_DESCR_MAGIC,
-			sizeof(descr->magic) - 1))
-		return VDFS4_COMPR_GZIP;
-
-	if (!memcmp(descr->magic + 1, VDFS4_COMPR_ZHW_FILE_DESCR_MAGIC,
-			sizeof(descr->magic) - 1))
-		return VDFS4_COMPR_ZHW;
-	return -EINVAL;
-}
-
 static u32 calc_compext_table_crc(void *data, int offset, size_t table_len)
 {
 	struct vdfs4_comp_file_descr *descr = NULL;
@@ -2970,6 +2990,21 @@ int vdfs4_prepare_compressed_file_inode(struct vdfs4_inode_info *inode_i)
 	ret = get_file_descriptor(inode_i, &descr);
 	if (ret)
 		return ret;
+
+	switch (descr.magic[0]) {
+	case VDFS4_COMPR_DESCR_START:
+		break;
+	case VDFS4_MD5_AUTH:
+	case VDFS4_SHA1_AUTH:
+	case VDFS4_SHA256_AUTH:
+#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+		set_vdfs4_inode_flag(inode, VDFS4_AUTH_FILE);
+#endif
+		break;
+	default:
+		return -EINVAL;
+	}
+
 	inode->i_size = (long long)le64_to_cpu(descr.unpacked_size);
 	inode->i_fop = &vdfs4_tuned_file_operations;
 	/* deny_write_access() */
@@ -2977,6 +3012,26 @@ int vdfs4_prepare_compressed_file_inode(struct vdfs4_inode_info *inode_i)
 		atomic_set(&inode->i_writecount, -1);
 
 	return ret;
+}
+
+static int vdfs4_init_hw_decompression(struct vdfs4_inode_info *inode_i)
+{
+#if (defined(CONFIG_VDFS4_USE_HW1_DECOMPRESS) \
+		|| defined(CONFIG_VDFS4_USE_HW2_DECOMPRESS))
+	const struct hw_capability hw_cap = get_hw_capability();
+	if (inode_i->fbc->log_chunk_size > hw_cap.max_size ||
+			inode_i->fbc->log_chunk_size < hw_cap.min_size)
+		return -EINVAL;
+
+	inode_i->fbc->hw_fn = vdfs_get_hwdec_fn(inode_i);
+	if (!inode_i->fbc->hw_fn)
+		return -ENOTSUPP;
+
+	inode_i->vfs_inode.i_mapping->a_ops = &vdfs4_tuned_aops_hw;
+	return 0;
+#else
+	return -ENOTSUPP;
+#endif
 }
 
 int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
@@ -2998,25 +3053,6 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 	if (ret)
 		return ret;
 
-	if (le32_to_cpu(descr.layout_version) != VDFS4_COMPR_LAYOUT_VER) {
-		VDFS4_ERR("Wrong layout version %d (expected %d)",
-				le32_to_cpu(descr.layout_version),
-				VDFS4_COMPR_LAYOUT_VER);
-		return -EINVAL;
-	}
-
-	if ((descr.magic[0] != VDFS4_COMPR_DESCR_START) &&
-			(descr.magic[0] != VDFS4_SHA1_AUTH) &&
-			(descr.magic[0] != VDFS4_SHA256_AUTH) &&
-			(descr.magic[0] != VDFS4_MD5_AUTH)) {
-		if (!debug)
-			return -EOPNOTSUPP;
-		VDFS4_ERR("Wrong descriptor magic start %c "
-				"in compressed file %s", descr.magic[0],
-				inode_i->name ? inode_i->name : "<no name>");
-		return -EINVAL;
-	}
-
 	compr_type = get_comprtype_by_descr(&descr);
 
 	switch (compr_type) {
@@ -3033,10 +3069,6 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 	default:
 		if (!debug)
 			return -EOPNOTSUPP;
-		VDFS4_ERR("Wrong descriptor magic (%.*s) "
-				"in compressed file %s",
-			(int)sizeof(descr.magic), descr.magic,
-			inode_i->name ? inode_i->name : "<no name>");
 		return compr_type;
 	}
 
@@ -3056,32 +3088,29 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 			(unsigned long)VDFS4_CRYPTED_HASH_LEN;
 #ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
 		if (is_sbi_flag_set(VDFS4_SB(inode->i_sb), VOLUME_AUTH))
-			inode_i->fbc->hash_fn = vdfs4_calculate_hash_md5;
+			inode_i->fbc->hash_fn = calculate_sw_hash_md5;
 #endif
 		inode_i->fbc->hash_type = VDFS4_HASH_MD5;
 		inode_i->fbc->hash_len = VDFS4_MD5_HASH_LEN;
-
 		break;
-
 	case VDFS4_SHA1_AUTH:
 		table_size_bytes += (unsigned long)VDFS4_SHA1_HASH_LEN *
 			(extents_num + 1lu) +
 			(unsigned long)VDFS4_CRYPTED_HASH_LEN;
 #ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
 		if (is_sbi_flag_set(VDFS4_SB(inode->i_sb), VOLUME_AUTH))
-			inode_i->fbc->hash_fn = vdfs4_calculate_hash_sha1;
+			inode_i->fbc->hash_fn = calculate_sw_hash_sha1;
 #endif
 		inode_i->fbc->hash_type = VDFS4_HASH_SHA1;
 		inode_i->fbc->hash_len = VDFS4_SHA1_HASH_LEN;
 		break;
-
 	case VDFS4_SHA256_AUTH:
 		table_size_bytes += (unsigned long)VDFS4_SHA256_HASH_LEN *
 			(extents_num + 1lu) +
 			(unsigned long)VDFS4_CRYPTED_HASH_LEN;
 #ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
 		if (is_sbi_flag_set(VDFS4_SB(inode->i_sb), VOLUME_AUTH))
-			inode_i->fbc->hash_fn = vdfs4_calculate_hash_sha256;
+			inode_i->fbc->hash_fn = calculate_sw_hash_sha256;
 #endif
 		inode_i->fbc->hash_type = VDFS4_HASH_SHA256;
 		inode_i->fbc->hash_len = VDFS4_SHA256_HASH_LEN;
@@ -3089,11 +3118,6 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 	default:
 		if (!debug)
 			return -EOPNOTSUPP;
-
-		VDFS4_ERR("Wrong descriptor magic (%.*s) "
-				"in compressed file %s",
-			(int)sizeof(descr.magic), descr.magic,
-			inode_i->name ? inode_i->name : "<no name>");
 		return (int)descr.magic[0];
 	}
 
@@ -3125,6 +3149,8 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 	if (crc != le32_to_cpu(descr.crc)) {
 		VDFS4_ERR("File based decompression crc mismatch: %s",
 				inode_i->name);
+		VDFS4_MDUMP("Original crc:", &descr.crc, sizeof(descr.crc));
+		VDFS4_MDUMP("Calculated crc:", &crc, sizeof(crc));
 		ret = -EINVAL;
 		goto out;
 	}
@@ -3143,19 +3169,8 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 	}
 
 	inode->i_mapping->a_ops = &vdfs4_tuned_aops;
-	/* HW block supports only 128K chunk size */
-	if (inode_i->fbc->log_chunk_size != 17)
-		goto sw_decompression;
 
-#if (defined(CONFIG_VDFS4_USE_HW1_DECOMPRESS) \
-		|| defined(CONFIG_VDFS4_USE_HW2_DECOMPRESS))
-	inode_i->fbc->hw_fn = vdfs_get_hwdec_fn(inode_i);
-	if (inode_i->fbc->hw_fn)
-		inode->i_mapping->a_ops = &vdfs4_tuned_aops_hw;
-#endif
-
-sw_decompression:
-
+	vdfs4_init_hw_decompression(inode_i);
 out:
 	vunmap(data);
 
@@ -3202,9 +3217,8 @@ int vdfs4_disable_file_decompression(struct vdfs4_inode_info *inode_i)
 struct inode *vdfs4_get_inode_from_record(struct vdfs4_cattree_record *record,
 		struct inode *parent)
 {
-	struct vdfs4_btree *tree =
-		VDFS4_BTREE_REC_I((void *) record)->rec_pos.bnode->host;
-	struct vdfs4_sb_info *sbi = tree->sbi;
+	struct vdfs4_btree *tree;
+	struct vdfs4_sb_info *sbi;
 	struct vdfs4_catalog_folder_record *folder_rec = NULL;
 	struct vdfs4_catalog_file_record *file_rec = NULL;
 	struct vdfs4_cattree_record *hlink_rec = NULL;
@@ -3214,6 +3228,9 @@ struct inode *vdfs4_get_inode_from_record(struct vdfs4_cattree_record *record,
 
 	if (IS_ERR(record) || !record)
 		return ERR_PTR(-EFAULT);
+
+	tree = VDFS4_BTREE_REC_I((void *) record)->rec_pos.bnode->host;
+	sbi = tree->sbi;
 
 	ino = le64_to_cpu(record->key->object_id);
 	if (tree->btree_type == VDFS4_BTREE_INST_CATALOG)
@@ -3353,6 +3370,9 @@ struct inode *vdfs4_get_inode_from_record(struct vdfs4_cattree_record *record,
 #endif
 
 	if (record->key->record_type == VDFS4_CATALOG_DLINK_RECORD) {
+		struct inode *data_inode = VDFS4_I(inode)->data_link.inode;
+		struct vdfs4_inode_info *d_info = VDFS4_I(data_inode);
+
 		if (is_vdfs4_inode_flag_set(VDFS4_I(inode)->data_link.inode,
 				VDFS4_AUTH_FILE)) {
 			set_vdfs4_inode_flag(inode, VDFS4_AUTH_FILE);
@@ -3362,7 +3382,18 @@ struct inode *vdfs4_get_inode_from_record(struct vdfs4_cattree_record *record,
 			set_vdfs4_inode_flag(inode, VDFS4_READ_ONLY_AUTH);
 		inode->i_mapping->a_ops = &vdfs4_data_link_aops;
 		atomic_set(&inode->i_writecount, -1); /* deny_write_access() */
+
+		if (S_ISLNK(inode->i_mode) && d_info->fbc &&
+			(d_info->fbc->compr_type == VDFS4_COMPR_UNDEF)) {
+			mutex_lock(&data_inode->i_mutex);
+			if (d_info->fbc->compr_type == VDFS4_COMPR_UNDEF)
+				ret = vdfs4_init_file_decompression(d_info, 1);
+			mutex_unlock(&data_inode->i_mutex);
+			if (ret)
+				goto error_exit;
+		}
 	}
+
 	if (is_vdfs4_inode_flag_set(inode, VDFS4_COMPRESSED_FILE)) {
 		ret = vdfs4_prepare_compressed_file_inode(VDFS4_I(inode));
 		if (ret)
@@ -3489,10 +3520,6 @@ static int vdfs4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	int ret = 0;
 	struct vdfs4_cattree_record *record;
 	u8 record_type;
-
-	ret = vdfs4_check_permissions(dir);
-	if (ret)
-		return ret;
 
 	VDFS4_DEBUG_INO("'%s' dir = %ld", dentry->d_name.name, dir->i_ino);
 

@@ -110,7 +110,7 @@ void vdfs4_stop_writeback(struct vdfs4_sb_info *sbi)
 	}
 }
 
-static __u64 validate_base_table(struct vdfs4_base_table *table)
+__u64 validate_base_table(struct vdfs4_base_table *table)
 {
 	__u32 checksum, on_disk_checksum;
 	int is_not_base_table;

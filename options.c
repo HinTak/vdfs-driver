@@ -87,13 +87,11 @@ int vdfs4_parse_options(struct super_block *sb, char *input)
 		case option_fmask:
 			ret = match_octal(&args[0], &option);
 			if (ret) {
-				printk(KERN_ERR "[VDFS4-ERROR] fmask must be "
-						"octal-base value");
+				VDFS4_ERR("fmask must be octal-base value");
 				return ret;
 			}
 			if (option & ~((unsigned int) S_IRWXUGO)) {
-				printk(KERN_ERR "[VDFS4-ERROR] fmask  "
-					" is wrong");
+				VDFS4_ERR("fmask is wrong");
 				return -EINVAL;
 			}
 			set_option(VDFS4_SB(sb), FMASK);
@@ -102,13 +100,11 @@ int vdfs4_parse_options(struct super_block *sb, char *input)
 		case option_dmask:
 			ret = match_octal(&args[0], &option);
 			if (ret) {
-				printk(KERN_ERR "[VDFS4-ERROR] dmask must be "
-						"octal-base value");
+				VDFS4_ERR("dmask must be octal-base value");
 				return ret;
 			}
 			if (option & ~((unsigned int) S_IRWXUGO)) {
-				printk(KERN_ERR "[VDFS4-ERROR] dmask  "
-					" is wrong");
+				VDFS4_ERR("dmask is wrong");
 				return -EINVAL;
 			}
 
@@ -116,6 +112,11 @@ int vdfs4_parse_options(struct super_block *sb, char *input)
 			VDFS4_SB(sb)->dmask = (umode_t)option;
 			break;
 		case option_do_not_check_sign:
+			if (sb->s_flags & MS_RDONLY) {
+				VDFS4_MOUNT_INFO("dncs cannot be used with ro\n");
+				return -EINVAL;
+			}
+
 			set_option(VDFS4_SB(sb), DO_NOT_CHECK_SIGN);
 			set_sbi_flag(VDFS4_SB(sb), DO_NOT_CHECK_SIGN);
 			break;

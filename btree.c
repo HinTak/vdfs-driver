@@ -19,14 +19,9 @@
  * USA.
  */
 
-#ifndef USER_SPACE
 #include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/pagevec.h>
-
-#else
-#include "vdfs_tools.h"
-#endif
 
 #include "vdfs4_layout.h"
 #include "vdfs4.h"
@@ -957,32 +952,6 @@ static void traverse_stack_destroy(struct list_head *stack)
 	}
 }
 
-#ifdef USER_SPACE
-#ifdef CONFIG_VDFS4_DEBUG
-int vdfs4_check_btree_slub_caches_empty(void)
-{
-	if (btree_traverse_stack_cachep->items_num) {
-		VDFS4_ERR("Traverse stack cache has %d items",
-				btree_traverse_stack_cachep->items_num);
-		return -1;
-	}
-
-	if (btree_record_info_cachep->items_num) {
-		VDFS4_ERR("Bnode record info cache has %d items",
-				btree_record_info_cachep->items_num);
-		return -1;
-	}
-
-	if (btree_todo_cachep->items_num) {
-		VDFS4_ERR("Todo cache has %d items",
-				btree_todo_cachep->items_num);
-		return -1;
-	}
-	return 0;
-}
-#endif
-#endif
-
 static inline void put_add_index_work(struct list_head *todo_list_head,
 		struct vdfs4_btree_traverse_stack *traverse_data,
 		__u32 point_to_bnode_id, __u32 current_root_id)
@@ -1052,18 +1021,15 @@ static struct vdfs4_bnode *btree_traverse_level(struct vdfs4_btree *btree,
 				err_ret = dang_record;
 				goto err_exit;
 			}
-#ifndef USER_SPACE
 			/* Currently btree is not multithread, dangling bnodes
 			 * should not appear. They allowed to appear only in the
 			 * btree user space */
 			/* VDFS4_BUG(); */
-#endif
 			vdfs4_put_bnode(bnode);
 			bnode = dang_bnode;
 			dang_bnode = NULL;
 			record = dang_record;
 			*pos = dang_pos;
-			curr_bnode_id = bnode->node_id;
 
 			if (todo_list_head) {
 				struct vdfs4_btree_traverse_stack *traverse_data;
@@ -1315,16 +1281,11 @@ static struct vdfs4_btree_gen_record *place_key_in_bnode(
 		goto err_exit;
 	}
 	if (is_node_full(bnode, &new_gen_key)) {
-#ifndef USER_SPACE
 		ret = vdfs4_check_bnode_reserve(btree, force_insert);
 		if (ret) {
 			err_ret = ERR_PTR(ret);
 			goto err_exit;
 		}
-#else
-		/*delete compile warning: unused parameter*/
-		force_insert = force_insert;
-#endif
 		right_bnode = vdfs4_alloc_new_bnode(btree);
 		if (IS_ERR(right_bnode)) {
 			err_ret = right_bnode;
@@ -2578,168 +2539,3 @@ void vdfs4_mark_record_dirty(struct vdfs4_btree_gen_record *record)
 
 	vdfs4_mark_bnode_dirty(rec_info->rec_pos.bnode);
 }
-
-
-#ifdef USER_SPACE
-
-
-u_int32_t btree_get_bitmap_size(struct vdfs4_sb_info *sbi)
-{
-	u_int32_t nodes_bitmap_size;
-	/* get bitmap size in bytes */
-	nodes_bitmap_size = get_bnode_size(sbi) -
-		sizeof(struct vdfs4_raw_btree_head) -
-		sizeof(unsigned int);
-
-	return nodes_bitmap_size;
-}
-
-u_int32_t find_first_free_node_id(struct vdfs_tools_btree_info *tree)
-{
-	u_int32_t rc = 0;
-	struct vdfs4_raw_btree_head *head_bnode_desc;
-	if (tree->vdfs4_btree.head_bnode) {
-		head_bnode_desc = tree->vdfs4_btree.head_bnode->data;
-		rc = find_first_zero_bit(head_bnode_desc->bitmap,
-			btree_get_bitmap_size(tree->vdfs4_btree.sbi) * 8);
-	}
-	return rc;
-}
-
-int test_and_clear_bnode_bitmap_bit(struct vdfs4_bnode *bnode)
-{
-	struct vdfs_tools_btree_info *tree =
-		container_of(bnode->host, struct vdfs_tools_btree_info,
-				vdfs4_btree);
-
-	struct vdfs4_raw_btree_head *head_bnode_desc =
-			tree->vdfs4_btree.head_bnode->data;
-	char *bitmap = (char *) &head_bnode_desc->bitmap;
-	int rc = bitmap[bnode->node_id >> 3] & (1 << (bnode->node_id % 8));
-	util_clear_bits(bitmap, bnode->node_id, 1);
-	return rc;
-}
-
-int test_and_set_bnode_bitmap_bit(struct vdfs_tools_btree_info *tree,
-		struct vdfs4_bnode *bnode)
-{
-	struct vdfs4_raw_btree_head *head_bnode_desc =
-			tree->vdfs4_btree.head_bnode->data;
-	char *bitmap = (char *) &head_bnode_desc->bitmap;
-	int rc = bitmap[bnode->node_id >> 3] & (1 << (bnode->node_id % 8));
-	util_set_bits(bitmap, bnode->node_id, 1);
-	return rc;
-}
-
-void make_node_bitmap(__u8 *nodes_bitmap, u_int32_t nodes_bitmap_size,
-		u_int32_t used_nodes)
-{
-	u_int32_t count;
-	u_int32_t byte;
-
-	memset(nodes_bitmap, 0, nodes_bitmap_size);
-	for (count = 0; count < used_nodes; count++) {
-		byte = count >> 3;
-		nodes_bitmap[byte] |= 1 << (count % 8);
-	}
-}
-
-int btree_init(struct vdfs4_sb_info *sbi,
-		struct vdfs_tools_btree_info *tree,
-		int btree_type, short max_record_len)
-{
-	int ret = 0;
-	tree->vdfs4_btree.node_size_bytes = get_bnode_size(sbi);
-	tree->vdfs4_btree.sbi = sbi;
-
-	tree->vdfs4_btree.btree_type = btree_type;
-	tree->vdfs4_btree.max_record_len = max_record_len;
-
-	/* Init head bnode */
-	tree->vdfs4_btree.head_bnode = vdfs4_alloc_new_bnode(&tree->vdfs4_btree);
-	if (IS_ERR(tree->vdfs4_btree.head_bnode)) {
-		ret = (PTR_ERR(tree->vdfs4_btree.head_bnode));
-		tree->vdfs4_btree.head_bnode = 0;
-		goto error_exit;
-	}
-	init_head_bnode(tree->vdfs4_btree.head_bnode);
-
-	mutex_init(&tree->vdfs4_btree.split_buff_lock);
-	tree->vdfs4_btree.split_buff = malloc(tree->vdfs4_btree.node_size_bytes);
-	if (!tree->vdfs4_btree.split_buff) {
-		ret = -ENOMEM;
-		goto error_exit;
-	}
-
-	return 0;
-error_exit:
-	return ret;
-}
-
-void init_head_bnode(struct vdfs4_bnode *head_bnode)
-{
-	struct vdfs4_raw_btree_head *head_bnode_desc = head_bnode->data;
-	struct vdfs4_sb_info *sbi = head_bnode->host->sbi;
-	u_int32_t nodes_bitmap_size;
-	u_int32_t used_nodes = 1; /* 1 - head */
-	u_int32_t root_bnode_id = 1;
-	u_int16_t btree_height = 1;
-
-	memset(head_bnode->data, 0x0, get_bnode_size(sbi));
-
-	set_magic(head_bnode_desc->magic, VDFS4_BTREE_HEAD_NODE_MAGIC);
-	head_bnode_desc->root_bnode_id = cpu_to_le32(root_bnode_id);
-	head_bnode_desc->btree_height = cpu_to_le16(btree_height);
-
-	nodes_bitmap_size = btree_get_bitmap_size(sbi);
-
-	make_node_bitmap((__u8 *)&head_bnode_desc->bitmap, nodes_bitmap_size,
-			used_nodes);
-}
-
-void put_bnode(struct vdfs4_bnode *bnode)
-{
-	free(bnode);
-}
-
-/* will be implemented for image creation */
-int expand_tree(struct vdfs_tools_btree_info *tree)
-{
-	u_int64_t i;
-	u_int64_t new_allocated_bnodes_count = tree->allocated_bnodes_count;
-	if (!new_allocated_bnodes_count)
-		/* tree must have at least 2 bnodes */
-		new_allocated_bnodes_count = 2;
-	else
-		new_allocated_bnodes_count *= 2;
-	tree->bnode_array = realloc(tree->bnode_array,
-			new_allocated_bnodes_count *
-			sizeof(struct vdfs4_bnode *));
-	if (!tree->bnode_array)
-		return -ENOMEM;
-	for (i = tree->allocated_bnodes_count; i < new_allocated_bnodes_count;
-			i++)
-		tree->bnode_array[i] = 0;
-	tree->tree.buffer_size = new_allocated_bnodes_count *
-			get_bnode_size(tree->vdfs4_btree.sbi);
-	tree->allocated_bnodes_count = new_allocated_bnodes_count;
-	return 0;
-}
-
-void btree_destroy_tree(struct vdfs_tools_btree_info *tree)
-{
-	__u64 i;
-	__u64 bnodes_count;
-	if (!tree->bnode_array)
-		return;
-	bnodes_count = get_bnodes_count(tree);
-	for (i = 0; i < bnodes_count; i++) {
-		free(tree->bnode_array[i]->data);
-		free(tree->bnode_array[i]);
-	}
-	free(tree->bnode_array);
-	free(tree->vdfs4_btree.split_buff);
-}
-
-#endif
-

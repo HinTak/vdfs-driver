@@ -22,10 +22,6 @@
 #ifndef XATRTREE_H_
 #define XATRTREE_H_
 
-#ifdef USER_SPACE
-#include "vdfs_tools.h"
-#endif
-
 #include "vdfs4_layout.h"
 
 #define XATTRTREE_LEAF "XAle"

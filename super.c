@@ -49,6 +49,7 @@
 #include "exttree.h"
 #include "xattrtree.h"
 #ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
+#include <crypto/crypto_wrapper.h>
 #include "public_key.h"
 #endif
 
@@ -86,11 +87,6 @@ static struct lock_class_key extents_tree_lock_key;
 static struct lock_class_key xattr_tree_lock_key;
 
 static struct kset *vdfs4_kset;
-
-#define VDFS4_MOUNT_INFO(fmt, ...)\
-do {\
-	printk(KERN_INFO "[VDFS4] " fmt, ##__VA_ARGS__);\
-} while (0)
 
 /**
  * @brief			B-tree destructor.
@@ -192,6 +188,7 @@ static void vdfs4_destroy_inode(struct inode *inode)
 	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
 
 	kfree(inode_info->name);
+	kfree(inode_info->fbc);
 
 	call_rcu(&inode->i_rcu, vdfs4_i_callback);
 }
@@ -483,12 +480,11 @@ static void vdfs4_put_super(struct super_block *sb)
 		vdfs4_fsm_destroy_management(sb);
 #ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
 	if (sbi->rsa_key)
-		vdfs4_destroy_rsa_key(sbi->rsa_key);
+		destroy_rsa_key(sbi->rsa_key);
 #endif
 /*	if (VDFS4_DEBUG_PAGES(sbi))
 		vdfs4_free_debug_area(sb);*/
 
-	vdfs4_destroy_high_priority(&sbi->high_priority);
 	if (sbi->snapshot_info)
 		vdfs4_destroy_snapshot_manager(sbi);
 
@@ -499,7 +495,7 @@ static void vdfs4_put_super(struct super_block *sb)
 	destroy_super(sbi);
 
 #ifdef CONFIG_VDFS4_STATISTIC
-	printk(KERN_INFO "Bytes written during umount : %lld\n",
+	VDFS4_DEBUG_TMP("Bytes written during umount : %lld\n",
 			sbi->umount_written_bytes);
 #endif
 
@@ -724,8 +720,13 @@ static int vdfs4_verify_sb(struct vdfs4_super_block *esb, char *str_sb_type,
 	if (memcmp(esb->signature, VDFS4_SB_SIGNATURE,
 				strlen(VDFS4_SB_SIGNATURE))) {
 		if (!silent || vdfs4_debug_mask & VDFS4_DBG_SB)
-			pr_err("%s: bad signature - %.8s, expected - %.8s\n",
+#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+			VDFS4_DEBUG_TMP("%s: bad signature - %.8s, expected - %.8s",
 				str_sb_type, esb->signature, VDFS4_SB_SIGNATURE);
+#else
+			VDFS4_ERR("%s: bad signature - %.8s, expected - %.8s",
+				str_sb_type, esb->signature, VDFS4_SB_SIGNATURE);
+#endif
 		return -EINVAL;
 	}
 
@@ -750,7 +751,7 @@ static int vdfs4_verify_sb(struct vdfs4_super_block *esb, char *str_sb_type,
 	if (check_signature && vdfs4_verify_superblock_rsa_signature(esb->hash_type,
 		(unsigned char *)esb, sizeof(*esb) - sizeof(esb->checksum)
 			- sizeof(esb->sb_hash), esb->sb_hash, sbi->rsa_key)) {
-		pr_err("bad superblock hash!!!");
+		VDFS4_ERR("bad superblock hash!!!");
 #ifndef	CONFIG_VDFS4_DEBUG_AUTHENTICAION
 		return -EINVAL;
 #endif
@@ -827,28 +828,112 @@ static int fill_runtime_superblock(struct vdfs4_super_block *esb,
 		(unsigned long)(1 << sbi->log_blocks_in_leb);
 
 	if (esb->case_insensitive)
+
 		set_option(sbi, CASE_INSENSITIVE);
 
 err_exit:
 	return ret;
 }
 
+static void add_reformat_record(struct vdfs4_sb_info *sbi, void *buffer)
+{
+	struct vdfs4_superblock *sb = (struct vdfs4_superblock *)buffer;
+	struct vdfs4_volume_begins *reformat_block =
+		(struct vdfs4_volume_begins *) &sb->sign2;
+	struct vdfs4_reformat_history *item =
+		(struct vdfs4_reformat_history *) reformat_block->command_line;
+	struct vdfs4_reformat_history *oldest_item = item;
+	int last_number = 0;
+
+	memcpy(sb->sing1.signature, VDFS4_SB_SIGNATURE_REFORMATTED,
+			sizeof(VDFS4_SB_SIGNATURE_REFORMATTED) - 1);
+	memcpy(sb->sign2.signature, VDFS4_SB_SIGNATURE_REFORMATTED,
+			sizeof(VDFS4_SB_SIGNATURE_REFORMATTED) - 1);
+
+	while ((void *)item < (void *)&reformat_block->checksum) {
+		if (memcmp(item->magic, VDFS4_REFORMAT_HISTORY_ITEM_MAGIC,
+					sizeof(item->magic))) {
+				oldest_item = item;
+				break;
+			}
+		if (le32_to_cpu(item->reformat_number) > last_number)
+			last_number = le32_to_cpu(item->reformat_number);
+		++item;
+		if (le32_to_cpu(item->reformat_number) <
+			le32_to_cpu(oldest_item->reformat_number))
+			oldest_item = item;
+	}
+
+	memcpy(oldest_item->magic, VDFS4_REFORMAT_HISTORY_ITEM_MAGIC,
+			sizeof(oldest_item->magic));
+	oldest_item->reformat_number = cpu_to_le32(last_number + 1);
+	oldest_item->mount_count = sb->ext_superblock.mount_counter;
+	oldest_item->sync_count = sb->ext_superblock.sync_counter;
+	memset(oldest_item->driver_version, 0,
+			sizeof(oldest_item->driver_version));
+	memset(oldest_item->mkfs_version, 0,
+			sizeof(oldest_item->driver_version));
+
+#if defined(VDFS4_GIT_BRANCH)
+	memcpy(oldest_item->driver_version, VDFS4_GIT_BRANCH + 6,
+			sizeof(oldest_item->driver_version));
+#endif
+	memcpy(oldest_item->mkfs_version, sb->superblock.mkfs_git_branch + 6,
+			sizeof(oldest_item->mkfs_version));
+
+}
+
+
 void destroy_layout(struct vdfs4_sb_info *sbi)
 {
 	if (test_option(sbi, DESTROY_LAYOUT)) {
-		struct page *page;
-		char message[] = "THE MAGIC WAS ERASED BY VDFS4_FATAL_ERROR";
-		void *buffer;
-
-		page = alloc_page(GFP_NOFS | __GFP_ZERO);
-		lock_page(page);
-		buffer = kmap(page);
-		memcpy(buffer, message, sizeof(message));
-		kunmap(page);
-		set_page_writeback(page);
-		vdfs4_write_page(sbi, page, 0, 1, 0, 1);
-		unlock_page(page);
+		int ret = 0;
+		VDFS4_DEBUG_TMP("Destroying layout");
+		lock_page(sbi->superblocks);
+		add_reformat_record(sbi, sbi->raw_superblock);
+		set_page_writeback(sbi->superblocks);
+		ret = vdfs4_write_page(sbi, sbi->superblocks, 0, 2, 0, 1);
+		if (ret) {
+			VDFS4_ERR("Failed to read first page from disk");
+			goto err_exit;
+		}
+		set_page_writeback(sbi->superblocks);
+		ret = vdfs4_write_page(sbi, sbi->superblocks, 8, 2, 0, 1);
+		if (ret)
+			VDFS4_ERR("Failed to read first page from disk");
+err_exit:
+		unlock_page(sbi->superblocks);
 	}
+}
+
+static void vdfs4_print_reformat_history(struct vdfs4_sb_info *sbi)
+{
+	struct vdfs4_superblock *sb;
+	struct vdfs4_volume_begins *reformat_block;
+	struct vdfs4_reformat_history *item;
+
+	lock_page(sbi->superblocks);
+	sb = (struct vdfs4_superblock *)sbi->raw_superblock;
+	reformat_block = (struct vdfs4_volume_begins *) &sb->sign2;
+	item = (struct vdfs4_reformat_history *) reformat_block->command_line;
+
+	if (!memcmp(item->magic, VDFS4_REFORMAT_HISTORY_ITEM_MAGIC,
+		sizeof(item->magic)))
+		VDFS4_DEBUG_TMP("There is a reformat history at volume");
+
+	while ((void *)item < (void *)&reformat_block->checksum &&
+		!memcmp(item->magic, VDFS4_REFORMAT_HISTORY_ITEM_MAGIC,
+		sizeof(item->magic))) {
+		VDFS4_DEBUG_TMP("Reformat #%d: mount #%d, sync#%d, "
+				"driver version: %.4s, mkfs_version: %.4s\n",
+				le32_to_cpu(item->reformat_number),
+				le32_to_cpu(item->mount_count),
+				le32_to_cpu(item->sync_count),
+				item->driver_version, item->mkfs_version);
+		++item;
+	}
+
+	unlock_page(sbi->superblocks);
 }
 
 void vdfs4_fatal_error(struct vdfs4_sb_info *sbi, const char *fmt, ...)
@@ -911,10 +996,6 @@ static int vdfs4_volume_check(struct super_block *sb)
 	if (ret)
 		goto error_exit;
 
-	esb++;
-	ret = vdfs4_verify_sb(esb, "SB", 0, 0, sbi);
-	if (ret)
-		goto error_exit;
 	sbi->superblocks = superblocks;
 	return 0;
 error_exit:
@@ -981,7 +1062,8 @@ static int vdfs4_sb_read(struct super_block *sb, int silent)
 	if (is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN))
 		check_signature = 0;
 	else {
-		sbi->rsa_key = vdfs4_create_rsa_key(pubkey_n, pubkey_e);
+		sbi->rsa_key = create_rsa_key(pubkey_n, pubkey_e,
+						VDFS4_CRYPTED_HASH_LEN, 3);
 		if (!sbi->rsa_key) {
 			VDFS4_ERR("can't create rsa key");
 			ret = -EINVAL;
@@ -1153,8 +1235,8 @@ static int vdfs4_check_resize_volume(struct super_block *sb)
 			(sb->s_bdev->bd_inode->i_size >> sb->s_blocksize_bits);
 
 	if (sbi->volume_blocks_count > disk_blocks) {
-		pr_err("VDFS4(%s): filesystem bigger than disk:"
-				"%llu > %llu blocks\n", sb->s_id,
+		VDFS4_ERR("VDFS4(%s): filesystem bigger than disk:"
+				"%llu > %llu blocks", sb->s_id,
 				sbi->volume_blocks_count,
 				disk_blocks);
 		return -EFBIG;
@@ -1491,6 +1573,12 @@ int vdfs4_remount_fs(struct super_block *sb, int *flags, char *data)
 			set_sbi_flag(sbi, EXSB_DIRTY);
 		}
 	} else {
+		/* prohibit ro and dncs together*/
+		if (is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN)) {
+			VDFS4_MOUNT_INFO("cannot remount readonly cause of "\
+							"dncs flag set\n");
+			return -EINVAL;
+		}
 process_orphan_inodes_error:
 		tree_remount(sbi->catalog_tree, MS_RDONLY);
 		tree_remount(sbi->extents_tree, MS_RDONLY);
@@ -1649,13 +1737,13 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 
 #if defined(VDFS4_GIT_BRANCH) && defined(VDFS4_GIT_REV_HASH) && \
 		defined(VDFS4_VERSION)
-	pr_err("%.5s\n", VDFS4_VERSION);
+	VDFS4_MOUNT_INFO("%.5s\n", VDFS4_VERSION);
 	VDFS4_MOUNT_INFO("version is \"%s\"\n", VDFS4_VERSION);
 	VDFS4_MOUNT_INFO("git branch is \"%s\"\n", VDFS4_GIT_BRANCH);
 	VDFS4_MOUNT_INFO("git revhash \"%.40s\"\n", VDFS4_GIT_REV_HASH);
 #endif
 #ifdef CONFIG_VDFS4_NOOPTIMIZE
-	pr_warn("[VDFS4] Build optimization is switched off\n");
+	VDFS4_MOUNT_INFO("Build optimization is switched off\n");
 #endif
 
 	if (!sb)
@@ -1703,6 +1791,8 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	ret = vdfs4_volume_check(sb);
 	if (ret)
 		goto not_vdfs4_volume;
+
+	vdfs4_print_reformat_history(sbi);
 
 	ret = vdfs4_sb_read(sb, silent);
 	if (ret)
@@ -1802,8 +1892,7 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	if (DATE_RESOLUTION_IN_NANOSECONDS_ENABLED)
 		sb->s_time_gran = 1;
 	else
-		printk(KERN_WARNING
-			"Date resolution in nanoseconds is disabled\n");
+		VDFS4_DEBUG_TMP("Date resolution in nanoseconds is disabled\n");
 
 #ifdef CONFIG_VDFS4_CHECK_FRAGMENTATION
 	for (count = 0; count < VDFS4_EXTENTS_COUNT_IN_FORK; count++)
@@ -1838,11 +1927,9 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 #ifdef CONFIG_VDFS4_PRINT_MOUNT_TIME
 	{
 		unsigned long result = jiffies - mount_start;
-		printk(KERN_ERR "Mount time %lu ms\n", result * 1000 / HZ);
+		VDFS4_DEBUG_TMP("Mount time %lu ms\n", result * 1000 / HZ);
 	}
 #endif
-
-	vdfs4_init_high_priority(&sbi->high_priority);
 
 	sbi->s_kobj.kset = vdfs4_kset;
 	init_completion(&sbi->s_kobj_unregister);
@@ -1902,7 +1989,7 @@ vdfs4_parse_options_error:
 not_vdfs4_volume:
 #ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
 	if (sbi->rsa_key)
-		vdfs4_destroy_rsa_key(sbi->rsa_key);
+		destroy_rsa_key(sbi->rsa_key);
 #endif
 	destroy_super(sbi);
 

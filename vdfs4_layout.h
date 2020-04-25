@@ -62,6 +62,7 @@
  */
 #define VDFS4_LAYOUT_VERSION			"2006"
 #define VDFS4_SB_SIGNATURE			"VDFS"
+#define VDFS4_SB_SIGNATURE_REFORMATTED		"RFMT"
 #define VDFS4_SB_VER_MAJOR	1
 #define VDFS4_SB_VER_MINOR	0
 
@@ -494,6 +495,16 @@ struct vdfs4_superblock {
 	struct vdfs4_extended_super_block ext_superblock;
 };
 
+#define VDFS4_REFORMAT_HISTORY_ITEM_MAGIC "fmth"
+
+struct vdfs4_reformat_history {
+	u8 magic[4];
+	__le32 reformat_number;
+	__le32 mount_count;
+	__le32 sync_count;
+	char driver_version[4];
+	char mkfs_version[4];
+};
 
 struct vdfs4_layout_sb {
 	struct vdfs4_super_block  _sb1;

@@ -19,20 +19,12 @@
  * USA.
  */
 
-#ifndef USER_SPACE
 #include <linux/slab.h>
 #include <linux/buffer_head.h>
 #include <linux/vmalloc.h>
 #include <linux/swap.h>
-
 #include "vdfs4.h"
-
 #include <linux/mmzone.h>
-
-#else
-#include "vdfs4_tools.h"
-#endif
-
 #include "btree.h"
 
 #if defined(CONFIG_VDFS4_CRC_CHECK)
@@ -204,7 +196,7 @@ static int read_or_create_bnode_data(struct vdfs4_bnode *bnode, int create,
 	int count;
 	int type = VDFS4_META_READ;
 #if defined(CONFIG_VDFS4_DEBUG)
-	int reread_count = VDFS4_META_REREAD;
+	int reread_count = VDFS4_META_REREAD_BNODE;
 #endif
 
 	page_idx = bnode->node_id * btree->pages_per_node;
@@ -312,6 +304,15 @@ do_reread:
 	if (!create)
 		vdfs4_bnode_sanity_check(bnode);
 #endif
+#ifdef CONFIG_VDFS4_DEBUG
+	/* temporary code: first time we read incorrectly, next time
+	it was ok. Need to know if such situation can really happen */
+	if (reread_count != VDFS4_META_REREAD_BNODE)
+		vdfs4_fatal_error(bnode->host->sbi,
+		"wrong data read from mmc, need to investigate (try %d/%d)",
+		VDFS4_META_REREAD_BNODE - (reread_count + 1),
+		VDFS4_META_REREAD_BNODE);
+#endif
 	return 0;
 
 err_exit_vunmap:
@@ -321,13 +322,24 @@ err_exit_vunmap:
 #ifdef CONFIG_VDFS4_DEBUG
 	dump_bnode_to_disk(bnode->host->sbi, bnode);
 	__vdfs4_dump_bnode_to_console(bnode, data);
+	{
+		/* temporary code: dump base/ext table in memory */
+		struct page *pg_null = NULL;
+		struct vdfs4_sb_info *sbi = VDFS4_SB(btree->inode->i_sb);
+		struct vdfs4_base_table* base_t = sbi->snapshot_info->base_t;
+		dump_bnode(base_t, &pg_null, 0, 16*1024);
+
+		/* temporary code: validate base table links in RO partition */
+		if ((sbi->sb->s_flags & MS_RDONLY) && !validate_base_table(base_t))
+			VDFS4_ERR("Base table CRC mismatch");
+	}
 #endif
 	vm_unmap_ram(data, btree->pages_per_node);
 	release_pages(bnode->pages, (int)btree->pages_per_node, 0);
 	memset(bnode->pages, 0, sizeof(struct page *) * btree->pages_per_node);
 #ifdef CONFIG_VDFS4_DEBUG
 	if (--reread_count >= 0) {
-		pr_err("do bnode re-read %d\n",
+		VDFS4_DEBUG_TMP("do bnode re-read %d",
 			VDFS4_META_REREAD - reread_count);
 		goto do_reread;
 	}
@@ -412,7 +424,7 @@ static void print_get_bnode_stack(struct vdfs4_bnode *bnode)
 	pr_default("*******************************\n");
 	pr_default("Get-traces for bnode #%u\n", bnode->node_id);
 	list_for_each_entry(trace, &bnode->get_traces_list, list) {
-		pr_err("Stack %2d %s:\n", i++,
+		VDFS4_ERR("Stack %2d %s:", i++,
 			(trace->mode == VDFS4_BNODE_MODE_RW) ? "rw" : "ro");
 		print_stack_trace(&trace->trace, 4);
 	}
@@ -477,7 +489,7 @@ struct vdfs4_bnode *vdfs4_get_bnode(struct vdfs4_btree *btree,
 		 * recursevely, so, its wrong behaviour if ref_count > 2
 		 */
 		if (mode == VDFS4_BNODE_MODE_RW && bnode->ref_count > 2) {
-			pr_err("VDFS4: bnode %d ref_count %d\n",
+			VDFS4_ERR("bnode %d ref_count %d",
 					bnode->node_id, bnode->ref_count);
 			print_get_bnode_stack(bnode);
 		}
@@ -822,7 +834,7 @@ int vdfs4_check_and_sign_dirty_bnodes(struct page **page,
 	bnode_data = vdfs4_vm_map_ram(page, btree->pages_per_node,
 				-1, PAGE_KERNEL);
 	if (!bnode_data) {
-		printk(KERN_ERR "can not allocate virtual memory");
+		VDFS4_ERR("can not allocate virtual memory");
 		return -ENOMEM;
 	}
 #if defined(CONFIG_VDFS4_META_SANITY_CHECK)

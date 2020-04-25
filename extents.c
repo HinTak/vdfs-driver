@@ -19,14 +19,7 @@
  * USA.
  */
 
-#ifndef USER_SPACE
 #include <linux/slab.h>
-#endif
-
-#ifdef USER_SPACE
-#include "vdfs_tools.h"
-#include <ctype.h>
-#endif
 
 #include "vdfs4.h"
 #include <linux/version.h>
@@ -54,22 +47,6 @@ int vdfs4_exttree_cmpfn(struct vdfs4_generic_key *__key1,
 
 	return cmp_2_le64 (key1->iblock, key2->iblock);
 }
-
-#ifdef USER_SPACE
-
-struct vdfs4_exttree_key *vdfs4_get_exttree_key(void)
-{
-	struct vdfs4_exttree_key *key =
-			malloc(sizeof(struct vdfs4_exttree_key));
-	return key ? key : ERR_PTR(-ENOMEM);
-}
-
-void vdfs4_put_exttree_key(struct vdfs4_exttree_key *key)
-{
-	free(key);
-}
-
-#endif
 
 int vdfs4_exttree_get_next_record(struct vdfs4_exttree_record *record)
 {
@@ -290,7 +267,6 @@ int vdfs4_exttree_add(struct vdfs4_sb_info *sbi, unsigned long object_id,
 	return ret;
 }
 
-#ifndef USER_SPACE
 /** eMMCFS extents tree key cache.
  */
 static struct kmem_cache *extents_tree_key_cachep;
@@ -631,4 +607,3 @@ long vdfs4_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		return -ENODEV;
 	return -EOPNOTSUPP; /*todo implementation*/
 }
-#endif

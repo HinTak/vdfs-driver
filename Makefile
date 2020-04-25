@@ -46,9 +46,10 @@ vdfs4-y	:= btree.o bnode.o cattree.o file.o inode.o \
 vdfs4-$(CONFIG_VDFS4_DEBUG)		+= debug.o
 
 GIT_REPO_PATH ?= $(shell echo $(MAKEFILE_FULL_NAME) | sed "s/vdfs-driver\/Makefile/.git/g")
-GIT_BRANCH = heads/vdfs4
-GIT_REV_HASH = 0bc03d8c510e97f8b66248b7e1d93a20829d08ca
-VERSION = "no_version"
+# ~0044 applied / 0041,0042 removed / applied "reduce fsync time"
+GIT_BRANCH = vdfs4.0045-2016_06_14
+GIT_REV_HASH = 34f54269c665d9fb8741b5739642fea430ec9764
+VERSION = vdfs4.0045-2016_06_14
 
 ifneq ($(GIT_BRANCH),)
 CFLAGS_super.o				+= -DVDFS4_GIT_BRANCH=\"$(GIT_BRANCH)\"

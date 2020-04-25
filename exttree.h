@@ -22,14 +22,8 @@
 #ifndef EXTTREE_H_
 #define EXTTREE_H_
 
-#ifdef USER_SPACE
-#include "vdfs_tools.h"
-#endif
-
 #include "vdfs4_layout.h"
-#ifndef USER_SPACE
 #include "btree.h"
-#endif
 
 /* vdfs4_exttree_key.iblock special values */
 #define IBLOCK_DOES_NOT_MATTER	0xFFFFFFFF /* any extent for specific inode */

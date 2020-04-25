@@ -19,17 +19,10 @@
  * USA.
  */
 
-#ifndef USER_SPACE
 #include <linux/slab.h>
 #include <linux/ctype.h>
 
 #include "vdfs4.h"
-
-#else
-#include "vdfs_tools.h"
-#include <ctype.h>
-#endif
-
 #include "cattree.h"
 #include "debug.h"
 #include "vdfs4.h"
@@ -286,8 +279,9 @@ struct vdfs4_cattree_key *vdfs4_alloc_cattree_key(int name_len,
 {
 	u32 record_len = 0;
 	struct vdfs4_cattree_key *form_key;
-	u32 key_len = sizeof(*form_key) - sizeof(form_key->name) +
-			(u32)name_len;
+	u32 key_len = sizeof(form_key->gen_key) + sizeof(form_key->parent_id) +
+		sizeof(form_key->object_id) + sizeof(form_key->record_type) +
+		sizeof(form_key->name_len) + (u32)name_len;
 
 	key_len = ALIGN(key_len, 8);
 
@@ -371,6 +365,10 @@ struct vdfs4_cattree_record *vdfs4_cattree_place_record(
 			(unsigned)len);
 	record = (struct vdfs4_cattree_record *)
 		vdfs4_btree_place_data(tree, &key->gen_key);
+	if(IS_ERR(record))
+		vdfs4_cattree_remove_ilink(tree, object_id, parent_id, name,
+						len);
+
 	kfree(key);
 	return record;
 }
@@ -494,239 +492,3 @@ int vdfs4_cattree_remove(struct vdfs4_btree *tree, __u64 object_id,
 	kfree(key);
 	return ret;
 }
-
-#ifdef USER_SPACE
-int get_cattree_record_size(int key_type)
-{
-	if (key_type == VDFS4_CATALOG_FOLDER_RECORD)
-		return sizeof(struct vdfs4_catalog_folder_record) +
-			VDFS4_CAT_KEY_MAX_LEN;
-
-	if (key_type == VDFS4_CATALOG_FILE_RECORD)
-		return sizeof(struct vdfs4_catalog_file_record) +
-			VDFS4_CAT_KEY_MAX_LEN;
-
-	if (key_type == VDFS4_CATALOG_HLINK_RECORD)
-		return sizeof(struct vdfs4_catalog_hlink_record) +
-			VDFS4_CAT_KEY_MAX_LEN;
-
-	if (key_type == VDFS4_CATALOG_DLINK_RECORD)
-		return sizeof(struct vdfs4_catalog_dlink_record) +
-			VDFS4_CAT_KEY_MAX_LEN;
-
-	/* if key wasn't recognized */
-	log_error("get_cattree_record_size() Unknown value for key_type %x",
-			key_type);
-	assert(0);
-	return 0;
-}
-
-/**
- * @brief			Allocate key for catalog tree record.
- * @param [in]	name_len	Length of a name for an allocating object
- * @param [in]	record_type	Type of record which it should be
- * @return			Returns pointer to a newly allocated key
- *				or error code otherwise
- */
-struct vdfs4_cattree_key *vdfs4_alloc_cattree_record(int name_len,
-		int record_type)
-{
-	u32 record_len = 0;
-	struct vdfs4_cattree_key *form_key;
-	int key_len = sizeof(*form_key) - sizeof(form_key->name) + name_len;
-
-	key_len = ALIGN(key_len, 8);
-
-	if (record_type == VDFS4_CATALOG_FILE_RECORD)
-		record_len = sizeof(struct vdfs4_catalog_file_record);
-	else if (record_type == VDFS4_CATALOG_FOLDER_RECORD)
-		record_len = sizeof(struct vdfs4_catalog_folder_record);
-	else if (record_type == VDFS4_CATALOG_HLINK_RECORD)
-		record_len = sizeof(struct vdfs4_catalog_folder_record);
-	else if (record_type == VDFS4_CATALOG_DLINK_RECORD)
-		record_len = sizeof(struct vdfs4_catalog_folder_record);
-
-	form_key = kzalloc(key_len + record_len, GFP_NOFS);
-	if (!form_key)
-		return ERR_PTR(-ENOMEM);
-
-	form_key->gen_key.key_len = cpu_to_le32(key_len);
-	form_key->gen_key.record_len = cpu_to_le32(key_len + record_len);
-	form_key->record_type = record_type;
-	return form_key;
-}
-
-static int cattree_init_root_bnode(struct vdfs4_bnode *root_bnode)
-{
-	int ret = 0;
-	struct vdfs4_sb_info *sbi = root_bnode->host->sbi;
-	struct vdfs4_catalog_folder_record *root_folder_value;
-	struct vdfs4_posix_permissions perm_root;
-	void *root_record;
-
-	memset(root_bnode->data, 0x0, get_bnode_size(sbi));
-	vdfs4_init_new_node_descr(root_bnode, VDFS4_NODE_LEAF);
-
-	root_record = vdfs4_alloc_cattree_record(strlen(VDFS4_ROOTDIR_NAME),
-			VDFS4_CATALOG_FOLDER_RECORD);
-	if (IS_ERR(root_record))
-		return PTR_ERR(root_record);
-
-	vdfs4_fill_cattree_key(root_record, VDFS4_ROOT_INO, VDFS4_ROOTDIR_OBJ_ID,
-			VDFS4_ROOTDIR_NAME, strlen(VDFS4_ROOTDIR_NAME));
-	root_folder_value = get_value_pointer(root_record);
-
-	if (sbi->root_path) {
-		ret = get_permissions_for_root_dir_from_path(sbi, &perm_root);
-		if (ret)
-			goto exit;
-	} else
-		get_permissions_for_root_dir(&perm_root);
-	root_folder_value->flags = 0;
-	root_folder_value->total_items_count = 0;
-	root_folder_value->links_count = cpu_to_le64(1);
-	root_folder_value->file_mode = cpu_to_le16(16877);
-
-	root_folder_value->file_mode = perm_root.file_mode;
-	root_folder_value->uid = perm_root.uid;
-	root_folder_value->gid = perm_root.gid;
-
-	memcpy(&root_folder_value->creation_time, &sbi->timestamp,
-		sizeof(root_folder_value->creation_time));
-	memcpy(&root_folder_value->modification_time, &sbi->timestamp,
-		sizeof(root_folder_value->modification_time));
-	memcpy(&root_folder_value->access_time, &sbi->timestamp,
-			sizeof(root_folder_value->access_time));
-
-	vdfs4_insert_into_node(root_bnode, root_record, 0);
-exit:
-	free(root_record);
-	return ret;
-}
-
-int init_cattree(struct vdfs4_sb_info *sbi)
-{
-	int ret = 0;
-	struct vdfs_tools_btree_info *cattree_btree = &sbi->cattree;
-	struct vdfs4_bnode *root_bnode = 0;
-
-	log_activity("Create catalog tree");
-
-
-	ret = btree_init(sbi, cattree_btree, VDFS4_BTREE_CATALOG,
-			VDFS4_CAT_KEY_MAX_LEN +
-			sizeof(struct vdfs4_catalog_file_record));
-	if (ret)
-		goto error_exit;
-
-
-	/* Init root bnode */
-	root_bnode = vdfs4_alloc_new_bnode(&cattree_btree->vdfs4_btree);
-	if (IS_ERR(root_bnode)) {
-		ret = (PTR_ERR(root_bnode));
-		root_bnode = 0;
-		goto error_exit;
-	}
-	ret = cattree_init_root_bnode(root_bnode);
-	if (ret)
-		goto error_exit;
-	cattree_btree->tree.subsystem_name = "CATALOG TREE";
-	cattree_btree->tree.sub_system_id = VDFS4_CAT_TREE_INO;
-	cattree_btree->vdfs4_btree.comp_fn = vdfs4_cattree_cmpfn;
-	util_update_crc(cattree_btree->bnode_array[0]->data,
-			get_bnode_size(sbi), NULL, 0);
-	util_update_crc(root_bnode->data, get_bnode_size(sbi), NULL, 0);
-	return 0;
-
-error_exit:
-	log_error("Can't init catalog tree");
-	return ret;
-}
-
-/**
- * @brief Function fork_init Fill fork structure of file
- * @param [in] fork		point to fork to fill
- * @param [in] begin		start offset position of file
- * @param [in] length		size of file
- * @param [in] block_size
-  */
-void fork_init(struct vdfs4_fork *_fork, u_int64_t begin, u_int64_t length,
-		unsigned int block_size)
-{
-	int i ;
-	memset(_fork, 0, sizeof(struct vdfs4_fork));
-	_fork->size_in_bytes = cpu_to_le64(length);
-	_fork->total_blocks_count = cpu_to_le32(
-			byte_to_block(length, block_size));
-	for (i = 0; i < VDFS4_EXTENTS_COUNT_IN_FORK; i++)
-		memset(&_fork->extents[i].extent, 0,
-				sizeof(struct vdfs4_extent));
-	if (length) {
-		_fork->extents[0].extent.begin = cpu_to_le64(begin/block_size);
-		_fork->extents[0].extent.length = _fork->total_blocks_count;
-	}
-}
-/****************************************************************************/
-/**
- * @brief Function vdfs4_fill_cattree_record_value for VDFS4 subsystem
- * @param [in] record			structure of cattree record to fill
- * @param [in] record_type		type of record to fill
- * @param [in] total_items_count	Amount of files in the directory
- * @param [in] links_count		Link's count for file
- * @param [in] uuid			object_id of object
- * @param [in] permissions		permissions to object
- * @param [in] time_creation
- * @param [in] time_modification
- * @param [in] time_access
- * @param [in] begin			start adress of object in volume
- * @param [in] length			size of object
- * @param [in] block_size
- * @return 0 on success, error code otherwise
- */
-void vdfs4_fill_cattree_record_value(struct vdfs4_cattree_record *record,
-		u_int64_t total_items_count,
-		u_int64_t links_count,
-		struct vdfs4_posix_permissions	*permissions,
-		const struct vdfs4_timespec time_creation,
-		const struct vdfs4_timespec time_modification,
-		const struct vdfs4_timespec time_access,
-		u_int64_t   begin,
-		u_int64_t   length,
-		unsigned int block_size, int compress_to_dlink)
-{
-	struct vdfs4_catalog_folder_record *val = VDFS4_CATTREE_FOLDVAL(record);
-	struct vdfs4_catalog_hlink_record *hl =
-			(struct vdfs4_catalog_hlink_record *)
-					(record->val);
-	if (record->key->record_type == VDFS4_CATALOG_HLINK_RECORD) {
-		memset(hl, 0, sizeof(struct vdfs4_catalog_hlink_record));
-		hl->file_mode = permissions->file_mode;
-		return;
-	}
-	memset(val, 0, sizeof(struct vdfs4_catalog_folder_record));
-	val->total_items_count = cpu_to_le64(total_items_count);
-	val->links_count = links_count;
-
-	val->file_mode = permissions->file_mode;
-	val->uid = permissions->uid;
-	val->gid = permissions->gid;
-	if (record->key->record_type == VDFS4_CATALOG_DLINK_RECORD
-			&& compress_to_dlink)
-		val->flags |= (1 << SIGNED_DLINK);
-	memcpy(&val->creation_time, &time_creation,
-		sizeof(val->creation_time));
-	memcpy(&val->modification_time, &time_modification,
-		sizeof(val->modification_time));
-	memcpy(&val->access_time, &time_access,
-			sizeof(val->access_time));
-	if (links_count > 1)
-		val->flags |= (1 << HARD_LINK);
-	if (record->key->record_type == VDFS4_CATALOG_FILE_RECORD) {
-		struct vdfs4_catalog_file_record *file_rec = (
-				struct vdfs4_catalog_file_record *) val;
-		fork_init(&file_rec->data_fork, begin, length,
-					block_size);
-	}
-}
-
-#endif

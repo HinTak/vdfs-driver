@@ -22,7 +22,6 @@
 #ifndef _VDFS4_VDFS4_H_
 #define _VDFS4_VDFS4_H_
 
-#ifndef USER_SPACE
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/rbtree.h>
@@ -45,12 +44,7 @@
 #include <crypto/internal/hash.h>
 #include <crypto/md5.h>
 #include <linux/mpi.h>
-typedef struct
-{
-	MPI rsa_n;
-	MPI rsa_e;
-} vdfs4_rsa_key;
-#endif
+#include <crypto/crypto_wrapper.h>
 #endif
 
 #define UUL_MAX_LEN 20
@@ -111,13 +105,6 @@ enum vdfs4_read_type {
 	VDFS4_READ_NR,
 };
 
-
-#ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
-struct sdesc {
-	struct shash_desc shash;
-	char ctx[];
-};
-#endif
 
 struct ioctl_data_link {
 	__u64 data_offset;
@@ -191,6 +178,7 @@ extern unsigned int cattree_prealloc;
 #define FSM_PREALLOC_DELTA	0
 
 #define VDFS4_META_REREAD	0
+#define VDFS4_META_REREAD_BNODE 2
 
 /**
  * @brief		Compare two 64 bit values
@@ -213,13 +201,6 @@ static inline int cmp_2_le64(__le64 a, __le64 b)
 /* ioctl command code for open_count fetch */
 #define	VDFS4_IOC_GET_OPEN_COUNT		_IOR('C', 1, long)
 #define	VDFS4_IOC32_GET_OPEN_COUNT	_IOR('C', 1, int)
-/* ioctl command codes for high priority tasks */
-#define VDFS4_IOC_GRAB			_IOR('D', 1, long)
-#define VDFS4_IOC_RELEASE		_IOR('E', 1, long)
-#define VDFS4_IOC_RESET			_IOR('F', 1, long)
-#define VDFS4_IOC_GRAB2PARENT		_IOR('G', 1, long)
-#define VDFS4_IOC_RELEASE2PARENT		_IOR('H', 1, long)
-
 /* File based compression commands */
 #define VDFS4_IOC_SET_DECODE_STATUS	_IOW('I', 1, int)
 #define VDFS4_IOC_GET_DECODE_STATUS	_IOR('I', 1, int)
@@ -227,8 +208,6 @@ static inline int cmp_2_le64(__le64 a, __le64 b)
 #define VDFS4_IOC_IS_AUTHENTICATED	_IOR('K', 1, int)
 
 #define VDFS4_IOC_DATA_LINK	_IOR('Q', 3, struct ioctl_data_link)
-
-#ifndef USER_SPACE
 
 #define vdfs4_vmalloc(...) ({				\
 	unsigned noio_flags = memalloc_noio_save();	\
@@ -263,17 +242,6 @@ struct packtrees_list {
 	struct mutex lock_pactree_list;
 
 	struct list_head list;
-};
-
-struct vdfs4_int_container {
-	int value;
-	struct list_head list;
-};
-
-struct vdfs4_high_priority {
-	struct list_head high_priority_tasks;
-	struct completion high_priority_done;
-	struct mutex	task_list_lock; /* protect high_priority_tasks list */
 };
 
 /** @brief	Maintains private super block information.
@@ -380,8 +348,6 @@ struct vdfs4_sb_info {
 	/* decompression type : hardware or software */
 	int use_hw_decompressor;
 
-	struct vdfs4_high_priority high_priority;
-
 	struct vdfs4_proc_dir_info *proc_info;
 
 	/* new files mode mask, filled if fmask mount option is specifided */
@@ -400,12 +366,10 @@ struct vdfs4_sb_info {
 #endif
 	__u64 dump_meta_file_offset;
 #ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
-	vdfs4_rsa_key *rsa_key;
+	rsakey_t *rsa_key;
 #endif
 
 };
-
-#endif
 
 /** @brief	Current extent information.
  */
@@ -448,15 +412,11 @@ struct vdfs4_fork_info {
 	unsigned int used_extents;
 };
 
-#ifndef USER_SPACE
-
 /*
  * Free space extents are hashed by log2(length) in
  * VDFS4_FSM_MAX_ORDER + 1 buckets: 1..2^FSM_MAX_ORDER blocks
  */
 #define VDFS4_FSM_MAX_ORDER	16
-
-#ifndef CONFIG_VDFS4_DEBUG
 
 /*
  * Upper limit of tracked free area extents
@@ -467,16 +427,6 @@ struct vdfs4_fork_info {
  * Upper limit of tracked next-free area extents
  */
 # define VDFS4_FSM_MAX_NEXT_NODES	10240
-
-#else /* CONFIG_VDFS4_DEBUG */
-
-/*
- * Tight limits for stress testing
- */
-# define VDFS4_FSM_MAX_FREE_NODES	256
-# define VDFS4_FSM_MAX_NEXT_NODES	64
-
-#endif /* CONFIG_VDFS4_DEBUG */
 
 /** @brief	Maintains free space management info.
  */
@@ -733,7 +683,7 @@ static inline int is_fork_valid(const struct vdfs4_fork *fork,
 	}
 	return 1;
 ERR:
-	printk(KERN_ERR "fork is invalid\n");
+	VDFS4_ERR("fork is invalid\n");
 	return 0;
 }
 
@@ -1189,6 +1139,8 @@ int vdfs4_check_page_offset(struct vdfs4_sb_info *sbi, struct inode *inode,
 		pgoff_t page_index, char *is_new, int force_insert);
 int vdfs4_is_enospc(struct vdfs4_sb_info *sbi, int threshold);
 int vdfs4_check_meta_space(struct vdfs4_sb_info *sbi);
+__u64 validate_base_table(struct vdfs4_base_table *table);
+
 
 /* data.c */
 int vdfs4__read(struct inode *inode, int type, struct page **pages,
@@ -1275,19 +1227,9 @@ int __vdfs4_write_inode(struct vdfs4_sb_info *sbi, struct inode *inode);
  *		 operations which cannot be expressed by regular system calls
  */
 
-void vdfs4_update_image_and_dir(struct inode *inode, struct inode *image_inode);
-void vdfs4_update_parent_dir(struct file *filp);
-int vdfs4_unlock_source_image(struct vdfs4_sb_info *sbi, __u64 parent_id,
-		char *name, size_t name_len);
-void vdfs4_release_image_inodes(struct vdfs4_sb_info *sbi, ino_t start_ino,
-		unsigned int ino_count);
 long vdfs4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 long vdfs4_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 long vdfs4_dir_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
-void vdfs4_clear_list(struct list_head *list);
-void vdfs4_init_high_priority(struct vdfs4_high_priority *high_priority);
-void vdfs4_destroy_high_priority(struct vdfs4_high_priority *high_priority);
-int vdfs4_check_permissions(struct inode *inode);
 
 /* xattr.c */
 int vdfs4_setxattr(struct dentry *dentry, const char *name, const void *value,
@@ -1341,21 +1283,12 @@ int vdfs4_check_hash_chunk(struct vdfs4_inode_info *inode_i,
 int vdfs4_check_hash_meta(struct vdfs4_inode_info *inode_i,
 		struct vdfs4_comp_file_descr *descr);
 
-int vdfs4_calculate_hash_md5(unsigned char *buf, size_t buf_len,
-		char *hash);
 int vdfs4_verify_rsa_md5_signature(unsigned char *buf, size_t buf_len,
 		unsigned char *signature);
-int vdfs4_calculate_hash_sha1(unsigned char *buf, size_t buf_len,
-		char *hash);
-int vdfs4_calculate_hash_sha256(unsigned char *buf, size_t buf_len,
-		char *hash);
 #ifdef CONFIG_VDFS4_DATA_AUTHENTICATION
-vdfs4_rsa_key *vdfs4_create_rsa_key(const char *pubRsaN, const char *pubRsaE );
-void vdfs4_destroy_rsa_key(vdfs4_rsa_key *pKey);
-
 int vdfs4_verify_superblock_rsa_signature(enum hash_type hash_type,
 		void *buf, size_t buf_len,
-		void *signature, vdfs4_rsa_key *pkey);
+		void *signature, rsakey_t *pkey);
 #endif
 int vdfs4_check_hash_chunk_no_calc(struct vdfs4_inode_info *inode_i,
 		size_t extent_idx, void *hash_calc);
@@ -1443,7 +1376,8 @@ void vdfs4_destroy_proc_entry(struct vdfs4_sb_info *sbi);
 #define is_dlink(inode) (VDFS4_I(inode)->record_type == \
 		VDFS4_CATALOG_DLINK_RECORD)
 
-
+#define INODEI_NAME(inode_i) ((inode_i == NULL) ? "<null inodei>" :\
+								((inode_i->name == NULL) ? "<noname>" : inode_i->name))
 #ifdef CONFIG_SMP
 
 /*
@@ -1539,11 +1473,5 @@ static inline void vdfs4_assert_btree_lock(struct vdfs4_btree *btree) { }
 static inline void vdfs4_assert_btree_write(struct vdfs4_btree *btree) { }
 static inline void vdfs4_assert_i_mutex(struct inode *inode) { }
 #endif /* CONFIG_VDFS4_DEBUG */
-
-
-
-
-
-#endif /* USER_SPACE */
 
 #endif /* _VDFS4_VDFS4_H_ */

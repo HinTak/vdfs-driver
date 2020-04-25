@@ -24,10 +24,7 @@
 
 #include "vdfs4_layout.h"
 
-
-#ifndef USER_SPACE
 /* #define CONFIG_VDFS4_DEBUG_GET_BNODE */
-#endif
 
 #ifdef CONFIG_VDFS4_DEBUG_GET_BNODE
 #include <linux/stacktrace.h>
@@ -59,10 +56,8 @@
 #define VDFS4_WAIT_BNODE_UNLOCK 1
 #define VDFS4_NOWAIT_BNODE_UNLOCK 0
 
-#ifndef USER_SPACE
 #include "mutex_on_sem.h"
 #include <linux/rbtree.h>
-#endif
 
 /**
  * @brief		Get pointer to value in key-value pair.
@@ -146,10 +141,6 @@ struct vdfs4_bnode {
 
 	/* under btree->hash_lock */
 	int ref_count;
-
-#ifdef USER_SPACE
-	int is_dirty;
-#endif
 
 #ifdef CONFIG_VDFS4_DEBUG_GET_BNODE
 	/* under btree->hash_lock */
@@ -318,14 +309,9 @@ int vdfs4_check_btree_records_order(struct vdfs4_btree *btree);
 
 void vdfs4_init_new_node_descr(struct vdfs4_bnode *bnode,
 		enum vdfs4_node_type type);
-#ifndef USER_SPACE
 void vdfs4_dump_panic_remount(struct vdfs4_bnode *bnode,
 		const char *fmt, ...);
 int vdfs4_check_and_sign_dirty_bnodes(struct page **page,
 		struct vdfs4_btree *btree, __u64 version);
-#else
-static inline void vdfs4_dump_panic_remount(UNUSED struct vdfs4_bnode *bnode,
-		UNUSED const char *fmt, ...) {};
-#endif
 
 #endif /* BTREE_H_ */

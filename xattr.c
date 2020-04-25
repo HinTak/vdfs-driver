@@ -19,20 +19,14 @@
  * USA.
  */
 
-#ifndef USER_SPACE
 #include <linux/xattr.h>
 #include <linux/fs.h>
 #include <linux/posix_acl.h>
 #include <linux/posix_acl_xattr.h>
-#else
-#include "vdfs_tools.h"
-#include <sys/xattr.h>
-#endif
 
 #include "vdfs4.h"
 #include "xattrtree.h"
 
-#ifndef USER_SPACE
 char *vdfs4_xattr_prefixes[] = {
 	XATTR_USER_PREFIX,
 	XATTR_SYSTEM_PREFIX,
@@ -56,7 +50,6 @@ static int check_xattr_prefix(const char *name)
 
 	return ret;
 }
-#endif
 
 /* Now this function is not used in the utilities. Hide under ifdef to avoid
  * build warnings */
@@ -191,7 +184,6 @@ exit:
 	return record;
 }
 
-#ifndef USER_SPACE
 static int xattrtree_remove_record(struct vdfs4_btree *tree, u64 object_id,
 		const char *name)
 {
@@ -208,7 +200,6 @@ static int xattrtree_remove_record(struct vdfs4_btree *tree, u64 object_id,
 
 	return ret;
 }
-#endif
 
 static int xattrtree_get_next_record(struct vdfs4_xattrtree_record *record)
 {
@@ -244,8 +235,6 @@ err_exit:
 	return ERR_PTR(ret);
 
 }
-
-#ifndef USER_SPACE
 
 #ifdef CONFIG_VDFS4_POSIX_ACL
 
@@ -745,174 +734,3 @@ int vdfs4_init_security_xattrs(struct inode *inode,
 
 	return ret;
 }
-
-#endif /* !USER_SPACE */
-
-#ifdef USER_SPACE
-void dummy_xattrtree_record_init(struct vdfs4_xattrtree_key *xattr_record)
-{
-	int key_len, name_len;
-
-	memset(xattr_record, 0, sizeof(*xattr_record));
-	set_magic(xattr_record->gen_key.magic, XATTRTREE_LEAF);
-
-	name_len = strlen(VDFS4_XATTRTREE_ROOT_REC_NAME);
-	key_len = sizeof(*xattr_record) - sizeof(xattr_record->name) + name_len;
-
-	key_len = ALIGN(key_len, 8);
-
-	xattr_record->gen_key.key_len = cpu_to_le32(key_len);
-	/* Xattr root record has no value, so record_len == key_len */
-	xattr_record->gen_key.record_len = key_len;
-	xattr_record->name_len = name_len;
-	memcpy(xattr_record->name, VDFS4_XATTRTREE_ROOT_REC_NAME, name_len);
-}
-
-static void xattrtree_init_root_bnode(struct vdfs4_bnode *root_bnode)
-{
-	struct vdfs4_xattrtree_key xattr_record;
-
-	vdfs4_init_new_node_descr(root_bnode, VDFS4_NODE_LEAF);
-	dummy_xattrtree_record_init(&xattr_record);
-	vdfs4_insert_into_node(root_bnode, &xattr_record, 0);
-}
-
-int init_xattrtree(struct vdfs4_sb_info *sbi)
-{
-	int ret = 0;
-	struct vdfs_tools_btree_info *xattr_btree = &sbi->xattrtree;
-	struct vdfs4_bnode *root_bnode = 0;
-
-	log_activity("Create xattr tree");
-
-	xattr_btree->tree.sub_system_id = VDFS4_XATTR_TREE_INO;
-	xattr_btree->tree.subsystem_name = "XATTR TREE";
-	ret = btree_init(sbi, xattr_btree, VDFS4_BTREE_XATTRS,
-			VDFS4_XATTR_KEY_MAX_LEN +
-			VDFS4_XATTR_VAL_MAX_LEN);
-
-	if (ret)
-		goto error_exit;
-	xattr_btree->vdfs4_btree.comp_fn = vdfs4_xattrtree_cmpfn;
-	sbi->xattr_tree = &xattr_btree->vdfs4_btree;
-	/* Init root bnode */
-	root_bnode = vdfs4_alloc_new_bnode(&xattr_btree->vdfs4_btree);
-	if (IS_ERR(root_bnode)) {
-		ret = (PTR_ERR(root_bnode));
-		root_bnode = 0;
-		goto error_exit;
-	}
-	xattrtree_init_root_bnode(root_bnode);
-	util_update_crc(xattr_btree->vdfs4_btree.head_bnode->data,
-			get_bnode_size(sbi), NULL, 0);
-	util_update_crc(root_bnode->data, get_bnode_size(sbi), NULL, 0);
-
-	return 0;
-
-error_exit:
-
-	log_error("Can't init xattr tree");
-	return ret;
-}
-
-int get_set_xattrs(struct vdfs4_sb_info *sbi, char *path, u64 object_id)
-{
-	int len, ret = 0;
-	char *val = malloc(XATTR_VAL_SIZE);
-	if (!val) {
-		log_error("MKFS can't allocate enough memory");
-		return -ENOMEM;
-	}
-	char *buffer = malloc(SUPER_PAGE_SIZE_DEFAULT);
-	char *name;
-	ssize_t size = 0;
-	if (!buffer) {
-		log_error("MKFS can't allocate enough memory");
-		free(val);
-		return -ENOMEM;
-	}
-	memset(buffer, 0, SUPER_PAGE_SIZE_DEFAULT);
-	len = listxattr(path, buffer, SUPER_PAGE_SIZE_DEFAULT);
-	if (len < 0) {
-		if (errno == ENOTSUP) {
-			log_warning("Operation list xattr not supported ");
-			errno = 0;
-		} else if (errno != ENODATA) {
-			ret = -errno;
-			log_error("Can't list xattr because of %s",
-					strerror(errno));
-			errno = 0;
-		}
-		goto exit;
-	} else if (len == 0)
-		goto exit;
-
-	name = buffer;
-	while (len > 0) {
-		int name_len = strlen(name);
-		assert(name_len <= len);
-		memset(val, 0, XATTR_VAL_SIZE);
-		size = getxattr(path, name, val, XATTR_VAL_SIZE);
-		if (size < 0) {
-			log_error("Can not get xattr %s for %s: %s",
-					 name, path, strerror(errno));
-			return -1;
-		}
-		ret = xattrtree_insert(&sbi->xattrtree.vdfs4_btree, object_id,
-				name, size, val);
-		if (ret) {
-			log_error("Can't add extended attribute %s for file %s",
-					name, path);
-			goto exit;
-		}
-		name += (name_len + 1);
-		len -= (name_len + 1);
-	}
-
-exit:
-	free(buffer);
-	free(val);
-	return ret;
-}
-int unpack_xattr(struct vdfs4_btree *xattr_tree, char *path, u64 object_id)
-{
-	int ret = 0;
-	char name[VDFS4_FULL_PATH_LEN];
-	struct vdfs4_xattrtree_record *record = xattrtree_get_first_record(
-			xattr_tree, object_id, VDFS4_BNODE_MODE_RW);
-	if (IS_ERR(record)) {
-		if (PTR_ERR(record) == -ENOENT)
-			return 0;
-		return PTR_ERR(record);
-	}
-
-	log_activity("Set xattrs for %s", path);
-	while (record->key->object_id == object_id) {
-		memset(name, 0, sizeof(name));
-		memcpy(name, record->key->name, record->key->name_len);
-		if (setxattr(path, name, (void *)(record->val + 1),
-					(size_t)(*(unsigned char *)record->val),
-					XATTR_CREATE)) {
-				log_error("cannot set xattr %s for file %s:"
-						" %s\n",
-						 record->key->name, path,
-						 strerror(errno));
-				ret = -errno;
-				goto exit;
-			}
-		ret = xattrtree_get_next_record(record);
-		if (ret) {
-			if (ret == -ENOENT)
-				/* There is no records anymore in the btree,
-				 * it is not a error */
-				ret = 0;
-			goto exit;
-		}
-	}
-exit:
-	if (!IS_ERR(record))
-		vdfs4_release_record((struct vdfs4_btree_gen_record *)record);
-	return ret;
-}
-
-#endif

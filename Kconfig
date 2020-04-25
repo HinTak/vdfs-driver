@@ -123,7 +123,6 @@ config VDFS4_RETRY
 config VDFS4_DATA_AUTHENTICATION
 	bool "User data and vdfs4 meta authentication"
 	depends on VDFS4_FS
-	depends on (RSA1024)
 	select MPILIB
 	help
 		Protect the vdfs4 superblock, file-based meta data and compressed chunks
@@ -141,6 +140,7 @@ config VDFS4_EXEC_ONLY_AUTHENTICATED
 
 config VDFS4_DEBUG_AUTHENTICAION
 	depends on VDFS4_DATA_AUTHENTICATION
+	depends on !VD_RELEASE || VD_PERFORMANCE_MODE 
 	bool "if enable - do not return an error if authenticaion is failed."
 	help
 		if enable - if authentication is enabled do not return an error

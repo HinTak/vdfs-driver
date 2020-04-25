@@ -79,54 +79,54 @@ static int sw_decompress(z_stream *strm, char *ibuff, int ilen,
 
 static void print_uncomp_err_dump_header(char *name, int name_len)
 {
-	pr_err("--------------------------------------------------\n");
+	VDFS4_ERR("--------------------------------------------------");
 	VDFS4_ERR("Software decomression ERROR");
-	pr_err(" Current : %s(%d)", current->comm,
+	VDFS4_ERR(" Current : %s(%d)", current->comm,
 			task_pid_nr(current));
-	pr_err("--------------------------------------------------\n");
+	VDFS4_ERR("--------------------------------------------------");
 #if defined(VDFS4_GIT_BRANCH) && defined(VDFS4_GIT_REV_HASH) && \
 		defined(VDFS4_VERSION)
 
-	pr_err("== VDFS4 Debugger - %15s ===== Core : %2d ====\n"
+	VDFS4_ERR("== VDFS4 Debugger - %15s ===== Core : %2d ===="
 			, VDFS4_VERSION, current_thread_info()->cpu);
 #endif
-	pr_err("--------------------------------------------------\n");
-	pr_err("Source image name : %.*s", name_len, name);
-	pr_err("--------------------------------------------------\n");
+	VDFS4_ERR("--------------------------------------------------");
+	VDFS4_ERR("Source image name : %.*s", name_len, name);
+	VDFS4_ERR("--------------------------------------------------");
 }
 
 static void print_zlib_error(int unzip_error)
 {
 	switch (unzip_error) {
 	case (Z_ERRNO):
-		pr_err("File operation error %d\n", Z_ERRNO);
+		VDFS4_ERR("File operation error %d", Z_ERRNO);
 		break;
 	case (Z_STREAM_ERROR):
-		pr_err("The stream state was inconsistent %d\n",
+		VDFS4_ERR("The stream state was inconsistent %d",
 				Z_STREAM_ERROR);
 		break;
 	case (Z_DATA_ERROR):
-		pr_err("Stream was freed prematurely %d\n", Z_DATA_ERROR);
+		VDFS4_ERR("Stream was freed prematurely %d", Z_DATA_ERROR);
 		break;
 	case (Z_MEM_ERROR):
-		pr_err("There was not enough memory %d\n", Z_MEM_ERROR);
+		VDFS4_ERR("There was not enough memory %d", Z_MEM_ERROR);
 		break;
 	case (Z_BUF_ERROR):
-		pr_err("no progress is possible or if there was not "
-				"enough room in the output buffer %d\n",
+		VDFS4_ERR("no progress is possible or if there was not "
+				"enough room in the output buffer %d",
 				Z_BUF_ERROR);
 		break;
 	case (Z_VERSION_ERROR):
-		pr_err("zlib library version is incompatible with"
-			" the version assumed by the caller %d\n",
+		VDFS4_ERR("zlib library version is incompatible with"
+			" the version assumed by the caller %d",
 			Z_VERSION_ERROR);
 		break;
 	case (VDFS4_Z_NEED_DICT_ERR):
-		pr_err(" The Z_NEED_DICT error happened %d\n" ,
+		VDFS4_ERR(" The Z_NEED_DICT error happened %d" ,
 				VDFS4_Z_NEED_DICT_ERR);
 		break;
 	default:
-		pr_err("Unknown error code %d\n", unzip_error);
+		VDFS4_ERR("Unknown error code %d", unzip_error);
 		break;
 	}
 
@@ -184,17 +184,17 @@ dump_to_console:
 
 	/*
 	for (count = 0; count < pages_num; count++)
-		pr_err("page index %lu phy addr:0x%llx\n",
+		VDFS4_ERR("page index %lu phy addr:0x%llx",
 				pages[count]->index,
 				(long long unsigned int)
 				page_to_phys(pages[count]));
 	*/
 
-	pr_err("chunk info:\n\t"
+	VDFS4_ERR("chunk info:\n\t"
 			"offset = %llu\n\t"
 			"len_bytes = %d\n\t"
 			"blocks_n = %d\n\t"
-			"is_uncompr = %d\n",
+			"is_uncompr = %d",
 			((extent.first_block +
 			cext->start_block) << 12) + (sector_t)cext->offset,
 			cext->len_bytes, cext->blocks_n,
