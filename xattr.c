@@ -246,10 +246,10 @@ struct posix_acl *vdfs4_get_acl(struct inode *inode, int type)
 
 	switch (type) {
 	case ACL_TYPE_ACCESS:
-		name = POSIX_ACL_XATTR_ACCESS;
+		name = XATTR_NAME_POSIX_ACL_ACCESS;
 		break;
 	case ACL_TYPE_DEFAULT:
-		name = POSIX_ACL_XATTR_DEFAULT;
+		name = XATTR_NAME_POSIX_ACL_DEFAULT;
 		break;
 	default:
 		return ERR_PTR(-EINVAL);
@@ -295,7 +295,7 @@ int vdfs4_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 
 	switch (type) {
 	case ACL_TYPE_ACCESS:
-		name = POSIX_ACL_XATTR_ACCESS;
+		name = XATTR_NAME_POSIX_ACL_ACCESS;
 		if (acl) {
 			ret = posix_acl_equiv_mode(acl, &inode->i_mode);
 			if (ret < 0)
@@ -303,7 +303,7 @@ int vdfs4_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 		}
 		break;
 	case ACL_TYPE_DEFAULT:
-		name = POSIX_ACL_XATTR_DEFAULT;
+		name = XATTR_NAME_POSIX_ACL_DEFAULT;
 		if (!S_ISDIR(inode->i_mode))
 			return acl ? -EACCES : 0;
 		break;
@@ -483,9 +483,9 @@ int vdfs4_setxattr(struct dentry *dentry, const char *name, const void *value,
 	if (ret)
 		return -EOPNOTSUPP;
 
-	if (!strcmp(name, POSIX_ACL_XATTR_DEFAULT))
+	if (!strcmp(name, XATTR_NAME_POSIX_ACL_DEFAULT))
 		return vdfs4_set_acl_xattr(inode, ACL_TYPE_DEFAULT, value, size);
-	if (!strcmp(name, POSIX_ACL_XATTR_ACCESS))
+	if (!strcmp(name, XATTR_NAME_POSIX_ACL_ACCESS))
 		return vdfs4_set_acl_xattr(inode, ACL_TYPE_ACCESS, value, size);
 
 	VT_IOPS_START(vt_data, vdfs_trace_iops_setxattr, dentry);
@@ -562,10 +562,10 @@ ssize_t vdfs4_getxattr(struct dentry *dentry, const char *name, void *buffer,
 	if (IS_ERR(btree))
 		return PTR_ERR(btree);
 
-	if (!strcmp(name, POSIX_ACL_XATTR_DEFAULT))
+	if (!strcmp(name, XATTR_NAME_POSIX_ACL_DEFAULT))
 		return vdfs4_get_acl_xattr(inode, ACL_TYPE_DEFAULT,
 						buffer, buf_size);
-	if (!strcmp(name, POSIX_ACL_XATTR_ACCESS))
+	if (!strcmp(name, XATTR_NAME_POSIX_ACL_ACCESS))
 		return vdfs4_get_acl_xattr(inode, ACL_TYPE_ACCESS,
 						buffer, buf_size);
 
