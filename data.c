@@ -1082,7 +1082,7 @@ static void meta_end_IO(struct bio *bio, int err)
 	struct vdfs4_sb_info *sbi =
 			bvec->bv_page->mapping->host->i_sb->s_fs_info;
 
-	if (bio->bi_rw & WRITE) {
+	if (bio->bi_opf & WRITE) {
 		VDFS4_BUG_ON(atomic_read(&sbi->meta_bio_count) <= 0, sbi);
 		if (atomic_dec_and_test(&sbi->meta_bio_count))
 			wake_up_all(&sbi->meta_bio_wait);
@@ -1100,7 +1100,7 @@ static void meta_end_IO(struct bio *bio, int err)
 				set_bit(AS_EIO, &page->mapping->flags);
 		}
 
-		if (bio->bi_rw & WRITE) {
+		if (bio->bi_opf & WRITE) {
 			end_page_writeback(page);
 		} else {
 			if (uptodate)
