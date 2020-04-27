@@ -368,7 +368,8 @@ int vdfs4_table_IO(struct vdfs4_sb_info *sbi, void *buffer,
 			pages_count--;
 			submited_pages++;
 		} while (pages_count > 0);
-		submit_bio(rw, bio);
+		bio->bi_opf |= rw;
+		submit_bio(bio);
 
 	} while (pages_count > 0);
 
@@ -488,7 +489,8 @@ again:
 		}
 	}
 	bio->bi_private = &wait;
-	submit_bio(READ | REQ_META | REQ_META, bio);
+	bio->bi_opf |= READ | REQ_META | REQ_META;
+	submit_bio(bio);
 	blk_finish_plug(&plug);
 
 	/* Synchronous read operation */
@@ -549,7 +551,8 @@ int vdfs4_read_page(struct block_device *bdev,
 		return -EFAULT;
 	}
 	bio->bi_private = &wait;
-	submit_bio(READ | REQ_META | REQ_META, bio);
+	bio->bi_opf |= READ | REQ_META | REQ_META;
+	submit_bio(bio);
 	blk_finish_plug(&plug);
 
 	/* Synchronous read operation */
@@ -617,7 +620,8 @@ int vdfs4_write_page(struct vdfs4_sb_info *sbi,
 	if (is_sync)
 		bio->bi_private = &wait;
 
-	submit_bio(WRITE_FLUSH_FUA | REQ_META | REQ_PRIO, bio);
+	bio->bi_opf |= WRITE_FLUSH_FUA | REQ_META | REQ_PRIO;
+	submit_bio(bio);
 	blk_finish_plug(&plug);
 	if (is_sync) {
 		/* Synchronous write operation */
@@ -1282,7 +1286,8 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 		       !bio_add_page(bio, page, PAGE_SIZE, 0)) {
 			if (bio) {
 				atomic_inc(&sbi->meta_bio_count);
-				submit_bio(WRITE_FUA | REQ_META | REQ_PRIO, bio);
+				bio->bi_opf |= WRITE_FUA | REQ_META | REQ_PRIO;
+				submit_bio(bio);
 			}
 			bio = allocate_new_request(sbi, block, pvec.nr - i);
 			next_block = block;
@@ -1294,7 +1299,8 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 
 	if (bio) {
 		atomic_inc(&sbi->meta_bio_count);
-		submit_bio(WRITE_FUA | REQ_META | REQ_PRIO, bio);
+		bio->bi_opf |= WRITE_FUA | REQ_META | REQ_PRIO;
+		submit_bio(bio);
 	}
 
 	blk_finish_plug(&plug);
@@ -1391,7 +1397,10 @@ int vdfs4__read(struct inode *inode, int type, struct page **pages,
 			unsigned max_pages_num = min_t(unsigned,
 					(pages_count - count), (blocks_num - block));
 			if (bio)
-				submit_bio(bio_flags, bio);
+				{
+					bio->bi_opf |= bio_flags;
+					submit_bio(bio);
+				}
 again:
 			bio = allocate_new_request(sbi, block,
 					max_pages_num);
@@ -1405,7 +1414,10 @@ again:
 
 		size = bio_add_page(bio, page, PAGE_SIZE, 0);
 		if (size < (int)PAGE_SIZE) {
-			submit_bio(bio_flags, bio);
+		{
+			bio->bi_opf |= bio_flags;
+			submit_bio(bio);
+		}
 			bio = NULL;
 			goto again;
 		}
@@ -1414,7 +1426,10 @@ again:
 
 exit:
 	if (bio)
-		submit_bio(bio_flags, bio);
+	{
+		bio->bi_opf |= bio_flags;
+		submit_bio(bio);
+	}
 
 	blk_finish_plug(&plug);
 
@@ -2210,7 +2225,8 @@ struct page *vdfs4_read_or_create_page(struct inode *inode, pgoff_t index,
 struct bio *vdfs4_mpage_bio_submit(int rw, struct bio *bio)
 {
 	bio->bi_end_io = end_io_write;
-	submit_bio(rw, bio);
+	bio->bi_opf |= rw;
+	submit_bio(bio);
 	return NULL;
 }
 
