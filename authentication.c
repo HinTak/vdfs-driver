@@ -173,10 +173,10 @@ static int vdfs4_get_and_cmp_hash(struct vdfs4_inode_info *inode_i,
 		(unsigned int)comp_chunks_count *
 		sizeof(struct vdfs4_comp_extent) +
 		inode_i->fbc->hash_len * chunk_idx;
-	page_idx = (pgoff_t)(hash_offset >> PAGE_CACHE_SHIFT);
-	pos = hash_offset & (PAGE_CACHE_SIZE - 1);
-	if (PAGE_CACHE_SIZE - (hash_offset - ((hash_offset >> PAGE_CACHE_SHIFT)
-			<< PAGE_CACHE_SHIFT)) < inode_i->fbc->hash_len) {
+	page_idx = (pgoff_t)(hash_offset >> PAGE_SHIFT);
+	pos = hash_offset & (PAGE_SIZE - 1);
+	if (PAGE_SIZE - (hash_offset - ((hash_offset >> PAGE_SHIFT)
+			<< PAGE_SHIFT)) < inode_i->fbc->hash_len) {
 		ret = vdfs4_read_comp_pages(&inode_i->vfs_inode, page_idx,
 			2, pages, VDFS4_FBASED_READ_M);
 		if (ret)
@@ -226,7 +226,7 @@ err:
 				unlock_page(pages[page_idx]);
 			}
 			mark_page_accessed(pages[page_idx]);
-			page_cache_release(pages[page_idx]);
+			put_page(pages[page_idx]);
 		}
 	}
 err_read:

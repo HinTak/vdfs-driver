@@ -145,7 +145,7 @@ static int _load_debug_area(struct vdfs4_sb_info *sbi,
 	}
 
 	ret = vdfs4_read_pages(sbi->sb->s_bdev, pages,
-		debug_area_start << (PAGE_CACHE_SHIFT - SECTOR_SIZE_SHIFT),
+		debug_area_start << (PAGE_SHIFT - SECTOR_SIZE_SHIFT),
 		(unsigned int)debug_page_count);
 	for (count = 0; count < (int)debug_page_count; count++) {
 		unlock_page(pages[count]);
@@ -263,7 +263,7 @@ static int _record_err_info(struct vdfs4_sb_info *sbi,
 	for (count = 0; count < (uint32_t)debug_page_count; count++) {
 		sector_t sector_to_write =
 			((debug_area_start + (sector_t)count)
-				<<  (PAGE_CACHE_SHIFT - SECTOR_SIZE_SHIFT));
+				<<  (PAGE_SHIFT - SECTOR_SIZE_SHIFT));
 		lock_page(debug_pages[count]);
 		set_page_writeback(debug_pages[count]);
 		ret = vdfs4_write_page(sbi, sector_to_write, debug_pages[count],
@@ -574,7 +574,7 @@ static int vdfs4_dump_to_disk_all(struct vdfs4_sb_info *sbi,
 
 	/* 3. debug area dump */
 	if (_load_debug_area(sbi, &pages, &page_count, &debug_area) == 0) {
-		length = page_count << PAGE_CACHE_SHIFT;
+		length = page_count << PAGE_SHIFT;
 		vdfs4_dump_to_disk(debug_area, length, "vdfs_debugarea.dump");
 		_free_debug_area(pages, page_count, debug_area);
 	}

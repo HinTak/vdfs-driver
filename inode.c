@@ -562,7 +562,7 @@ int vdfs4_get_free_inode(struct vdfs4_sb_info *sbi, ino_t *i_ino,
 
 		kunmap(page);
 		unlock_page(page);
-		page_cache_release(page);
+		put_page(page);
 
 	}
 
@@ -607,7 +607,7 @@ int vdfs4_free_inode_n(struct vdfs4_sb_info *sbi, ino_t inode_n, int count)
 	vdfs4_add_chunk_bitmap(sbi, page, 1);
 	kunmap(page);
 	unlock_page(page);
-	page_cache_release(page);
+	put_page(page);
 	return 0;
 }
 
@@ -1239,7 +1239,7 @@ static int vdfs4_access_remote_vm(struct mm_struct *mm,
 					buf, (char *)maddr + offset,
 					(size_t)bytes);
 			kunmap(page);
-			page_cache_release(page);
+			put_page(page);
 		} else
 			break;
 		len -= bytes;
@@ -1509,12 +1509,12 @@ static int get_file_descriptor(struct vdfs4_inode_info *inode_i,
 	if (inode_i->fbc->comp_size < sizeof(*descr))
 		return -EINVAL;
 	descr_offset = inode_i->fbc->comp_size - sizeof(*descr);
-	page_idx = (pgoff_t)(descr_offset >> PAGE_CACHE_SHIFT);
-	pos = descr_offset & (PAGE_CACHE_SIZE - 1);
+	page_idx = (pgoff_t)(descr_offset >> PAGE_SHIFT);
+	pos = descr_offset & (PAGE_SIZE - 1);
 
-	if (PAGE_CACHE_SIZE - (descr_offset -
-			((descr_offset >> PAGE_CACHE_SHIFT)
-			<< PAGE_CACHE_SHIFT)) < sizeof(*descr)) {
+	if (PAGE_SIZE - (descr_offset -
+			((descr_offset >> PAGE_SHIFT)
+			<< PAGE_SHIFT)) < sizeof(*descr)) {
 		ret = vdfs4_read_comp_pages(&inode_i->vfs_inode, page_idx,
 			2, pages, VDFS4_FBASED_READ_M);
 		if (ret)
@@ -1558,7 +1558,7 @@ err:
 				unlock_page(pages[page_idx]);
 			}
 			mark_page_accessed(pages[page_idx]);
-			page_cache_release(pages[page_idx]);
+			put_page(pages[page_idx]);
 		}
 	}
 	return ret;
@@ -1627,8 +1627,8 @@ static int vdfs4_readpage_tuned_sw(struct file *file, struct page *page)
 		goto exit;
 	}
 
-	if (page->index >= ((i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
-					PAGE_CACHE_SHIFT)) {
+	if (page->index >= ((i_size_read(inode) + PAGE_SIZE - 1) >>
+					PAGE_SHIFT)) {
 		/* outside inode->i_size */
 		clear_highpage(page);
 		SetPageUptodate(page);
@@ -1655,10 +1655,10 @@ static int vdfs4_readpage_tuned_sw(struct file *file, struct page *page)
 			unlock_page(chunk_pages[i]);
 		} else
 			mark_page_accessed(chunk_pages[i]);
-		page_cache_release(chunk_pages[i]);
+		put_page(chunk_pages[i]);
 	}
 	VT_DECOMP_FINISH(vt_data, vdfs_trace_decomp_sw, inode,
-			 (cext.start_block << PAGE_CACHE_SHIFT) + cext.offset,
+			 (cext.start_block << PAGE_SHIFT) + cext.offset,
 			 cext.len_bytes,!!(inode_i->fbc->hash_fn),
 			 !!(ret), (cext.flags&VDFS4_CHUNK_FLAG_UNCOMPR));
 exit:
@@ -1673,8 +1673,8 @@ static int vdfs4_readpage_tuned_hw_generic(struct file *file, struct page *page)
 	int ret = 0;
 	struct inode *inode = page->mapping->host;
 	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
-	unsigned file_size_pg = ((i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
-					PAGE_CACHE_SHIFT);
+	unsigned file_size_pg = ((i_size_read(inode) + PAGE_SIZE - 1) >>
+					PAGE_SHIFT);
 
 	if (page->index >= file_size_pg) {
 		clear_highpage(page);
@@ -1706,8 +1706,8 @@ static int vdfs4_readpage_tuned_hw(struct file *file, struct page *page)
 	int ret;
 	struct inode *inode = page->mapping->host;
 	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
-	unsigned file_size_pg = ((i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
-						PAGE_CACHE_SHIFT);
+	unsigned file_size_pg = ((i_size_read(inode) + PAGE_SIZE - 1) >>
+						PAGE_SHIFT);
 	VT_PREPARE_PARAM(vt_data);
 
 	VT_AOPS_START(vt_data, vdfs_trace_aops_tuned_chunk,
@@ -1784,8 +1784,8 @@ static int vdfs4_readpage_tuned_hw(struct file *file, struct page *page)
 	int ret = 0;
 	struct inode *inode = page->mapping->host;
 	struct vdfs4_inode_info *inode_i = VDFS4_I(inode);
-	unsigned file_size_pg = ((i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
-					PAGE_CACHE_SHIFT);
+	unsigned file_size_pg = ((i_size_read(inode) + PAGE_SIZE - 1) >>
+					PAGE_SHIFT);
 	VT_PREPARE_PARAM(vt_data);
 
 	if (page->index >= file_size_pg) {
@@ -2044,7 +2044,7 @@ static int vdfs4_write_end(struct file *file, struct address_space *mapping,
 	}
 
 	unlock_page(page);
-	page_cache_release(page);
+	put_page(page);
 
 	if (i_size_changed)
 		mark_inode_dirty(inode);
@@ -3691,10 +3691,10 @@ int vdfs4_init_file_decompression(struct vdfs4_inode_info *inode_i, int debug)
 	}
 
 	start_idx = (unsigned long int)((inode_i->fbc->comp_size -
-		table_size_bytes) >> PAGE_CACHE_SHIFT);
+		table_size_bytes) >> PAGE_SHIFT);
 	start_offset = inode_i->fbc->comp_size - table_size_bytes;
 	pages_num = (unsigned int)(((inode_i->fbc->comp_size +
-			PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT) - start_idx);
+			PAGE_SIZE - 1) >> PAGE_SHIFT) - start_idx);
 
 	/* Now we can now how many pages do we need, read the rest of them */
 	pages = kmalloc(pages_num * sizeof(*pages), GFP_NOFS);
@@ -3768,12 +3768,12 @@ out:
 			lock_page(pages[i]);
 			ClearPageUptodate(pages[i]);
 			ClearPageChecked(pages[i]);
-			page_cache_release(pages[i]);
+			put_page(pages[i]);
 			unlock_page(pages[i]);
 
 		} else {
 			mark_page_accessed(pages[i]);
-			page_cache_release(pages[i]);
+			put_page(pages[i]);
 		}
 	}
 

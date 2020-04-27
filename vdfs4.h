@@ -1411,7 +1411,7 @@ int vdfs4_check_hash_chunk_no_calc(struct vdfs4_inode_info *inode_i,
 		<< sbi->block_size_shift)
 
 #define VDFS4_DEBUG_AREA_PAGE_COUNT(sbi) (VDFS4_DEBUG_AREA_LENGTH_BYTES(sbi) \
-		>> PAGE_CACHE_SHIFT)
+		>> PAGE_SHIFT)
 
 #define DEBUG_AREA_CRC_OFFSET(sbi) (VDFS4_DEBUG_AREA_LENGTH_BYTES(sbi) \
 		- sizeof(unsigned int))
@@ -1442,7 +1442,7 @@ int vdfs4_check_hash_chunk_no_calc(struct vdfs4_inode_info *inode_i,
 		>> (sbi->log_blocks_in_leb + sbi->block_size_shift - \
 		PAGE_SHIFT) : page_offset)
 
-#define PAGE_TO_SECTORS(x) (x * ((1 << (PAGE_CACHE_SHIFT - SECTOR_SIZE_SHIFT))))
+#define PAGE_TO_SECTORS(x) (x * ((1 << (PAGE_SHIFT - SECTOR_SIZE_SHIFT))))
 
 #define INODEI_NAME(inode_i) ((inode_i == NULL) ? "<null inodei>" :\
 		((inode_i->name == NULL) ? "<noname>" : inode_i->name))

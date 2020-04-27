@@ -210,7 +210,7 @@ do_reread:
 	if (create) {
 		__u16 poison_val;
 		__u16 max_poison_val = (__u16)(btree->pages_per_node <<
-			(PAGE_CACHE_SHIFT - 1));
+			(PAGE_SHIFT - 1));
 		__u16 *curr_pointer = data;
 
 		for (poison_val = 0; poison_val < max_poison_val;
@@ -527,7 +527,7 @@ static void free_bnode(struct vdfs4_bnode *bnode)
 
 	for (i = 0; i < bnode->host->pages_per_node; i++) {
 		if (!IS_ERR_OR_NULL(bnode->pages[i]))
-			page_cache_release(bnode->pages[i]);
+			put_page(bnode->pages[i]);
 		bnode->pages[i] = NULL;
 	}
 

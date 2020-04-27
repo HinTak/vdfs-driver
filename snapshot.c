@@ -464,7 +464,7 @@ static int load_extended_table(struct vdfs4_sb_info *sbi, sector_t start)
 	struct vdfs4_snapshot_info *snapshot = sbi->snapshot_info;
 
 	if (!snapshot->extended_table) {
-		snapshot->extended_table = vdfs4_vmalloc(PAGE_CACHE_SIZE);
+		snapshot->extended_table = vdfs4_vmalloc(PAGE_SIZE);
 		if (!snapshot->extended_table)
 			return -ENOMEM;
 	}
@@ -686,7 +686,7 @@ static void update_extended_table(struct vdfs4_sb_info *sbi, ino_t ino_n,
 			sizeof(struct vdfs4_extended_record) +
 			sizeof(struct vdfs4_extended_table) + CRC32_SIZE;
 
-	if (new_table_size > PAGE_CACHE_SIZE) {
+	if (new_table_size > PAGE_SIZE) {
 		snapshot->use_base_table = 1;
 		return;
 	}
@@ -1540,7 +1540,7 @@ loff_t vdfs4_special_file_size(struct vdfs4_sb_info *sbi, ino_t ino_n)
 		size = (loff_t)(1llu << sbi->log_super_page_size) *
 			(last_page_index + (loff_t)1);
 	else
-		size = PAGE_CACHE_SIZE * (last_page_index + 1);
+		size = PAGE_SIZE * (last_page_index + 1);
 
 
 	return size;

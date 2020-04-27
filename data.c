@@ -249,10 +249,10 @@ static int get_block_meta_wrapper(struct inode *inode, pgoff_t page_idx,
 
 			mask = ((unsigned int)1 << (sbi->log_blocks_in_leb +
 				sbi->block_size_shift -
-				(unsigned int)PAGE_CACHE_SHIFT)) -
+				(unsigned int)PAGE_SHIFT)) -
 				(unsigned int)1;
 			meta_iblock += (page_idx & (pgoff_t)mask)
-				<< (PAGE_CACHE_SHIFT - sbi->block_size_shift);
+				<< (PAGE_SHIFT - sbi->block_size_shift);
 		}
 		*res_block = 0;
 		ret = get_meta_block(sbi, meta_iblock, res_block, &length);
@@ -261,7 +261,7 @@ static int get_block_meta_wrapper(struct inode *inode, pgoff_t page_idx,
 		break;
 	case VDFS4_PACKTREE_READ:
 		bh_result.b_blocknr = 0;
-		iblock = ((sector_t)page_idx) << (PAGE_CACHE_SHIFT -
+		iblock = ((sector_t)page_idx) << (PAGE_SHIFT -
 				sbi->block_size_shift);
 		ret = vdfs4_get_block(inode, iblock, &bh_result, 0);
 		*res_block = bh_result.b_blocknr;
@@ -335,7 +335,7 @@ int vdfs4_table_IO(struct vdfs4_sb_info *sbi, void *buffer,
 		if (ret)
 			goto error_exit;
 
-		start_sector += submited_pages << (PAGE_CACHE_SHIFT -
+		start_sector += submited_pages << (PAGE_SHIFT -
 						SECTOR_SIZE_SHIFT);
 
 		bio = __allocate_new_bio(bdev, start_sector, nr_vectr);
@@ -420,10 +420,10 @@ static inline int vdfs4_chunk_page_count(struct inode *inode,
 		goto log_chunk_size;
 
 	/* div round up by PAGE_SIZE */
-	return (i_size + PAGE_CACHE_SIZE-1) >> PAGE_CACHE_SHIFT;
+	return (i_size + PAGE_SIZE-1) >> PAGE_SHIFT;
 
 log_chunk_size:
-	return (1 << (inode_i->fbc->log_chunk_size - PAGE_CACHE_SHIFT));
+	return (1 << (inode_i->fbc->log_chunk_size - PAGE_SHIFT));
 }
 
 /**
@@ -472,11 +472,11 @@ again:
 	/* Initialize the bio */
 	for (; count < pages_count; count++) {
 		if ((unsigned) bio_add_page(bio, page[count],
-				PAGE_CACHE_SIZE, 0) < PAGE_CACHE_SIZE) {
+				PAGE_SIZE, 0) < PAGE_SIZE) {
 			if (bio->bi_vcnt) {
 				continue_load = 1;
 				sector_addr += ((sector_t)count <<
-						(PAGE_CACHE_SHIFT - SECTOR_SIZE_SHIFT));
+						(PAGE_SHIFT - SECTOR_SIZE_SHIFT));
 			} else {
 				VDFS4_ERR("FAIL to add page to BIO");
 				bio_put(bio);
@@ -946,7 +946,7 @@ static int vdfs4_init_bitmap_page(struct vdfs4_sb_info *sbi, ino_t ino_n,
 		bitmap = kmap_atomic(page);
 		if (!bitmap)
 			return -ENOMEM;
-		memset((char *)bitmap, 0, PAGE_CACHE_SIZE);
+		memset((char *)bitmap, 0, PAGE_SIZE);
 		memcpy((char *)bitmap, INODE_BITMAP_MAGIC,
 				INODE_BITMAP_MAGIC_LEN - VERSION_SIZE);
 		memcpy((char *)bitmap + INODE_BITMAP_MAGIC_LEN - VERSION_SIZE,
@@ -1279,7 +1279,7 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 		unlock_page(page);
 
 		while (!bio || next_block != block ||
-		       !bio_add_page(bio, page, PAGE_CACHE_SIZE, 0)) {
+		       !bio_add_page(bio, page, PAGE_SIZE, 0)) {
 			if (bio) {
 				atomic_inc(&sbi->meta_bio_count);
 				submit_bio(WRITE_FUA | REQ_META | REQ_PRIO, bio);
@@ -1358,9 +1358,9 @@ int vdfs4__read(struct inode *inode, int type, struct page **pages,
 	int ret = 0;
 	sector_t last_block = 0, block;
 	struct block_device *bdev = inode->i_sb->s_bdev;
-	sector_t blocks_num = bdev->bd_inode->i_size >> PAGE_CACHE_SHIFT;
+	sector_t blocks_num = bdev->bd_inode->i_size >> PAGE_SHIFT;
 
-	unsigned int blocks_per_page = (unsigned)(1 << (PAGE_CACHE_SHIFT -
+	unsigned int blocks_per_page = (unsigned)(1 << (PAGE_SHIFT -
 			sbi->block_size_shift));
 	unsigned int count;
 	int bio_flags = (type == VDFS4_META_READ) ?
@@ -1403,8 +1403,8 @@ again:
 			}
 		}
 
-		size = bio_add_page(bio, page, PAGE_CACHE_SIZE, 0);
-		if (size < (int)PAGE_CACHE_SIZE) {
+		size = bio_add_page(bio, page, PAGE_SIZE, 0);
+		if (size < (int)PAGE_SIZE) {
 			submit_bio(bio_flags, bio);
 			bio = NULL;
 			goto again;
@@ -1538,7 +1538,7 @@ exit_alloc_page:
 	VDFS4_ERR("Error in allocate page");
 	for (; count > 0; count--) {
 		unlock_page(pages[count - 1]);
-		page_cache_release(pages[count - 1]);
+		put_page(pages[count - 1]);
 	}
 	return ret;
 exit_read_data:
@@ -1564,8 +1564,8 @@ static int __get_chunk_extent(struct vdfs4_inode_info *inode_i,
 	extent_offset = inode_i->fbc->comp_table_start_offset +
 		chunk_idx * sizeof(struct vdfs4_comp_extent);
 
-	page_idx = (pgoff_t)extent_offset >> PAGE_CACHE_SHIFT;
-	pos = extent_offset & (PAGE_CACHE_SIZE - 1);
+	page_idx = (pgoff_t)extent_offset >> PAGE_SHIFT;
+	pos = extent_offset & (PAGE_SIZE - 1);
 
 	ret = vdfs4_read_comp_pages(&inode_i->vfs_inode, page_idx,
 		1, &page, VDFS4_FBASED_READ_M);
@@ -1600,11 +1600,11 @@ static int __get_chunk_extent(struct vdfs4_inode_info *inode_i,
 
 	start = (pgoff_t)le64_to_cpu(raw_extent->start);
 	cext->flags = le16_to_cpu(raw_extent->flags);
-	cext->start_block = (pgoff_t)start >> (pgoff_t)PAGE_CACHE_SHIFT;
-	cext->offset = start & (PAGE_CACHE_SIZE - 1);
+	cext->start_block = (pgoff_t)start >> (pgoff_t)PAGE_SHIFT;
+	cext->offset = start & (PAGE_SIZE - 1);
 	cext->len_bytes = (int)le32_to_cpu(raw_extent->len_bytes);
-	last_block = (pgoff_t)(start + cext->len_bytes + PAGE_CACHE_SIZE - 1)
-			>> PAGE_CACHE_SHIFT;
+	last_block = (pgoff_t)(start + cext->len_bytes + PAGE_SIZE - 1)
+			>> PAGE_SHIFT;
 	cext->blocks_n = (int)(last_block - cext->start_block);
 #ifdef CONFIG_VDFS4_SQUEEZE
 	cext->profiled_prio =  le16_to_cpu(raw_extent->profiled_prio);
@@ -1632,7 +1632,7 @@ out_unmap:
 		unlock_page(page);
 	}
 	mark_page_accessed(page);
-	page_cache_release(page);
+	put_page(page);
 	return ret;
 }
 
@@ -1739,7 +1739,7 @@ static int hw2_unpack_chunk(struct inode *inode,
 	blocks_n = pext.block_count - start_offset;
 
 	/* Check if chunk is fragmented */
-	chunk_blocks_num = (chunk_len + PAGE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+	chunk_blocks_num = (chunk_len + PAGE_SIZE - 1) >> PAGE_SHIFT;
 	if (blocks_n < chunk_blocks_num)
 		return -EAGAIN;
 
@@ -1773,7 +1773,7 @@ static int __find_get_pages(struct inode *inode, pgoff_t index,
 		if (!pages[i]) {
 			while (--i >= 0) {
 				unlock_page(pages[i]);
-				page_cache_release(pages[i]);
+				put_page(pages[i]);
 			}
 			return -ENOMEM;
 		}
@@ -1895,20 +1895,20 @@ int vdfs4_auth_decompress_hw2(struct inode *inode, struct page *page)
 exit_unlock:
 	for (i = 0; i < pages_count; ++i) {
 		unlock_page(dst_pages[i]);
-		page_cache_release(dst_pages[i]);
+		put_page(dst_pages[i]);
 	}
 	kfree(dst_pages);
 	vdfs4_hw2_free_req(&req_hw);
 exit:
 	VT_DECOMP_FINISH(vt_data, vdfs_trace_decomp_hw, inode,
-			 (cext.start_block << PAGE_CACHE_SHIFT) + cext.offset,
+			 (cext.start_block << PAGE_SHIFT) + cext.offset,
 			 cext.len_bytes, auth,
 			 !!ret,(cext.flags&VDFS4_CHUNK_FLAG_UNCOMPR));
 	return ret;
 }
 #endif /* end of CONFIG_VDFS4_HW_DECOMPRESS_SUPPORT */
 
-#define COMPR_TABLE_EXTENTS_PER_PAGE (PAGE_CACHE_SIZE \
+#define COMPR_TABLE_EXTENTS_PER_PAGE (PAGE_SIZE \
 		/ sizeof(struct vdfs4_comp_extent))
 
 /* just read a chunk from disk
@@ -1975,7 +1975,7 @@ exit:
 			if (ret) {
 				ClearPageUptodate(chunk_pages[count]);
 				ClearPageChecked(chunk_pages[count]);
-				page_cache_release(chunk_pages[count]);
+				put_page(chunk_pages[count]);
 			} else {
 				SetPageChecked(chunk_pages[count]);
 			}
@@ -2032,7 +2032,7 @@ int vdfs4_auth_decompress_sw(struct inode *inode, struct page **chunk_pages,
 		if (!unpacked_pages[i]) {
 			while (i-- > 0) {
 				unlock_page(unpacked_pages[i]);
-				page_cache_release(unpacked_pages[i]);
+				put_page(unpacked_pages[i]);
 			}
 
 			ret = -ENOMEM;
@@ -2043,7 +2043,7 @@ int vdfs4_auth_decompress_sw(struct inode *inode, struct page **chunk_pages,
 	if (PageUptodate(page)) {
 		for (i = 0; i < pages_count; i++) {
 			unlock_page(unpacked_pages[i]);
-			page_cache_release(unpacked_pages[i]);
+			put_page(unpacked_pages[i]);
 		}
 		ret = 0;
 		goto exit_alloc_pages;
@@ -2072,7 +2072,7 @@ exit_free_pages:
 			mark_page_accessed(unpacked_pages[i]);
 		}
 		unlock_page(unpacked_pages[i]);
-		page_cache_release(unpacked_pages[i]);
+		put_page(unpacked_pages[i]);
 	}
 exit_alloc_pages:
 	kfree(unpacked_pages);
@@ -2176,14 +2176,14 @@ exit_alloc_page:
 	VDFS4_ERR("Error in allocate page");
 	for (; count > 0; count--) {
 		unlock_page(pages[count - 1]);
-		page_cache_release(pages[count - 1]);
+		put_page(pages[count - 1]);
 	}
 	return ret;
 exit_alloc_locked_page:
 	VDFS4_ERR("Error in init bitmap page");
 	for (; count >= 0; count--) {
 		unlock_page(pages[count]);
-		page_cache_release(pages[count]);
+		put_page(pages[count]);
 	}
 	return ret;
 exit_validate_page:
@@ -2236,7 +2236,7 @@ int vdfs4_mpage_writepage(struct page *page,
 	loff_t i_size = i_size_read(inode);
 
 	memset(&extent, 0x0, sizeof(extent));
-	block_in_file = (sector_t)page->index << (PAGE_CACHE_SHIFT - blkbits);
+	block_in_file = (sector_t)page->index << (PAGE_SHIFT - blkbits);
 	blocksize = (unsigned int)(1 << inode->i_blkbits);
 	if (page_has_buffers(page)) {
 		bh = page_buffers(page);
@@ -2307,7 +2307,7 @@ int vdfs4_mpage_writepage(struct page *page,
 	}
 
 	boundary_block = bh->b_blocknr;
-	end_index = (unsigned long int)(i_size >> PAGE_CACHE_SHIFT);
+	end_index = (unsigned long int)(i_size >> PAGE_SHIFT);
 	if (page->index >= end_index) {
 		/*
 		 * The page straddles i_size.  It must be zeroed out on each
@@ -2317,11 +2317,11 @@ int vdfs4_mpage_writepage(struct page *page,
 		 * is zeroed when mapped, and writes to that region are not
 		 * written out to the file."
 		 */
-		unsigned offset = i_size & (PAGE_CACHE_SIZE - 1);
+		unsigned offset = i_size & (PAGE_SIZE - 1);
 
 		if (page->index > end_index || !offset)
 			goto confused;
-		zero_user_segment(page, offset, PAGE_CACHE_SIZE);
+		zero_user_segment(page, offset, PAGE_SIZE);
 	}
 
 	/*

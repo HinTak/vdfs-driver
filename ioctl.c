@@ -273,8 +273,8 @@ unlock_inode_exit:
 
 				/* Count comp/uncomp chunk */
 				extent_offset = VDFS4_I(inode)->fbc->comp_table_start_offset;
-				page_idx = (pgoff_t)extent_offset >> PAGE_CACHE_SHIFT;
-				pos = extent_offset & (PAGE_CACHE_SIZE - 1);
+				page_idx = (pgoff_t)extent_offset >> PAGE_SHIFT;
+				pos = extent_offset & (PAGE_SIZE - 1);
 				chunk_extable_size =
 					ioc_file_info.chunk_cnt *
 					sizeof(struct vdfs4_comp_extent);
@@ -310,7 +310,7 @@ unlock_inode_exit:
 					lock_page(pages[pages_count]);
 					ClearPageUptodate(pages[pages_count]);
 					ClearPageChecked(pages[pages_count]);
-					page_cache_release(pages[pages_count]);
+					put_page(pages[pages_count]);
 					unlock_page(pages[pages_count]);
 				}
 				kfree(pages);

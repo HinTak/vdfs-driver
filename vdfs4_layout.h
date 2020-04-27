@@ -41,7 +41,7 @@
 
 #define SECTOR_SIZE		512
 #define SECTOR_SIZE_SHIFT	9
-#define SECTOR_PER_PAGE		(PAGE_CACHE_SIZE / SECTOR_SIZE)
+#define SECTOR_PER_PAGE		(PAGE_SIZE / SECTOR_SIZE)
 
 /* Volume Information Structure */
 /* +--------------+-----------------------+-----------------------+ */

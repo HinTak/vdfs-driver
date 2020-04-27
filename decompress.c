@@ -158,12 +158,12 @@ void vdfs4_dump_fbc_error(struct vdfs4_inode_info *inode_i, void *packed,
 			((extent.first_block +
 			cext->start_block) << 12) +
 			(sector_t)cext->offset,
-			(int)(cext->blocks_n << PAGE_CACHE_SHIFT));
+			(int)(cext->blocks_n << PAGE_SHIFT));
 
 
 		if (name_length > 0)
 			vdfs4_dump_to_disk(packed,
-				(size_t)(cext->blocks_n << PAGE_CACHE_SHIFT),
+				(size_t)(cext->blocks_n << PAGE_SHIFT),
 				(const char *)file_name);
 	}
 dump_to_console:
