@@ -886,7 +886,7 @@ static inline void vdfs4_lfork_to_rfork(struct vdfs4_fork *lfork,
  * @param [in]	inode	The inode for which current time will be returned
  * @return		Time value for current inode
  */
-static inline struct timespec vdfs4_current_time(struct inode *inode)
+static inline struct timespec64 vdfs4_current_time(struct inode *inode)
 {
 	return (inode->i_sb->s_time_gran < NSEC_PER_SEC) ?
 		current_fs_time(inode->i_sb) : CURRENT_TIME_SEC;

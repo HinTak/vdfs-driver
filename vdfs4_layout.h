@@ -200,7 +200,7 @@ struct vdfs4_timespec {
 	__le32	nanoseconds;
 };
 
-static inline struct vdfs4_timespec vdfs4_encode_time(struct timespec ts)
+static inline struct vdfs4_timespec vdfs4_encode_time(struct timespec64 ts)
 {
 	return (struct vdfs4_timespec) {
 		.seconds = cpu_to_le32(ts.tv_sec),
@@ -209,9 +209,9 @@ static inline struct vdfs4_timespec vdfs4_encode_time(struct timespec ts)
 	};
 }
 
-static inline struct timespec vdfs4_decode_time(struct vdfs4_timespec ts)
+static inline struct timespec64 vdfs4_decode_time(struct vdfs4_timespec ts)
 {
-	return (struct timespec) {
+	return (struct timespec64) {
 		.tv_sec = (long)(le32_to_cpu(ts.seconds) +
 			((u64)le32_to_cpu(ts.seconds_high) << 32)),
 		.tv_nsec = (long)(le32_to_cpu(ts.nanoseconds)),
