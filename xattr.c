@@ -380,7 +380,7 @@ static int vdfs4_set_acl_xattr(struct inode *inode, int type,
 	if (IS_ERR(acl))
 		return PTR_ERR(acl);
 	if (acl)
-		ret = posix_acl_valid(acl);
+		ret = posix_acl_valid(inode->i_sb->s_user_ns, acl);
 	if (!ret)
 		ret = vdfs4_set_acl(inode, acl, type);
 	posix_acl_release(acl);
