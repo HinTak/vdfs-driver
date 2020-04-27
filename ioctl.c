@@ -222,7 +222,7 @@ long vdfs4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			VDFS4_I(inode)->flags &= ~(1u <<
 					(unsigned)VDFS4_IMMUTABLE);
 		vdfs4_set_vfs_inode_flags(inode);
-		inode->i_ctime = vdfs4_current_time(inode);
+		inode->i_ctime = current_time(inode);
 		mark_inode_dirty(inode);
 		vdfs4_stop_transaction(sbi);
 

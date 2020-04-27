@@ -335,7 +335,7 @@ int vdfs4_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 	}
 	mutex_w_unlock(sbi->xattr_tree->rw_tree_lock);
 	if (!ret) {
-		inode->i_ctime = vdfs4_current_time(inode);
+		inode->i_ctime = current_time(inode);
 		mark_inode_dirty(inode);
 	}
 	vdfs4_stop_transaction(sbi);
@@ -526,7 +526,7 @@ insert_xattr:
 exit:
 	mutex_w_unlock(sbi->xattr_tree->rw_tree_lock);
 	if (!ret) {
-		inode->i_ctime = vdfs4_current_time(inode);
+		inode->i_ctime = current_time(inode);
 		mark_inode_dirty(inode);
 	}
 	vdfs4_stop_transaction(sbi);
