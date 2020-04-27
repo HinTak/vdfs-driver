@@ -27,13 +27,15 @@
 #include <linux/sched/mm.h>
 #include <linux/rbtree.h>
 #include <linux/fs.h>
-#include <uapi/linux/mount.h>
 #include <linux/aio.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/pagemap.h>
 #include <linux/completion.h>
 #include <linux/version.h>
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0))
+#include <uapi/linux/mount.h>
+#endif
 #include <linux/list.h>
 #include <linux/crypto.h>
 #include <linux/xattr.h>
