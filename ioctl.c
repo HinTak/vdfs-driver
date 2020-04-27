@@ -46,7 +46,7 @@ static int vdfs4_set_type_status(struct vdfs4_inode_info *inode_i,
 	} else if (status)
 		return 0;
 
-	mutex_lock(&inode->i_mutex);
+	inode_lock(inode);
 	vdfs4_start_transaction(sbi);
 	if (atomic_read(&inode_i->open_count) != 1) {
 		ret = -EBUSY;
@@ -88,7 +88,7 @@ retry:
 
 out:
 	vdfs4_stop_transaction(sbi);
-	mutex_unlock(&inode->i_mutex);
+	inode_unlock(inode);
 
 	return ret;
 }
@@ -196,7 +196,7 @@ long vdfs4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			break;
 		}
 
-		mutex_lock(&inode->i_mutex);
+		inode_lock(inode);
 
 		/*
 		 * The IMMUTABLE flag can only be changed by the relevant
@@ -227,7 +227,7 @@ long vdfs4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		vdfs4_stop_transaction(sbi);
 
 unlock_inode_exit:
-		mutex_unlock(&inode->i_mutex);
+		inode_unlock(inode);
 		break;
 	case VDFS4_IOC_SET_DECODE_STATUS:
 		ret = -EFAULT;

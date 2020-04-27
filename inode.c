@@ -264,9 +264,9 @@ static loff_t vdfs4_llseek_dir(struct file *file, loff_t offset, int whence)
 {
 	struct inode *inode = file->f_mapping->host;
 
-	mutex_lock(&inode->i_mutex);
+	inode_lock(inode);
 	vdfs4_release_dir(inode, file);
-	mutex_unlock(&inode->i_mutex);
+	inode_unlock(inode);
 
 	return generic_file_llseek(file, offset, whence);
 }
@@ -2063,7 +2063,7 @@ static int vdfs4_file_open_init_compressed(struct inode *inode)
 	struct vdfs4_inode_info *inode_info = VDFS4_I(inode);
 
 	if (inode_info->fbc) {
-		mutex_lock(&inode->i_mutex);
+		inode_lock(inode);
 		if ((inode_info->fbc) &&
 		    (inode_info->fbc->compr_type == VDFS4_COMPR_UNDEF)) {
 			int retry_count = 0;
@@ -2075,7 +2075,7 @@ static int vdfs4_file_open_init_compressed(struct inode *inode)
 						retry_count);
 			} while (rc && (++retry_count < 3));
 		}
-		mutex_unlock(&inode->i_mutex);
+		inode_unlock(inode);
 	}
 	return rc;
 }
@@ -3099,7 +3099,7 @@ static long vdfs4_fallocate(struct file *file, int mode,
 	max_blocks = (ALIGN(new_size, sbi->block_size)
 		      >> sbi->block_size_shift) - lblk;
 
-	mutex_lock(&inode->i_mutex);
+	inode_lock(inode);
 	vdfs4_start_transaction(sbi);
 
 	if (!max_blocks)
@@ -3142,7 +3142,7 @@ out:
 	mark_inode_dirty(inode);
 
 	vdfs4_stop_transaction(sbi);
-	mutex_unlock(&inode->i_mutex);
+	inode_unlock(inode);
 	return ret;
 
 err_allocate:
@@ -3164,7 +3164,7 @@ err_reserve:
 	}
 	mutex_unlock(&i_info->truncate_mutex);
 	vdfs4_stop_transaction(sbi);
-	mutex_unlock(&inode->i_mutex);
+	inode_unlock(inode);
 	if (ret == -ENOSPC)
 		VDFS4_WARNING("fallocate: len over avail size(%s:%llu,%llu)\n",
 		      i_info->name, len,
