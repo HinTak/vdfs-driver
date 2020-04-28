@@ -2177,16 +2177,15 @@ static int vdfs4_rmdir(struct inode *dir, struct dentry *dentry)
  * @brief		Direct IO.
  * @param [in]	iocb	Pointer to io block
  * @param [in]	iov_iter	Pointer to io iter
- * @param [in]	offset	Offset
  * @return		Returns written size
  */
-static ssize_t vdfs4_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
-						loff_t offset)
+static ssize_t vdfs4_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 {
 	ssize_t rc, inode_new_size = 0;
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file->f_path.dentry->d_inode->i_mapping->host;
 	struct vdfs4_sb_info *sbi = VDFS4_SB(inode->i_sb);
+	loff_t offset = iocb->ki_pos;
 
 	VT_PREPARE_PARAM(vt_data);
 
