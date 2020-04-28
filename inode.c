@@ -2193,7 +2193,7 @@ static ssize_t vdfs4_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 		      inode, file, iocb->ki_pos, iter->count, AOPS_SYNC);
 	if (iov_iter_rw(iter))
 		vdfs4_start_transaction(sbi);
-	rc = blockdev_direct_IO(iocb, inode, iter, offset, vdfs4_get_block);
+	rc = blockdev_direct_IO(iocb, inode, iter, vdfs4_get_block);
 	if (!iov_iter_rw(iter))
 		goto exit;
 
