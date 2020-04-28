@@ -2987,7 +2987,7 @@ static const struct inode_operations vdfs4_dir_inode_operations = {
 	.mkdir		= vdfs4_mkdir,
 	.rmdir		= vdfs4_rmdir,
 	.mknod		= vdfs4_mknod,
-	.rename2	= vdfs4_rename2,
+	.rename		= vdfs4_rename2,
 	.setattr	= vdfs4_setattr,
 
 	.setxattr	= vdfs4_setxattr,
