@@ -2989,9 +2989,6 @@ static const struct inode_operations vdfs4_dir_inode_operations = {
 	.rename		= vdfs4_rename2,
 	.setattr	= vdfs4_setattr,
 
-	.setxattr	= vdfs4_setxattr,
-	.getxattr	= vdfs4_getxattr,
-	.removexattr	= vdfs4_removexattr,
 	.listxattr	= vdfs4_listxattr,
 #ifdef CONFIG_VDFS4_POSIX_ACL
 	.get_acl	= vdfs4_get_acl,
@@ -3008,9 +3005,6 @@ static const struct inode_operations vdfs4_symlink_inode_operations = {
 	.put_link	= page_put_link,
 	.setattr	= vdfs4_setattr,
 
-	.setxattr	= vdfs4_setxattr,
-	.getxattr	= vdfs4_getxattr,
-	.removexattr	= vdfs4_removexattr,
 	.listxattr	= vdfs4_listxattr,
 };
 
@@ -3405,10 +3399,7 @@ static const struct file_operations vdfs4_tuned_file_operations = {
 };
 const struct inode_operations vdfs4_special_inode_operations = {
 	.setattr	= vdfs4_setattr,
-	.setxattr	= vdfs4_setxattr,
-	.getxattr	= vdfs4_getxattr,
 	.listxattr	= vdfs4_listxattr,
-	.removexattr	= vdfs4_removexattr,
 #ifdef CONFIG_VDFS4_POSIX_ACL
 	.get_acl	= vdfs4_get_acl,
 	.set_acl	= vdfs4_set_acl,
@@ -3419,9 +3410,6 @@ const struct inode_operations vdfs4_special_inode_operations = {
  */
 static const struct inode_operations vdfs4_file_inode_operations = {
 	.setattr	= vdfs4_setattr,
-	.setxattr	= vdfs4_setxattr,
-	.getxattr	= vdfs4_getxattr,
-	.removexattr	= vdfs4_removexattr,
 	.listxattr	= vdfs4_listxattr,
 #ifdef CONFIG_VDFS4_POSIX_ACL
 	.get_acl	= vdfs4_get_acl,
