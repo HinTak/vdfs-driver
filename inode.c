@@ -880,7 +880,7 @@ update_on_disk_layout:
 		ret = blkdev_issue_discard(sbi->sb->s_bdev,
 			extent->first_block << sector_cnt_in_blk,
 			extent->block_count << sector_cnt_in_blk,
-			GFP_NOFS, BLKDEV_DISCARD_ZERO);
+			GFP_NOFS, BLKDEV_DISCARD_SECURE);
 		if (ret)
 			ret = blkdev_issue_zeroout(sbi->sb->s_bdev,
 				extent->first_block << sector_cnt_in_blk,
