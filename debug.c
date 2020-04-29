@@ -189,10 +189,10 @@ static int _initialize_debug_area(void *debug_area)
 
 static uint32_t _calc_crash_val(struct vdfs4_sb_info *sbi)
 {
-	struct timespec ts;
+	struct timespec64 ts;
 	u64 ret = 0;
 
-	getnstimeofday(&ts);
+	ktime_get_real_ts64(&ts);
 
 	if (!is_sbi_flag_set(sbi, IS_MOUNT_FINISHED))
 		ret = 10;	/* mount fail case */

@@ -1916,7 +1916,7 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	char bdev_name[BDEVNAME_SIZE];
 	struct vdfs4_layout_sb *l_sb = NULL;
 	struct vdfs4_extended_super_block *exsb = NULL;
-	struct timespec ts;
+	struct timespec64 ts;
 
 #ifdef CONFIG_VDFS4_PRINT_MOUNT_TIME
 	unsigned long mount_start = jiffies;
@@ -2186,7 +2186,7 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	}
 #endif
 
-	getnstimeofday(&ts);
+	ktime_get_real_ts64(&ts);
 	sbi->mount_time = ts.tv_sec;
 	atomic_set(&sbi->running_errcnt, 0);
 	VDFS4_NOTICE("mounted %s\n",  bdevname(sb->s_bdev, bdev_name));
