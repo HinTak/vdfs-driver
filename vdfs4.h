@@ -334,7 +334,7 @@ struct vdfs4_sb_info {
 	u8 log_erase_block_size;
 	u8 log_block_size;
 	char umount_time;
-	time_t mount_time;
+	time64_t mount_time;
 
 	atomic_t running_errcnt;
 
