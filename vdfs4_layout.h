@@ -39,7 +39,9 @@
 #define CRC_ENABLED 1
 #define CRC_DISABLED 0
 
+#ifndef SECTOR_SIZE
 #define SECTOR_SIZE		512
+#endif
 #define SECTOR_SIZE_SHIFT	9
 #define SECTOR_PER_PAGE		(PAGE_SIZE / SECTOR_SIZE)
 
