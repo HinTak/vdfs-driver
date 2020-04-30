@@ -32,6 +32,7 @@ extern void set_kpi_hw_error(char *prefix, char *msg);
 #include <linux/console.h>
 
 extern void console_forbid_async_printk(void);
+extern void  console_flush_messages(void);
 extern void console_permit_async_printk(void);
 
 #define VDFS4_PRE_DUMP()\
