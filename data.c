@@ -47,9 +47,8 @@
  * param [in]	err	With error or not.
  * @return	void
  */
-static void end_io_write(struct bio *bio, int err)
+static void end_io_write(struct bio *bio)
 {
-	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
 	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
 
 	do {
@@ -57,7 +56,7 @@ static void end_io_write(struct bio *bio, int err)
 
 		if (--bvec >= bio->bi_io_vec)
 			prefetchw(&bvec->bv_page->flags);
-		if (!uptodate) {
+		if (bio->bi_error) {
 			SetPageError(page);
 			if (page->mapping)
 				set_bit(AS_EIO, &page->mapping->flags);
@@ -73,12 +72,10 @@ static void end_io_write(struct bio *bio, int err)
 /**
  * @brief		Finalize IO writing.
  * param [in]	bio	BIO structure to be read.
- * param [in]	err	With error or not.
  * @return	void
  */
-static void read_end_io(struct bio *bio, int err)
+static void read_end_io(struct bio *bio)
 {
-	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
 	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
 	struct completion *wait = bio->bi_private;
 
@@ -88,7 +85,7 @@ static void read_end_io(struct bio *bio, int err)
 		if (--bvec >= bio->bi_io_vec)
 			prefetchw(&bvec->bv_page->flags);
 
-		if (uptodate) {
+		if (!bio->bi_error) {
 			SetPageUptodate(page);
 		} else {
 			ClearPageUptodate(page);
@@ -283,9 +280,8 @@ static int get_block_meta_wrapper(struct inode *inode, pgoff_t page_idx,
 	return ret;
 }
 
-static void table_end_IO(struct bio *bio, int err)
+static void table_end_IO(struct bio *bio)
 {
-	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
 	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
 
 	do {
@@ -293,7 +289,7 @@ static void table_end_IO(struct bio *bio, int err)
 
 		if (--bvec >= bio->bi_io_vec)
 			prefetchw(&bvec->bv_page->flags);
-		if (!uptodate)
+		if (bio->bi_error)
 			SetPageError(page);
 		unlock_page(page);
 	} while (bvec >= bio->bi_io_vec);
@@ -1075,9 +1071,8 @@ static int get_pages_from_mapping(struct vdfs4_sb_info *sbi,
 
 
 
-static void meta_end_IO(struct bio *bio, int err)
+static void meta_end_IO(struct bio *bio)
 {
-	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
 	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
 	struct vdfs4_sb_info *sbi =
 			bvec->bv_page->mapping->host->i_sb->s_fs_info;
@@ -1094,7 +1089,7 @@ static void meta_end_IO(struct bio *bio, int err)
 		if (--bvec >= bio->bi_io_vec)
 			prefetchw(&bvec->bv_page->flags);
 
-		if (!uptodate) {
+		if (bio->bi_error) {
 			SetPageError(page);
 			if (page->mapping)
 				set_bit(AS_EIO, &page->mapping->flags);
@@ -1103,7 +1098,7 @@ static void meta_end_IO(struct bio *bio, int err)
 		if (bio->bi_opf & WRITE) {
 			end_page_writeback(page);
 		} else {
-			if (uptodate)
+			if (!bio->bi_error)
 				SetPageUptodate(page);
 			unlock_page(page);
 		}
