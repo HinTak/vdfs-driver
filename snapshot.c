@@ -1029,7 +1029,7 @@ int vdfs4_update_translation_tables(struct vdfs4_sb_info *sbi)
 retry_basetable_write:
 		ret = vdfs4_table_IO(sbi, (char *)table + PAGE_SIZE,
 			table_size - PAGE_SIZE,
-			WRITE_FLUSH_FUA | REQ_META | REQ_PRIO, &s_iblock);
+			REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_PRIO, &s_iblock);
 		if (ret) {
 			if (--retry_count >= 0) {
 				VDFS4_WARNING("commit basetable failed. retry(%d)",
@@ -1042,7 +1042,7 @@ retry_basetable_write:
 
 retry_transtable_write:
 	ret = vdfs4_table_IO(sbi, table, PAGE_SIZE,
-			WRITE_FLUSH_FUA | REQ_META | REQ_PRIO, &iblock);
+			REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_PRIO, &iblock);
 	if (ret) {
 		if (--retry_count >= 0) {
 			VDFS4_WARNING("commit translation table failed. retry(%d)",

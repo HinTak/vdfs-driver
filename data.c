@@ -620,7 +620,7 @@ int vdfs4_write_page(struct vdfs4_sb_info *sbi,
 	if (is_sync)
 		bio->bi_private = &wait;
 
-	bio->bi_opf |= WRITE_FLUSH_FUA | REQ_META | REQ_PRIO;
+	bio->bi_opf |= REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_PRIO;
 	submit_bio(bio);
 	blk_finish_plug(&plug);
 	if (is_sync) {
@@ -1286,7 +1286,7 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 		       !bio_add_page(bio, page, PAGE_SIZE, 0)) {
 			if (bio) {
 				atomic_inc(&sbi->meta_bio_count);
-				bio->bi_opf |= WRITE_FUA | REQ_META | REQ_PRIO;
+				bio->bi_opf |= REQ_FUA | REQ_META | REQ_PRIO;
 				submit_bio(bio);
 			}
 			bio = allocate_new_request(sbi, block, pvec.nr - i);
@@ -1299,7 +1299,7 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 
 	if (bio) {
 		atomic_inc(&sbi->meta_bio_count);
-		bio->bi_opf |= WRITE_FUA | REQ_META | REQ_PRIO;
+		bio->bi_opf |= REQ_FUA | REQ_META | REQ_PRIO;
 		submit_bio(bio);
 	}
 
