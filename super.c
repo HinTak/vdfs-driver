@@ -381,15 +381,11 @@ static void vdfs4_delayed_prof_write(struct work_struct *work)
 				size = kfifo_out(&sbi->prof_fifo, &prof_data,
 							sizeof(prof_data));
 				if (size) {
-					mm_segment_t fs = get_fs();
-
-					set_fs(KERNEL_DS);
 					pos = sbi->prof_file->f_path.dentry->d_inode->i_size;
-					written = vfs_write(sbi->prof_file, (char *)&prof_data,
+					written = kernel_write(sbi->prof_file, (char *)&prof_data,
 								size, &pos);
 					if (written < 0)
 						VDFS4_ERR("cannot write to file err:%zd", written);
-					set_fs(fs);
 				}
 			} while (size);
 		}

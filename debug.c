@@ -519,19 +519,15 @@ int vdfs4_dump_to_disk(void *mapped_chunk, size_t chunk_length,
 	if (!IS_ERR(fd)) {
 		loff_t pos;
 		ssize_t written;
-		mm_segment_t fs;
 
 		pos = fd->f_path.dentry->d_inode->i_size;
-		fs = get_fs();
-		set_fs(KERNEL_DS);
 
-		written = vfs_write(fd, mapped_chunk, chunk_length, &pos);
+		written = kernel_write(fd, mapped_chunk, chunk_length, &pos);
 		if (written < 0) {
 			VDFS4_ERR("cannot write to file %s err:%zd",
 					path, written);
 			ret = (int)written;
 		}
-		set_fs(fs);
 		filp_close(fd, NULL);
 
 		VDFS4_ERR("dump the chunk to file %s", path);
