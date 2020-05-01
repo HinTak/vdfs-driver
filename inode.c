@@ -1388,7 +1388,9 @@ static int vdfs4_readpages(struct file *file, struct address_space *mapping,
 	int ret;
 
 	#define list_to_page(head) (list_entry((head)->prev, struct page, lru))
+#ifdef CONFIG_VDFS4_TRACE
 	struct page *page = list_to_page(pages);
+#endif
 
 	VT_PREPARE_PARAM(vt_data);
 	VT_AOPS_START(vt_data, vdfs_trace_aops_readpages,
@@ -3193,7 +3195,9 @@ static ssize_t vdfs4_file_write_iter(struct kiocb *iocb,
 				     struct iov_iter *iov_iter)
 {
 	ssize_t ret = 0;
+#ifdef CONFIG_VDFS4_TRACE
 	struct inode *inode = INODE(iocb);
+#endif
 
 	VT_PREPARE_PARAM(vt_data);
 	trace_vdfs4_file_write_iter(iocb, iov_iter);
