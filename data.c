@@ -2351,10 +2351,9 @@ alloc_new:
 		sector_t s_count = (sector_t)(bdev->bd_inode->i_size >>
 							SECTOR_SIZE_SHIFT);
 		sector_t first_sector = (boundary_block << (blkbits - 9));
-		unsigned nr_vecs = (unsigned)bio_get_nr_vecs(bdev);
-		unsigned s_nr_vecs = nr_vecs * SECTOR_PER_PAGE;
+		unsigned nr_vecs = BIO_MAX_PAGES;
 
-		if (first_sector + s_nr_vecs > s_count)
+		if (first_sector + BIO_MAX_PAGES * SECTOR_PER_PAGE > s_count)
 			nr_vecs = (s_count - first_sector) / SECTOR_PER_PAGE;
 
 		if (nr_vecs > 0)
