@@ -317,8 +317,9 @@ unlock_inode_exit:
 				}
 				kfree(pages);
 			}
-			copy_to_user((void *)arg, (void *)&ioc_file_info,
-				sizeof(struct vdfs4_ioc_file_info));
+			if (copy_to_user((void *)arg, (void *)&ioc_file_info,
+					sizeof(struct vdfs4_ioc_file_info)))
+				ret = -EFAULT;
 		} else {
 			ret = -EINVAL;
 		}
