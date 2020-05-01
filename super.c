@@ -1356,6 +1356,8 @@ static int load_meta_hashtable(struct super_block *sb)
 	/* Meta hashtable for R/O partition is placed in second base table */
 	ret = get_hashtable_size(sbi, table_start,
 				 &hashtable_size_in_bytes);
+	if (ret)
+		return ret;
 
 	hashtable = vdfs4_vmalloc((unsigned long int)(DIV_ROUND_UP(
 				   hashtable_size_in_bytes,
