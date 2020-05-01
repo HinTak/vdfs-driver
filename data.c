@@ -1250,7 +1250,7 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 	int ret, ret2;
 	unsigned int i = 0;
 
-	pagevec_init(&pvec, 0);
+	pagevec_init(&pvec);
 	blk_start_plug(&plug);
 
 	while (1) {
