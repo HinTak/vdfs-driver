@@ -1591,11 +1591,11 @@ static int __get_chunk_extent(struct vdfs4_inode_info *inode_i,
 		struct vdfs4_sb_info *sbi = VDFS4_SB(inode_i->vfs_inode.i_sb);
 
 		VDFS4_ERR("Wrong magic in compressed extent: #%ld, "
-				" chunk idx:%lu, ext offset:%lld, addr:0x%x "
+				" chunk idx:%lu, ext offset:%lld, addr:0x%lx "
 				" (0x%02X 0x%02X, %s)",
 			   inode_i->vfs_inode.i_ino, chunk_idx,
 			   (long long)extent_offset,
-			   (unsigned int)(raw_extent->magic),
+			   (unsigned long int)(raw_extent->magic),
 			   raw_extent->magic[0], raw_extent->magic[1],
 			   VDFS4_COMPR_EXT_MAGIC);
 #ifdef VDFS4_DEBUG_DUMP
