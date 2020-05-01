@@ -966,7 +966,7 @@ static void __dump_tagged_pages(struct address_space *mapping, unsigned tag)
 	struct radix_tree_iter iter;
 	void **slot;
 
-	radix_tree_for_each_tagged(slot, &mapping->page_tree, &iter, 0, tag) {
+	radix_tree_for_each_tagged(slot, &mapping->i_pages, &iter, 0, tag) {
 		struct page *page = *slot;
 
 		VDFS4_ERR("mapping %p index %ld page %p",
@@ -981,9 +981,9 @@ static void __dump_tagged_pages(struct address_space *mapping, unsigned tag)
 
 static void dump_tagged_pages(struct address_space *mapping, unsigned tag)
 {
-	spin_lock_irq(&mapping->tree_lock);
+	xa_lock_irq(&mapping->i_pages);
 	__dump_tagged_pages(mapping, tag);
-	spin_unlock_irq(&mapping->tree_lock);
+	xa_unlock_irq(&mapping->i_pages);
 }
 
 static struct address_space *vdfs4_next_mapping(struct vdfs4_sb_info *sbi,
@@ -1315,7 +1315,7 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 			ret = ret2;
 		}
 
-		spin_lock_irq(&current_mapping->tree_lock);
+		xa_lock_irq(&current_mapping->i_pages);
 		if (mapping_tagged(current_mapping, PAGECACHE_TAG_DIRTY)) {
 			VDFS4_ERR("inode #%ld has dirty tag set",
 					current_mapping->host->i_ino);
@@ -1330,7 +1330,7 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 					    PAGECACHE_TAG_WRITEBACK);
 			ret = -EFAULT;
 		}
-		spin_unlock_irq(&current_mapping->tree_lock);
+		xa_unlock_irq(&current_mapping->i_pages);
 	}
 
 	if (atomic_read(&sbi->meta_bio_count)) {
