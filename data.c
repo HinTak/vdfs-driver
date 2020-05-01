@@ -2275,8 +2275,7 @@ int vdfs4_mpage_writepage(struct page *page,
 						(block_in_file - extent.iblock);
 					clear_buffer_delay(bh);
 				}
-				unmap_underlying_metadata(bh->b_bdev,
-					bh->b_blocknr);
+				clean_bdev_bh_alias(bh);
 			}
 		} else {
 			/*
@@ -2289,8 +2288,7 @@ int vdfs4_mpage_writepage(struct page *page,
 					goto confused;
 				}
 				if (buffer_new(bh))
-					unmap_underlying_metadata(bh->b_bdev,
-							bh->b_blocknr);
+					clean_bdev_bh_alias(bh);
 			}
 		}
 		mutex_unlock(&inode_info->truncate_mutex);
@@ -2312,8 +2310,7 @@ int vdfs4_mpage_writepage(struct page *page,
 		if (vdfs4_get_block(inode, block_in_file, bh, 1))
 			goto confused;
 		if (buffer_new(bh))
-			unmap_underlying_metadata(bh->b_bdev,
-					bh->b_blocknr);
+			clean_bdev_bh_alias(bh);
 
 	}
 
