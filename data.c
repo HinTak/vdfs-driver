@@ -56,7 +56,7 @@ static void end_io_write(struct bio *bio)
 
 		if (--bvec >= bio->bi_io_vec)
 			prefetchw(&bvec->bv_page->flags);
-		if (bio->bi_error) {
+		if (bio->bi_status) {
 			SetPageError(page);
 			if (page->mapping)
 				set_bit(AS_EIO, &page->mapping->flags);
@@ -85,7 +85,7 @@ static void read_end_io(struct bio *bio)
 		if (--bvec >= bio->bi_io_vec)
 			prefetchw(&bvec->bv_page->flags);
 
-		if (!bio->bi_error) {
+		if (!bio->bi_status) {
 			SetPageUptodate(page);
 		} else {
 			ClearPageUptodate(page);
@@ -289,7 +289,7 @@ static void table_end_IO(struct bio *bio)
 
 		if (--bvec >= bio->bi_io_vec)
 			prefetchw(&bvec->bv_page->flags);
-		if (bio->bi_error)
+		if (bio->bi_status)
 			SetPageError(page);
 		unlock_page(page);
 	} while (bvec >= bio->bi_io_vec);
@@ -1089,7 +1089,7 @@ static void meta_end_IO(struct bio *bio)
 		if (--bvec >= bio->bi_io_vec)
 			prefetchw(&bvec->bv_page->flags);
 
-		if (bio->bi_error) {
+		if (bio->bi_status) {
 			SetPageError(page);
 			if (page->mapping)
 				set_bit(AS_EIO, &page->mapping->flags);
@@ -1098,7 +1098,7 @@ static void meta_end_IO(struct bio *bio)
 		if (bio->bi_opf & WRITE) {
 			end_page_writeback(page);
 		} else {
-			if (!bio->bi_error)
+			if (!bio->bi_status)
 				SetPageUptodate(page);
 			unlock_page(page);
 		}
