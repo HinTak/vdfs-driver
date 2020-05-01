@@ -89,7 +89,7 @@ static int _free_debug_area(struct page **debug_pages,
 			__le64 page_count, void *debug_area)
 {
 	__le64 count;
-	sector_t  debug_page_count;
+	/* sector_t  debug_page_count; *//* unused */
 
 	if (!debug_pages || !debug_area)
 		return -EINVAL;
@@ -299,6 +299,7 @@ static int _get_err_count(void *debug_area, uint32_t *err_count)
 	return 0;
 }
 
+#ifndef CONFIG_VDFS4_DEBUG
 /**
  * @brief			get vdfs crash_val
  * @param [in] debug_area	vmapped debug area
@@ -323,6 +324,7 @@ static int _get_crash_val(void *debug_area, uint32_t *crash_val)
 	*crash_val = debug_map->dbg_info.crash_val;
 	return 0;
 }
+#endif
 
 /**
  * @brief			core function for printing volume info in debug area
@@ -459,7 +461,9 @@ int vdfs4_debugarea_check(struct vdfs4_sb_info *sbi)
 	unsigned int result;
 	int page_count = 0;
 	void *debug_area = NULL;
+#ifndef CONFIG_VDFS4_DEBUG
 	int crash_val = 0;
+#endif
 
 	if (!sbi)
 		return -EINVAL;

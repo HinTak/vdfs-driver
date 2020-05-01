@@ -421,7 +421,7 @@ read_basetable:
 
 	checked = validate_base_table(sbi, table);
 	if (!checked) {
-		struct page *pg_null = NULL;
+		/* struct page *pg_null = NULL; *//* unused */
 		if (!opposite) {
 			/* try to use opposite base_table. */
 			opposite = 1;

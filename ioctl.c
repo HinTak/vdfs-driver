@@ -98,6 +98,7 @@ static __u8 vdfs4_get_type_status(struct vdfs4_inode_info *inode_i)
 	return test_bit(VDFS4_COMPRESSED_FILE, &inode_i->flags) ? 1 : 0;
 }
 
+#ifdef CONFIG_VDFS4_DEBUG
 static __u32 vdfs4_get_compr_type(struct vdfs4_inode_info *inode_i)
 {
 	return inode_i->fbc == NULL ? VDFS4_COMPR_UNDEF :
@@ -109,6 +110,7 @@ static __u32 vdfs4_get_auth_status(struct vdfs4_inode_info *inode_i)
 	return inode_i->flags & ((1 << VDFS4_AUTH_FILE) |
 			(1 << VDFS4_READ_ONLY_AUTH));
 }
+#endif
 
 #if defined(CONFIG_VDFS4_DEBUG) || defined(CONFIG_VDFS4_PERF)
 static u32 vdfs4_get_extent_count(struct inode *inode)

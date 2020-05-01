@@ -3219,7 +3219,9 @@ static ssize_t vdfs4_file_write_iter(struct kiocb *iocb,
 static ssize_t vdfs4_file_read_iter(struct kiocb *iocb,
 				    struct iov_iter *iov_iter)
 {
+#if defined(CONFIG_VDFS4_AUTHENTICATION) || defined(CONFIG_VDFS4_DEBUG) || defined(CONFIG_VDFS4_TRACE)
 	struct inode *inode = INODE(iocb);
+#endif
 	ssize_t ret;
 
 	VT_PREPARE_PARAM(vt_data);

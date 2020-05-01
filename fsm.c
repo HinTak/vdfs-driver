@@ -893,10 +893,10 @@ static int fsm_free_block_chunk(struct vdfs4_fsm_info *fsm,
 	__u64 block_offset, __u32 length_in_blocks, int fsm_flags)
 {
 	int err = 0;
-	unsigned int i;
+	/* unsigned int i; *//* unused */
 	__u64 start_page = block_offset;
 	__u64 end_page	= block_offset + length_in_blocks, page_index;
-	__u64 total_size = fsm->sbi->volume_blocks_count * fsm->sbi->block_size;
+	/* __u64 total_size = fsm->sbi->volume_blocks_count * fsm->sbi->block_size; *//* unused */
 	/* calculate start block */
 	do_div(start_page, VDFS4_BIT_BLKSIZE(fsm->sbi->block_size,
 			FSM_BMP_MAGIC_LEN));
