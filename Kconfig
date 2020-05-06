@@ -1,0 +1,134 @@
+config VDFS4_FS
+	tristate "Samsung VDFS4 file system"
+	depends on BLOCK
+	select NLS
+	select CRC32
+	default n
+	help
+	  If you say Y here, you will be able to mount format
+	  VDFS4-formatted hard drive partitions with full read-write access.
+
+	  To compile this code as a module, choose M here: the module will be
+	  called vdfs4.
+
+	  If unsure, say N.
+
+config VDFS4_POSIX_ACL
+	bool "VDFS4 Access Control Lists"
+	depends on VDFS4_FS
+	select FS_POSIX_ACL
+	help
+	  POSIX Access Control Lists (ACLs) support permissions for users and
+	  groups beyond the owner/group/world scheme. See man 5 acl for details.
+
+config VDFS4_DEBUG
+	bool "VDFS4 debug support"
+	depends on VDFS4_FS
+	default n
+	help
+	  If you say Y here,
+	     you can use the 'debug' mount option to enable debugging output.
+	  If unsure, say N.
+	  (unchecking VDFS4 debug&perf support means release mode)
+
+config VDFS4_PERF
+	bool "VDFS4 perf support"
+	depends on VDFS4_FS && !VDFS4_DEBUG
+	default n
+	help
+	  If you say Y here,
+	     you can use some vdfs4 features without effect performance.
+	  If unsure, say N.
+	  (unchecking VDFS4 debug&perf support means release mode)
+
+config VDFS4_PANIC_ON_ERROR
+	bool "force kernel panic on fatal errors"
+	depends on VDFS4_FS
+	depends on VDFS4_DEBUG
+	default y
+	help
+	  If you say Y here first disk error or metadata corruption will cause
+	  kernel panic. This mode is useful for testing.
+
+	  Otherwise filesystem will be automatically remounted into read-only
+	  mode for preventing further corruption, after that it hopefully can
+	  be unmounted without crashing whole kernel. All unwritten data will
+	  be lost.
+
+config VDFS4_META_SANITY_CHECK
+	bool "VDFS4 metadata sanity check"
+	depends on VDFS4_FS
+	help
+	  This feature adds additional checks for VDFS4 metadata,
+	  to find metadata corruption on early stage, and prevent
+	  writing incorrect data to flash.
+	  Enable CRC check for metadata, as well.
+
+	  If unsure, say N.
+
+config VDFS4_HW_DECOMPRESS_SUPPORT
+	bool "VDFS4 H/W decompressor support"
+	depends on HW_DECOMPRESSOR
+	depends on HW_DECOMP_BLK_MMC_SUBSYSTEM
+	depends on VDFS4_FS
+	depends on MMC
+	help
+	  Use HW API to decompress user data from compressed files.
+	  Utilize hardware decompressor to decompress packed user data from
+	  compressed vdfs files.
+	  The hardware decompressor is embedded into the MMC layer.
+
+config VDFS4_AUTHENTICATION
+	bool "VDFS4 Authentication"
+	depends on VDFS4_FS
+	select MPILIB
+	select VDFS4_META_SANITY_CHECK
+	default y
+	help
+	  Protect the vdfs4 superblock, meta, file-based meta and compressed
+	  chunks by digital signature. The VDFS4 uses several algorithms to
+	  calculate the digital signatures;
+	  If the option is set, bnode & exsb meta modification is detected for
+	  non dncs partition.
+	  If the option is set only authenticated binary can be run. The vdfs4
+	  checks for inode flag, if the flag is set it allows to do mmap with
+	  VM_EXEC bit set and do not clear VM_MAYEXEC on vma
+
+config VDFS4_DEBUG_AUTHENTICAION
+	depends on VDFS4_AUTHENTICATION
+	bool "Do not return an error if authenticaion is failed."
+	help
+	default n
+	  if enable - if authentication is enabled do not return an error
+	  and print error message. Use public key of "debug, perf".
+	  if disable - if return an error if authenticaion is failed. Use
+	  public key of "product"
+
+config VDFS4_ALLOW_LEGACY_SIGN
+	depends on VDFS4_AUTHENTICATION
+	bool "Allow mounting of partitions with RSA1024 signature"
+	default y
+
+config VDFS4_SQUEEZE
+	depends on VDFS4_FS
+	bool "VDFS4 Squeeze"
+	default n
+
+config VDFS4_SQUEEZE_PROFILING
+	depends on VDFS4_SQUEEZE
+	bool "VDFS4 Squeeze - Perform profiling"
+	default n
+
+config VDFS4_SQUEEZE_PROFILING_PARTITION
+	depends on VDFS4_SQUEEZE_PROFILING
+	string "Profiling partition"
+	default "mmcblk0p18"
+
+config VDFS4_TRACE
+	depends on VDFS4_FS
+	depends on (VDFS4_DEBUG || VDFS4_PERF)
+	bool "VDFS4 IO tracer"
+	default n
+	help
+	  This is an option for use by developer.
+	  This record each i/o requirement of fs layer and dump.
