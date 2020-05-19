@@ -1389,16 +1389,18 @@ int vdfs4__read(struct inode *inode, int type, struct page **pages,
 		}
 
 		if (last_block + blocks_per_page != block) {
-			unsigned max_pages_num = min_t(unsigned,
-					(pages_count - count), (blocks_num - block));
 			if (bio)
 				{
 					bio->bi_opf |= bio_flags;
 					submit_bio(bio);
 				}
 again:
+			{
+			unsigned max_pages_num = min_t(unsigned,
+					(pages_count - count), (blocks_num - block));
 			bio = allocate_new_request(sbi, block,
 					max_pages_num);
+			}
 			if (!bio) {
 				ret = -EIO;
 				for (; count < pages_count; count++)
