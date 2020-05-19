@@ -1390,10 +1390,10 @@ int vdfs4__read(struct inode *inode, int type, struct page **pages,
 
 		if (last_block + blocks_per_page != block) {
 			if (bio)
-				{
-					bio->bi_opf |= bio_flags;
-					submit_bio(bio);
-				}
+			{
+				bio->bi_opf |= bio_flags;
+				submit_bio(bio);
+			}
 again:
 			{
 			unsigned max_pages_num = min_t(unsigned,
@@ -1411,10 +1411,8 @@ again:
 
 		size = bio_add_page(bio, page, PAGE_SIZE, 0);
 		if (size < (int)PAGE_SIZE) {
-		{
 			bio->bi_opf |= bio_flags;
 			submit_bio(bio);
-		}
 			bio = NULL;
 			goto again;
 		}
