@@ -581,8 +581,10 @@ static int vdfs4_dump_to_disk_all(struct vdfs4_sb_info *sbi,
 
 	/* 4. kernel log dump */
 	VDFS4_ERR("kernel log dump start\n");
+#ifndef MODULE
 	vdfs4_dump_to_disk((void *)log_buf_addr_get(), log_buf_len_get(),
 				"vdfs_kernellog.dump");
+#endif
 	return 0;
 }
 
