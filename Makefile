@@ -49,6 +49,8 @@ vdfs4-y	:= btree.o bnode.o cattree.o file.o inode.o \
 		   decompress.o authentication.o \
 		   debug.o
 
+vdfs4-y += samsung-console-specific.o
+
 vdfs4-$(CONFIG_VDFS4_TRACE) += vdfs_trace.o
 vdfs4-$(CONFIG_VDFS4_LOCK_TRACE) += lock_trace.o
 
