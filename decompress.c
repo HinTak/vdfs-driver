@@ -78,7 +78,11 @@ static void print_uncomp_err_dump_header(char *name, int name_len)
 			task_pid_nr(current));
 	VDFS4_ERR("--------------------------------------------------");
 	VDFS4_ERR("== VDFS4 Debugger - %15s ===== Core : %2d ===="
+#ifdef CONFIG_THREAD_INFO_IN_TASK
 			, VDFS4_VERSION, current->cpu);
+#else
+			, VDFS4_VERSION, current_thread_info()->cpu);
+#endif
 	VDFS4_ERR("--------------------------------------------------");
 	VDFS4_ERR("Source image name : %.*s", name_len, name);
 	VDFS4_ERR("--------------------------------------------------");
