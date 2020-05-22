@@ -71,7 +71,7 @@ static int  __get_checksum_for_bnode(void *bnode_data,
 	if (is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN))
 		return 1;
 
-#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
+#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICATION)
 	if (!sbi->raw_meta_hashtable) {
 		/* suppress warning log */
 		/* VDFS4_WARNING("No meta hashtable - skip to get checksum for bnode\n"); */
@@ -100,7 +100,7 @@ static int  __get_checksum_for_bnode(void *bnode_data,
 	crc_on_hashtable = vdfs4_get_meta_hashtable(sbi, ino);
 
 	if (crc_on_bnode != crc_on_hashtable[index]) {
-#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
+#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICATION)
 		/* suppress warning log */
 		/* VDFS4_WARNING("wrong bnode hash bnode:%x hashtable:%x\n",
 		      crc_on_bnode, crc_on_hashtable[index]); */

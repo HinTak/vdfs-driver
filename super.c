@@ -733,7 +733,7 @@ static int vdfs4_verify_sb(struct vdfs4_super_block *esb, char *str_sb_type,
 		if (sign_length <= 0) {
 			VDFS4_ERR("Cannot check signature. Bad superblock"
 				" or unknown signature type %d", type);
-#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 			return -EINVAL;
 #endif
 		}
@@ -741,7 +741,7 @@ static int vdfs4_verify_sb(struct vdfs4_super_block *esb, char *str_sb_type,
 		if (!rsa_key) {
 			VDFS4_ERR("Cannot check signature."
 				" No matching public key found");
-#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 			return -EINVAL;
 #endif
 		}
@@ -755,7 +755,7 @@ static int vdfs4_verify_sb(struct vdfs4_super_block *esb, char *str_sb_type,
 		(unsigned char *)esb, sizeof(*esb) - sizeof(esb->checksum)
 			- sign_length, hash_ptr, rsa_key)) {
 			VDFS4_ERR("bad superblock hash!!!");
-#ifndef	CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifndef	CONFIG_VDFS4_DEBUG_AUTHENTICATION
 			return -EINVAL;
 #endif
 		}
@@ -1169,7 +1169,7 @@ static int vdfs4_verify_exsb(struct vdfs4_sb_info *sbi,
 	}
 
 	if (checksum != sb->exsb_checksum) {
-#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
+#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICATION)
 		VDFS4_NOTICE("extended superblock crc is updated - (org_sb:0x%x,"
 			"org:%x,calc:%x)\n", sb->exsb_checksum, exsb->checksum, checksum);
 #else
@@ -2019,7 +2019,7 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	if (!is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN)) {
 		ret = load_meta_hashtable(sb);
 		if (ret) {
-#if !defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
+#if !defined(CONFIG_VDFS4_DEBUG_AUTHENTICATION)
 			VDFS4_ERR("meta hashtable read error (%s,ret:%d)\n",
 				  bdevname(sb->s_bdev, bdev_name), ret);
 			goto vdfs4_extended_sb_read_error;

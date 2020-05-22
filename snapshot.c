@@ -160,7 +160,7 @@ __u64 validate_base_table(struct vdfs4_sb_info *sbi,
 	}
 
 	if (checksum != checksum_on_sb) {
-#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
+#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICATION)
 		VDFS4_NOTICE("basetable crc is updated.(org_sb:%#x,org:%#x,calc:%#x)",
 			checksum_on_sb, checksum_on_basetable, checksum);
 #else

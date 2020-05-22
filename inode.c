@@ -1302,7 +1302,7 @@ static int current_reads_only_authenticated(struct inode *inode, bool mm_locked)
 			sizeof(VDFS4_SB_SIGNATURE) - 1) &&
 			is_vdfs4_inode_flag_set(caller, VDFS4_READ_ONLY_AUTH);
 		if (ret) {
-#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 			if (!VDFS4_I(inode)->informed_about_fail_read) {
 #endif
 			unsigned int len;
@@ -1330,7 +1330,7 @@ static int current_reads_only_authenticated(struct inode *inode, bool mm_locked)
 			}
 			kfree(buffer);
 		}
-#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 		}
 #endif
 	}
@@ -3228,12 +3228,12 @@ static ssize_t vdfs4_file_read_iter(struct kiocb *iocb,
 
 #ifdef CONFIG_VDFS4_AUTHENTICATION
 	if (current_reads_only_authenticated(inode, false)) {
-#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 		if (!VDFS4_I(inode)->informed_about_fail_read)
 #endif
 			VDFS4_ERR("read is not permited: %lu:%s",
 				inode->i_ino, VDFS4_I(inode)->name);
-#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 		VDFS4_I(inode)->informed_about_fail_read = 1;
 #else
 		return -EPERM;
@@ -3272,7 +3272,7 @@ static ssize_t vdfs4_file_splice_read(struct file *in, loff_t *ppos,
 		VDFS4_ERR("read is not permited:  %lu:%s",
 			  in->f_mapping->host->i_ino,
 			  VDFS4_I(in->f_mapping->host)->name);
-#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 		return -EPERM;
 #endif
 	}
@@ -3297,7 +3297,7 @@ static int check_execution_available(struct inode *inode,
 
 	if (!is_vdfs4_inode_flag_set(inode, VDFS4_AUTH_FILE)) {
 		if (vma->vm_flags & VM_EXEC) {
-#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 			if (!VDFS4_I(inode)->informed_about_fail_read) {
 				VDFS4_I(inode)->informed_about_fail_read = 1;
 				VDFS4_SECURITY_ERR("Security violation detected [task:%s(%d)]."
@@ -3324,7 +3324,7 @@ static int check_execution_available(struct inode *inode,
 	}
 
 	if (current_reads_only_authenticated(inode, true))
-#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifndef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 		return -EPERM;
 #else
 		return 0;
@@ -3928,7 +3928,7 @@ struct inode *vdfs4_get_inode_from_record(struct vdfs4_cattree_record *record,
 		VDFS4_I(inode)->parent_id = le64_to_cpu(key->parent_id);
 	}
 
-#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 	VDFS4_I(inode)->informed_about_fail_read = 0;
 #endif
 
@@ -4127,7 +4127,7 @@ static int vdfs4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	dir->i_mtime = current_time(dir);
 	mark_inode_dirty(dir);
 	d_instantiate(dentry, inode);
-#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 	VDFS4_I(inode)->informed_about_fail_read = 0;
 #endif
 	unlock_new_inode(inode);

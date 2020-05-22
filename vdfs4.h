@@ -606,7 +606,7 @@ struct vdfs4_inode_info {
 
 	/** difference between file_open() and file_release() calls */
 	atomic_t open_count;
-#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICAION
+#ifdef CONFIG_VDFS4_DEBUG_AUTHENTICATION
 	int informed_about_fail_read;
 #endif
 #ifdef CONFIG_VDFS4_SQUEEZE
