@@ -524,8 +524,11 @@ struct vdfs4_extended_super_block {
 	/** Write statistics */
 /*688*/	__le64			kbytes_written;
 
+        /** Meta HashTable extent */
+/*690*/ struct vdfs4_extent     meta_hashtable_area;
+
 	/** Reserved */
-/*68C*/	__u8			reserved[876];
+/*6A0*/	__u8			reserved[860];
 
 	/** Extended superblock checksum */
 /*9FC*/	__le32			checksum;

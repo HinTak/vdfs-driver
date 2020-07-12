@@ -667,9 +667,8 @@ static int vdfs4_unlink(struct inode *dir, struct dentry *dentry)
 		goto exit_inc_nlink;
 	ret = __vdfs4_write_inode(sbi, inode);
 	if (ret) {
-		vdfs4_fatal_error(sbi, "fail to update orphan list %d", ret);
-		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_UNLINK,
-			dir->i_ino, inode->i_ino, "fail update orphan", NULL, 0);
+		vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_INODE_UNLINK,
+			inode->i_ino, "fail to update orphan list %d", ret);
 		goto exit_inc_nlink;
 	}
 keep:
@@ -1126,7 +1125,9 @@ done:
 	return 0;
 exit:
 	if (err && create && (fsm_flags & VDFS4_FSM_ALLOC_DELAYED))
-		vdfs4_fatal_error(sbi, "delayed allocation failed for "
+		vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_DELAYED_ALLOCATION,
+				inode->i_ino,
+				"delayed allocation failed for "
 				"inode #%lu: %d", inode->i_ino, err);
 	return err;
 }
@@ -3065,6 +3066,7 @@ exit:
 	return ret;
 }
 
+#ifdef CONFIG_VDFS4_FALLOCATE
 static long vdfs4_fallocate(struct file *file, int mode,
 			    loff_t offset, loff_t len)
 {
@@ -3174,6 +3176,7 @@ err_reserve:
 			  ret, i_info->name, offset, len);
 	return ret;
 }
+#endif
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -3309,8 +3312,8 @@ static int check_execution_available(struct inode *inode,
 			if (!VDFS4_I(inode)->informed_about_fail_read) {
 				VDFS4_I(inode)->informed_about_fail_read = 1;
 				VDFS4_SECURITY_ERR("Security violation detected [task:%s(%d)]."
-						" Try to execute non-auth file %s(%lu).\n"
-						" As debug/perf image is used, the execution will be PERMITTED.\n",
+						" %s(%lu)."
+						" but execution is ALLOWED - development image.\n",
 						current->comm,
 						current->pid,
 						VDFS4_I(inode)->name,
@@ -3319,7 +3322,7 @@ static int check_execution_available(struct inode *inode,
 		}
 #else
 			VDFS4_SECURITY_ERR("Security violation detected [task:%s(%d)]."
-					" Try to execute non-auth file %s(%lu).\n",
+					" Try to execute non-auth file : %s(%lu).\n",
 					current->comm,
 					current->pid,
 					VDFS4_I(inode)->name,
@@ -3388,7 +3391,9 @@ static const struct file_operations vdfs4_file_operations = {
 #ifdef CONFIG_COMPAT
 	.compat_ioctl	= vdfs4_compat_ioctl,
 #endif
+#ifdef CONFIG_VDFS4_FALLOCATE
 	.fallocate	= vdfs4_fallocate,
+#endif
 };
 
 static const struct file_operations vdfs4_tuned_file_operations = {
@@ -3490,15 +3495,20 @@ static int vdfs4_fill_inode(struct inode *inode,
 static u32 calc_compext_table_crc(void *data, int offset, size_t table_len)
 {
 	struct vdfs4_comp_file_descr *descr = NULL;
-	void *tmp_descr;
+	void *compext_table;
 	u32 crc = 0, stored_crc;
 
-	tmp_descr = ((char *)data + offset + table_len - sizeof(*descr));
-	descr = tmp_descr;
-	stored_crc = descr->crc;
+	compext_table = kmalloc(table_len, GFP_NOFS);
+	if (!compext_table)
+		return -ENOMEM;
+
+	memcpy(compext_table, (char *)data + offset, table_len);
+
+	descr = (void *)((char *)compext_table + table_len - sizeof(*descr));
 	descr->crc = 0;
-	crc = crc32(crc, (char *)data + offset, table_len);
-	descr->crc = stored_crc;
+	crc = crc32(crc, compext_table, table_len);
+	kfree(compext_table);
+
 	return crc;
 }
 
@@ -4178,9 +4188,8 @@ int __vdfs4_write_inode(struct vdfs4_sb_info *sbi, struct inode *inode)
 				strlen(VDFS4_I(inode)->name),
 				VDFS4_BNODE_MODE_RW);
 	if (IS_ERR(record)) {
-		vdfs4_fatal_error(sbi, "fail to update inode %lu", inode->i_ino);
-		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_WRITE,
-				inode->i_ino, 0, "fail update inode", NULL, 0);
+		vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_INODE_WRITE,
+			inode->i_ino, "fail to update inode %lu", inode->i_ino);
 		return PTR_ERR(record);
 	}
 	vdfs4_fill_cattree_value(inode, record->val);

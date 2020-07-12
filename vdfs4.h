@@ -38,6 +38,7 @@
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
 #include <linux/kfifo.h>
+#include <linux/delay.h>
 
 #include "vdfs4_layout.h"
 #include "btree.h"
@@ -198,6 +199,10 @@ extern unsigned int cattree_prealloc;
 #define VDFS4_META_REREAD	2
 #define VDFS4_META_REREAD_BNODE 2
 
+/* Virtual Memory Api retry configurations */
+#define VDFS4_VMEM_RETRY_CNT		2
+#define VDFS4_VMEM_RETRY_INTERVAL	10 /* ms */
+
 /**
  * @brief		Compare two 64 bit values
  * @param [in]	b	first value
@@ -227,32 +232,60 @@ static inline int cmp_2_le64(__le64 a, __le64 b)
 #define VDFS4_IOC_GET_FILE_INFORMATION	\
 			_IOR('M', 1, struct vdfs4_ioc_file_info *)
 
-#define vdfs4_vmalloc(...) ({				\
-	unsigned noio_flags = memalloc_noio_save();	\
-	void *ret = vmalloc(__VA_ARGS__);		\
-	memalloc_noio_restore(noio_flags);		\
-	ret;						\
+#define vdfs4_vmalloc(...) ({					\
+	unsigned noio_flags = memalloc_noio_save();		\
+	void *ret = vmalloc(__VA_ARGS__);			\
+	int retry = VDFS4_VMEM_RETRY_CNT;			\
+	while (unlikely(!ret) && retry--) {			\
+		VDFS4_WARNING("NoMem(%s():%d, %d):vmalloc\n",	\
+			      __func__, __LINE__, retry);	\
+		msleep(VDFS4_VMEM_RETRY_INTERVAL);		\
+		ret = vmalloc(__VA_ARGS__);			\
+	}							\
+	memalloc_noio_restore(noio_flags);			\
+	ret;							\
 })
 
-#define vdfs4_vzalloc(...) ({				\
-	unsigned noio_flags = memalloc_noio_save();	\
-	void *ret = vzalloc(__VA_ARGS__);		\
-	memalloc_noio_restore(noio_flags);		\
-	ret;						\
+#define vdfs4_vzalloc(...) ({					\
+	unsigned noio_flags = memalloc_noio_save();		\
+	void *ret = vzalloc(__VA_ARGS__);			\
+	int retry = VDFS4_VMEM_RETRY_CNT;			\
+	while (unlikely(!ret) && retry--) {			\
+		VDFS4_WARNING("NoMem(%s():%d, %d):vzalloc\n",	\
+			      __func__, __LINE__, retry);	\
+		msleep(VDFS4_VMEM_RETRY_INTERVAL);		\
+		ret = vzalloc(__VA_ARGS__);			\
+	}							\
+	memalloc_noio_restore(noio_flags);			\
+	ret;							\
 })
 
-#define vdfs4_vmap(...) ({				\
-	unsigned noio_flags = memalloc_noio_save();	\
-	void *ret = vmap(__VA_ARGS__);			\
-	memalloc_noio_restore(noio_flags);		\
-	ret;						\
+#define vdfs4_vmap(...) ({					\
+	unsigned noio_flags = memalloc_noio_save();		\
+	void *ret = vmap(__VA_ARGS__);				\
+	int retry = VDFS4_VMEM_RETRY_CNT;			\
+	while (unlikely(!ret) && retry--) {			\
+		VDFS4_WARNING("NoMem(%s():%d, %d):vmap\n",	\
+			      __func__, __LINE__, retry);	\
+		msleep(VDFS4_VMEM_RETRY_INTERVAL);		\
+		ret = vmap(__VA_ARGS__);			\
+	}							\
+	memalloc_noio_restore(noio_flags);			\
+	ret;							\
 })
 
 #define vdfs4_vm_map_ram(...) ({				\
-	unsigned noio_flags = memalloc_noio_save();	\
-	void *ret = vm_map_ram(__VA_ARGS__);		\
-	memalloc_noio_restore(noio_flags);		\
-	ret;						\
+	unsigned noio_flags = memalloc_noio_save();		\
+	void *ret = vm_map_ram(__VA_ARGS__);			\
+	int retry = VDFS4_VMEM_RETRY_CNT;			\
+	while (unlikely(!ret) && retry--) {			\
+		VDFS4_WARNING("NoMem(%s():%d, %d):vm_map\n",	\
+			      __func__, __LINE__, retry);	\
+		msleep(VDFS4_VMEM_RETRY_INTERVAL);		\
+		ret = vm_map_ram(__VA_ARGS__);			\
+	}							\
+	memalloc_noio_restore(noio_flags);			\
+	ret;							\
 })
 
 struct packtrees_list {
@@ -735,8 +768,9 @@ int vdfs4_log_error(struct vdfs4_sb_info *sbi, unsigned int,
  */
 #define VDFS4_LOG_ERROR(sbi, err) vdfs4_log_error(sbi, __LINE__, __func__, err)
 
-void __printf(2, 3)
-vdfs4_fatal_error(struct vdfs4_sb_info *sbi, const char *fmt, ...);
+void __printf(4, 5)
+vdfs4_fatal_error(struct vdfs4_sb_info *sbi, unsigned int err_type,
+			unsigned long i_ino, const char *fmt, ...);
 void destroy_layout(struct vdfs4_sb_info *sbi);
 
 /**
@@ -1446,6 +1480,9 @@ int vdfs4_check_hash_chunk_no_calc(struct vdfs4_inode_info *inode_i,
 
 #define INODEI_NAME(inode_i) ((inode_i == NULL) ? "<null inodei>" :\
 		((inode_i->name == NULL) ? "<noname>" : inode_i->name))
+
+#define VDFS4_GET_FREE_BLOCKS_COUNT(sbi) ((sbi)->free_blocks_count + \
+		(((sbi)->fsm_info) ? (sbi)->fsm_info->next_free_blocks : 0))
 
 /* VDFS4 mount options */
 enum vdfs4_mount_options {

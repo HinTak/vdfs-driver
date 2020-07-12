@@ -712,16 +712,14 @@ static int vdfs4_validate_bitmap(struct page *page, void *buff,
 		VDFS4_ERR("index:%lu phy addr: 0x%llx", page->index,
 				(unsigned long long int)
 				page_to_phys(page));
+		destroy_layout(sbi);
+	}
+#endif
 #ifdef VDFS4_DEBUG_DUMP
+	if (ret_val) {
 		mutex_lock(&sbi->dump_meta);
 		VDFS4_MDUMP("", buff, buff_size);
 		mutex_unlock(&sbi->dump_meta);
-#endif
-		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_BITMAP_VALIDATE,
-				*((unsigned int *)VDFS4_CRC32_OFFSET((char *)buff,
-				buff_size)), crc, "bitmap validate err",
-				(void *)buff, buff_size);
-		destroy_layout(sbi);
 	}
 #endif
 	return ret_val;
@@ -885,8 +883,9 @@ int vdfs4_clear_bits(char *buff, int buff_size, unsigned int offset,
 	unsigned int cur_position = 0;
 	u_int32_t length = 0, i = 0;
 	char *end_buff;
+	int ret = 0;
 
-	/* go through all blcoks */
+	/* go through all blocks */
 	for (cur_blck = start_blck; cur_blck <= end_blck;
 				cur_blck += blck_size) {
 		/* if it first block */
@@ -913,17 +912,17 @@ int vdfs4_clear_bits(char *buff, int buff_size, unsigned int offset,
 			if (!vdfs4_test_and_clear_bit((int)cur_position,
 					(void *)(cur_blck + magic_len))) {
 #ifdef VDFS4_DEBUG_DUMP
-				VDFS4_ERR("bit cleared offset: %u, position: %u",
+				VDFS4_WARNING("bit cleared offset: %u, position: %u",
 					  offset, cur_position);
 				VDFS4_MDUMP("space bitmap:", (void *)(cur_blck),
 					  blck_size);
 #endif
-				return -EFAULT;
+				ret = -EFAULT;
 			}
 			cur_position++;
 		}
 	}
-	return 0;
+	return ret;
 }
 
 /**
@@ -1303,7 +1302,8 @@ static int vdfs4_meta_write(struct vdfs4_sb_info *sbi)
 	while ((current_mapping = vdfs4_next_mapping(sbi, current_mapping))) {
 		ret2 = filemap_fdatawait_range(current_mapping, 0, LLONG_MAX);
 		if (ret2) {
-			vdfs4_fatal_error(sbi,
+			vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_META_INODE_WRITE,
+				current_mapping->host->i_ino,
 				"cannot write matadata inode %lu: %d",
 				current_mapping->host->i_ino, ret2);
 			ret = ret2;
@@ -1459,7 +1459,8 @@ int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi)
 		ret = vdfs4_sync_exsb(sbi, 1);
 		sbi->snapshot_info->use_base_table = 1;
 		if (ret) {
-			vdfs4_fatal_error(sbi, "cannot sync 2nd sb: %d", ret);
+			vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_META_EXSB_SYNC,
+					0, "cannot sync 2nd sb: %d", ret);
 			return ret;
 		}
 	}
@@ -1471,8 +1472,8 @@ int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi)
 	vdfs4_update_bitmaps(sbi);
 	ret = vdfs4_update_translation_tables(sbi);
 	if (ret) {
-		vdfs4_fatal_error(sbi,
-				"cannot commit translation tables: %d", ret);
+		vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_TRANSTABLE_COMMIT,
+					0, "cannot commit translation tables: %d", ret);
 		return ret;
 	}
 
@@ -1480,7 +1481,8 @@ int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi)
 		ret = vdfs4_sync_exsb(sbi, 0);
 		clear_sbi_flag(sbi, EXSB_DIRTY);
 		if (ret)
-			vdfs4_fatal_error(sbi, "cannot sync 1st sb: %d", ret);
+			vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_META_EXSB_SYNC,
+					0, "cannot sync 1st sb: %d", ret);
 	}
 
 	vdfs4_commit_free_space(sbi);
@@ -2157,21 +2159,26 @@ do_reread:
 
 	ret = (validate_err) ? -EINVAL : 0;
 
-	if (ret && (reread_count < VDFS4_META_REREAD)) {
-		reread_count++;
-		VDFS4_ERR("do re-read bitmap %d", reread_count);
-		for (count = 0; count < (int)pages_count; count++)
-			lock_page(pages[count]);
-		goto do_reread;
+	if (ret) {
+		if (reread_count < VDFS4_META_REREAD) {
+			reread_count++;
+			VDFS4_ERR("do reread bitmap (try %d/%d)\n",
+				  reread_count, VDFS4_META_REREAD);
+			for (count = 0; count < (int)pages_count; count++)
+				lock_page(pages[count]);
+			goto do_reread;
+		} else if (is_sbi_flag_set(sbi, IS_MOUNT_FINISHED)) {
+			vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_BITMAP_VALIDATE,
+					  0, "bitmap validate FAIL");
+		}
+		goto exit_validate_page;
 	}
 
-	if (ret && (is_sbi_flag_set(sbi, IS_MOUNT_FINISHED)))
-			vdfs4_fatal_error(sbi, "bitmap validate FAIL");
-
-	if (ret)
-		goto exit_validate_page;
-
+	if (reread_count)
+		VDFS4_ERR("successed reading of bitmap data with retry "
+			  "(try %d/%d)\n", reread_count, VDFS4_META_REREAD);
 	return ret;
+
 exit_alloc_page:
 	VDFS4_ERR("Error in allocate page");
 	for (; count > 0; count--) {

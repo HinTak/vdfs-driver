@@ -13,14 +13,6 @@ config VDFS4_FS
 
 	  If unsure, say N.
 
-config VDFS4_POSIX_ACL
-	bool "VDFS4 Access Control Lists"
-	depends on VDFS4_FS
-	select FS_POSIX_ACL
-	help
-	  POSIX Access Control Lists (ACLs) support permissions for users and
-	  groups beyond the owner/group/world scheme. See man 5 acl for details.
-
 config VDFS4_DEBUG
 	bool "VDFS4 debug support"
 	depends on VDFS4_FS
@@ -44,7 +36,6 @@ config VDFS4_PERF
 config VDFS4_PANIC_ON_ERROR
 	bool "force kernel panic on fatal errors"
 	depends on VDFS4_FS
-	depends on VDFS4_DEBUG
 	default y
 	help
 	  If you say Y here first disk error or metadata corruption will cause
@@ -108,6 +99,26 @@ config VDFS4_ALLOW_LEGACY_SIGN
 	depends on VDFS4_AUTHENTICATION
 	bool "Allow mounting of partitions with RSA1024 signature"
 	default y
+
+config VDFS4_POSIX_ACL
+	bool "VDFS4 Access Control Lists"
+	depends on VDFS4_FS
+	select FS_POSIX_ACL
+	help
+	  POSIX Access Control Lists (ACLs) support permissions for users and
+	  groups beyond the owner/group/world scheme. See man 5 acl for details.
+
+config VDFS4_FALLOCATE
+	bool "VDFS4 support fallocate"
+	depends on VDFS4_FS
+	default y
+	help
+	For filesystems which support the fallocate system call, preallocation
+	is done quickly by allocating blocks and marking them as uninitialized,
+	requiring no IO to the data blocks.
+	Support fallocate system call in vdfs through the method to use emmc
+	trim feature. so it should be considered about emmc performance impact
+	through latency of emmc latency.
 
 config VDFS4_SQUEEZE
 	depends on VDFS4_FS

@@ -95,7 +95,7 @@ int vdfs4_verify_rsa_signature(struct vdfs4_inode_info *inode_i,
 		goto exit;
 
 	ret = rsa_check_signature(pkey, signature, get_sign_length(sign_type),
-			hash, (uint32_t)inode_i->fbc->hash_len, RSA_PADDING_PKCS1_TYPE1);
+			hash, (unsigned int)inode_i->fbc->hash_len, RSA_PADDING_PKCS1_TYPE1);
 
 exit:
 	kfree(hash);
@@ -108,7 +108,7 @@ int vdfs4_verify_superblock_rsa_signature(enum hash_type hash_type,
 		void *signature, rsakey_t *pkey)
 {
 	int ret = 0;
-	uint32_t hash_len = 0;
+	unsigned int hash_len = 0;
 	int sign_len = get_sign_length(sign_type);
 	void *hash = NULL;
 
@@ -146,7 +146,7 @@ int vdfs4_verify_superblock_rsa_signature(enum hash_type hash_type,
 	if (ret)
 		goto exit;
 
-	ret = rsa_check_signature(pkey, signature, (uint32_t)sign_len,
+	ret = rsa_check_signature(pkey, signature, (unsigned int)sign_len,
 		hash, hash_len, RSA_PADDING_PKCS1_TYPE1);
 exit:
 	kfree(hash);

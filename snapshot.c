@@ -434,8 +434,8 @@ read_basetable:
 			(unsigned long int)(DIV_ROUND_UP(tables_size_in_bytes,
 			(__u64)PAGE_SIZE) << PAGE_SHIFT));
 		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_BASETABLE_LOAD,
-			(uint32_t)table1_version,
-			(uint32_t)table2_version,
+			(unsigned int)table1_version,
+			(unsigned int)table2_version,
 			"fail load baseT", table, tables_size_in_bytes);
 		vfree(table);
 		return -EFAULT;

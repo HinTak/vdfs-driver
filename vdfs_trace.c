@@ -95,6 +95,16 @@ static int arrange_traced_data(vdfs_trace_data_t *data);
 static void start_trace_data(vdfs_trace_data_t *data);
 static void finish_trace_data(vdfs_trace_data_t *data);
 
+static int __init set_init_mode(char *s)
+{
+	if (!s)
+		return 0;
+	trace_ctrl.onoff = TRACE_ON;
+	pr_info("enable vdfs trace(%s)\n", s);
+	return 0;
+}
+early_param("flash_trace", set_init_mode);
+
 static vdfs_trace_data_t *alloc_trace_data(void)
 {
 	unsigned long flag;
@@ -333,18 +343,23 @@ static void fill_fops_trace_data(vdfs_trace_data_t *trace,
 			struct inode *inode, struct file *file,
 			loff_t pos, size_t count)
 {
+	unsigned int flags = 0;
+
+	if (file)
+		flags = file->f_flags;
+
 	if (inode && virt_addr_valid(VDFS4_I(inode)->name))
 		fill_trace_data(trace, vdfs_trace_data_fops, ops_type,
 				bd_part->partno, inode->i_ino,
-				VDFS4_I(inode)->name, pos, count, 0);
+				VDFS4_I(inode)->name, pos, count, flags);
 	else if (inode && file && file->f_path.dentry)
 		fill_trace_data(trace, vdfs_trace_data_fops, ops_type,
 				bd_part->partno, inode->i_ino,
-				file->f_path.dentry->d_iname, pos, count, 0);
+				file->f_path.dentry->d_iname, pos, count, flags);
 	else
 		fill_trace_data(trace, vdfs_trace_data_fops, ops_type,
 				bd_part->partno, 0,
-				'\0', pos, count, 0);
+				'\0', pos, count, flags);
 }
 
 /**
@@ -648,7 +663,7 @@ vdfs_trace_data_t *vdfs_trace_aops_start(
 				return NULL;
 			}
 			break;
-		case vdfs_trace_aops_write_begin:
+		case vdfs_trace_aops_write_begin:	/* FALLTHROUGH */
 			i_info->write_size += len;	/* accrue write size */
 		default:
 			data_pos = pos;
@@ -1042,6 +1057,14 @@ static int _trace_data_to_str(char *buffer,
 
 	/* [ops_func + ] */
 	switch (trace->data_type) {
+	case vdfs_trace_data_fops:
+		if ((trace->ops_type == vdfs_trace_fops_open) &&
+		    (trace->data.target.type & O_TRUNC))
+			/* File Open Flags : T(Trunk) */
+			len += snprintf(buffer + len, size - len - 1, "[T]");
+		else
+			len += snprintf(buffer + len, size - len - 1, "[-]");
+		break;
 	case vdfs_trace_data_fault:
 	case vdfs_trace_data_aops:
 		if (trace->data.fault.type == 0)
@@ -1057,7 +1080,7 @@ static int _trace_data_to_str(char *buffer,
 				((trace->data.hw_decomp.use_hash == 1) ?
 				'H' : 'N'));
 		break;
-	default:	/* fops, req, iops, fstype, rpmb, writeback, pivot */
+	default:	/* req, iops, fstype, rpmb, writeback, pivot */
 		len += snprintf(buffer + len, size - len - 1, "[-]");
 		break;
 	}
@@ -1108,7 +1131,7 @@ static int _trace_data_to_str(char *buffer,
 
 	/* [F/B/C:start:size] */
 	switch (trace->data_type) {
-	case vdfs_trace_data_decomp:
+	case vdfs_trace_data_decomp:	/* FALLTHROUGH */
 		type   = 'C';
 	case vdfs_trace_data_fops:
 		countK = count >> 10;
@@ -1136,7 +1159,7 @@ static int _trace_data_to_str(char *buffer,
 		break;
 	case vdfs_trace_data_aops:
 		switch (trace->ops_type) {
-		case vdfs_trace_aops_writepages:
+		case vdfs_trace_aops_writepages:	/* FALLTHROUGH */
 			if (trace->data.aops.len == LLONG_MAX) {
 #if 0
 				len += snprintf(buffer + len, size - len - 1,

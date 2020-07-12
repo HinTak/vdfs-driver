@@ -374,12 +374,10 @@ static void fsm_add_free_space(struct vdfs4_fsm_info *fsm,
 		cur = container_of(*p, struct fsm_node, node);
 
 		if (fsm_intersects(cur, start, (u32)length)) {
-			vdfs4_fatal_error(fsm->sbi, "freeing already free "
+			vdfs4_fatal_error(fsm->sbi, VDFS4_DEBUG_ERR_BITMAP_FREE,
+					0, "freeing already free "
 					"space: %lld +%lld, %lld +%d",
 					start, length, cur->start, cur->length);
-			vdfs4_record_err_dump_disk(fsm->sbi,
-					VDFS4_DEBUG_ERR_BITMAP_FREE,
-					0, 0, "freeing already free", NULL, 0);
 			return;
 		}
 
@@ -459,10 +457,10 @@ fsm_append_free_space(struct vdfs4_fsm_info *fsm, struct fsm_node *last,
 	return node;
 }
 
-static int fsm_discard_free_space(struct vdfs4_fsm_info *fsm,
+static void fsm_discard_free_space(struct vdfs4_fsm_info *fsm,
 				  struct fsm_node *cur)
 {
-	int rtn;
+	int err;
 	unsigned int i;
 	__u64 total_size = fsm->sbi->volume_blocks_count * fsm->sbi->block_size;
 
@@ -482,24 +480,24 @@ static int fsm_discard_free_space(struct vdfs4_fsm_info *fsm,
 			if (last_block > total_size)
 				continue;
 
-			rtn = blkdev_issue_discard(fsm->sbi->sb->s_bdev,
+			err = blkdev_issue_discard(fsm->sbi->sb->s_bdev,
 				   erase_block_num * erase_blk_size_in_sector,
 				   erase_blk_size_in_sector, GFP_NOFS, 0);
 
 			VDFS4_INFO("discard %s : %d %llu %llu\n",
-				   fsm->sbi->sb->s_id, rtn,
+				   fsm->sbi->sb->s_id, err,
 				   erase_block_num, erase_blk_size_in_sector);
 
-			if (rtn && rtn != -EOPNOTSUPP) {
+			if (err && err != -EOPNOTSUPP) {
 				VDFS4_ERR("discard %s : %d %llu %llu",
-					  fsm->sbi->sb->s_id, rtn,
+					  fsm->sbi->sb->s_id, err,
 					  erase_block_num,
 					  erase_blk_size_in_sector);
 				VDFS4_BUG(fsm->sbi);
 			}
 		}
 	}
-	return rtn;
+	return;
 }
 
 /*
@@ -522,13 +520,11 @@ static void fsm_commit_free_space(struct vdfs4_fsm_info *fsm)
 		while (*p) {
 			cur = container_of(*p, struct fsm_node, node);
 			if (fsm_intersects(cur, node->start, node->length)) {
-				vdfs4_fatal_error(fsm->sbi,
-						"freeing already free "
+				vdfs4_fatal_error(fsm->sbi, VDFS4_DEBUG_ERR_BITMAP_FREE,
+						0, "freeing already free "
 						"space: %lld +%d, %lld +%d",
 						node->start, node->length,
 						cur->start, cur->length);
-				vdfs4_record_err_dump_disk(fsm->sbi, VDFS4_DEBUG_ERR_BITMAP_FREE,
-						0, 0, "freeing already free", NULL, 0);
 
 				fsm->sbi->free_blocks_count -= node->length;
 				fsm->untracked_blocks += node->length;
@@ -892,8 +888,8 @@ exit:
 static int fsm_free_block_chunk(struct vdfs4_fsm_info *fsm,
 	__u64 block_offset, __u32 length_in_blocks, int fsm_flags)
 {
-	int err = 0;
 	unsigned int i;
+	int bit_clear_error = 0;
 	__u64 start_page = block_offset;
 	__u64 end_page	= block_offset + length_in_blocks, page_index;
 	__u64 total_size = fsm->sbi->volume_blocks_count * fsm->sbi->block_size;
@@ -917,28 +913,25 @@ static int fsm_free_block_chunk(struct vdfs4_fsm_info *fsm,
 	if (block_offset + length_in_blocks > (fsm->sbi->volume_blocks_count)) {
 		if (!is_sbi_flag_set(fsm->sbi, IS_MOUNT_FINISHED)) {
 			mutex_unlock(&fsm->lock);
-			return err;
+			return 0;
 		}
 		VDFS4_ERR("[boundary check] offset:%lld, length:%u, count:%llu\n",
 				block_offset, length_in_blocks,
 				fsm->sbi->volume_blocks_count);
 		VDFS4_BUG(fsm->sbi);
 	}
-	/* clear bits */
-	err = (int)vdfs4_clear_bits(fsm->data, (int)
+	/*
+	 * Workaround for DF190617-01744 : Try to clear fsm bits.
+	 * And then let them pass through even if there is some error while doing clear.
+	 */
+	bit_clear_error = vdfs4_clear_bits(fsm->data, (int)
 			(fsm->page_count * PAGE_SIZE),
 			(unsigned int)block_offset,
 			length_in_blocks, FSM_BMP_MAGIC_LEN,
 			fsm->sbi->block_size);
-	if (err) {
-		if (!is_sbi_flag_set(fsm->sbi, IS_MOUNT_FINISHED)) {
-			mutex_unlock(&fsm->lock);
-			return err;
-		}
 
-		destroy_layout(fsm->sbi);
-		VDFS4_BUG(fsm->sbi);
-	}
+	if (bit_clear_error)
+		goto skip_handling;
 
 	/* return failed delayed-allocation back to reserve */
 	if (fsm_flags & VDFS4_FSM_FREE_RESERVE)
@@ -952,6 +945,7 @@ static int fsm_free_block_chunk(struct vdfs4_fsm_info *fsm,
 	else
 		fsm_add_free_space(fsm, block_offset, length_in_blocks);
 
+skip_handling:
 	mutex_unlock(&fsm->lock);
 	for (page_index = start_page; page_index <= end_page; page_index++)
 		vdfs4_add_chunk_bitmap(fsm->sbi, fsm->pages[page_index], 1);

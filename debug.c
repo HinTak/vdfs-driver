@@ -192,7 +192,7 @@ static uint32_t _calc_crash_val(struct vdfs4_sb_info *sbi)
 	struct timespec ts;
 	u64 ret = 0;
 
-	getnstimeofday(&ts);
+	get_monotonic_boottime(&ts);
 
 	if (!is_sbi_flag_set(sbi, IS_MOUNT_FINISHED))
 		ret = 10;	/* mount fail case */

@@ -229,16 +229,14 @@ static int check_set_offset(struct vdfs4_bnode *bnode, unsigned int index,
 	vdfs4_bt_off_t *offset = vdfs4_get_offset_addr(bnode, index);
 
 	if (IS_ERR(offset) || !offset) {
-		vdfs4_dump_panic_remount(
-			bnode, VDFS4_DEBUG_ERR_NONE,
-			"offset is wrong %llu", offset);
+		vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_NONE,
+				"offset is wrong %llu", offset);
 		return -EFAULT;
 	}
 
 	if (!is_offset_correct(bnode, new_val)) {
-		vdfs4_dump_panic_remount(
-			bnode, VDFS4_DEBUG_ERR_BNODE_OFFSET,
-			"new offset is wrong %llu", new_val);
+		vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_OFFSET,
+				"new offset is wrong %llu", new_val);
 		return -EFAULT;
 	}
 	*offset = new_val;
@@ -342,31 +340,26 @@ void vdfs4_bnode_sanity_check(struct vdfs4_bnode *bnode)
 	if (record_count == 0) {
 		if (__get_offset(bnode, 0) !=
 			sizeof(struct vdfs4_gen_node_descr)) {
-			vdfs4_dump_panic_remount(
-				bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
-				"zero offset is broken");
+			vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+					"zero offset is broken");
 		}
 		return;
 	}
 
-	if (le16_to_cpu(bnode_desc->free_space) > max_bnode_size) {
-		vdfs4_dump_panic_remount(
-			bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
-			"free is bigger than bnode (%u, %u)",
-			bnode_desc->free_space, max_bnode_size);
-	}
-	if (record_count > 1000) {
-		vdfs4_dump_panic_remount(
-			bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
-			"records count toooo big %d", record_count);
-	}
+	if (le16_to_cpu(bnode_desc->free_space) > max_bnode_size)
+		vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+				"free is bigger than bnode (%u, %u)",
+				bnode_desc->free_space, max_bnode_size);
+
+	if (record_count > 1000)
+		vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+				"records count toooo big %d", record_count);
 
 	for (count = 0; count < record_count; count++) {
 		offset = __get_offset(bnode, (unsigned)count);
 		if (!is_offset_correct(bnode, offset)) {
-			vdfs4_dump_panic_remount(
-				bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
-				"offset is broken %d %u", count, offset);
+			vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+					"offset is broken %d %u", count, offset);
 			return;
 		}
 		min_offset = (min_offset > offset) ? offset : min_offset;
@@ -380,21 +373,19 @@ void vdfs4_bnode_sanity_check(struct vdfs4_bnode *bnode)
 		key = addr;
 		offset += key->record_len;
 		if (!is_offset_correct(bnode, offset)) {
-			vdfs4_dump_panic_remount(
-				bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
-				"record is broken %d %d", count, key->record_len);
+			vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+					"record is broken %d %d", count, key->record_len);
 			return;
 		}
 	}
 
-	if (offset != __get_offset(bnode, (unsigned)record_count)) {
-		vdfs4_dump_panic_remount(
-			bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
-			"free space offset is broken %u, %u, %u",
-			offset, record_count,
-			__get_offset(bnode, (unsigned)record_count));
-	}
+	if (offset != __get_offset(bnode, (unsigned)record_count))
+		vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_SANITY,
+				"free space offset is broken %u, %u, %u",
+				offset, record_count,
+				__get_offset(bnode, (unsigned)record_count));
 }
+
 struct __vdfs4_bnode {
 	struct vdfs4_bnode bnode;
 	struct page *page;
@@ -747,9 +738,8 @@ static int delete_from_node(struct vdfs4_bnode *bnode, int del_index)
 
 	if (!is_offset_correct(bnode, free_space_offset) ||
 			!is_offset_correct(bnode, del_offset)) {
-		vdfs4_dump_panic_remount(
-			bnode, VDFS4_DEBUG_ERR_BNODE_DELETE,
-			"free space offset is broken %u", free_space_offset);
+		vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_DELETE,
+				"free space offset is broken %u", free_space_offset);
 		return -EFAULT;
 	}
 
@@ -1838,16 +1828,13 @@ static int btree_merge(struct vdfs4_btree *tree, unsigned int left_bnode_id,
 	if (check_bnode_offset_area(left_bnode) ||
 			check_bnode_offset_area(right_bnode)) {
 
-		if (check_bnode_offset_area(left_bnode)) {
-			vdfs4_dump_panic_remount(
-				left_bnode, VDFS4_DEBUG_ERR_BNODE_MERGE,
-				"offset area brk(L)");
-		}
-		if (check_bnode_offset_area(right_bnode)) {
-			vdfs4_dump_panic_remount(
-				right_bnode, VDFS4_DEBUG_ERR_BNODE_MERGE,
-				"offset area brk(R)");
-		}
+		if (check_bnode_offset_area(left_bnode))
+			vdfs4_dump_panic(left_bnode, VDFS4_DEBUG_ERR_BNODE_MERGE,
+					"offset area brk(L)");
+
+		if (check_bnode_offset_area(right_bnode))
+			vdfs4_dump_panic(right_bnode, VDFS4_DEBUG_ERR_BNODE_MERGE,
+					"offset area brk(R)");
 
 		vdfs4_put_bnode(right_bnode);
 		vdfs4_put_bnode(left_bnode);
@@ -1881,8 +1868,7 @@ static int btree_merge(struct vdfs4_btree *tree, unsigned int left_bnode_id,
 
 		if (check_set_offset(left_bnode, record_index,
 					record_offset)) {
-			vdfs4_dump_panic_remount(
-				left_bnode, VDFS4_DEBUG_ERR_BNODE_MERGE,
+			vdfs4_dump_panic(left_bnode, VDFS4_DEBUG_ERR_BNODE_MERGE,
 				"offset is wrong %d - %u", record_index, record_offset);
 			return -EFAULT;
 		}

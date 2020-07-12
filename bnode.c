@@ -71,13 +71,14 @@ static int  __get_checksum_for_bnode(void *bnode_data,
 	if (is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN))
 		return 1;
 
-#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
-	if (!sbi->raw_meta_hashtable) {
-		/* suppress warning log */
-		/* VDFS4_WARNING("No meta hashtable - skip to get checksum for bnode\n"); */
+	/* rw image doesn't have meta hashtable */
+	if (!sbi->orig_ro)
 		return 1;
-	}
-#endif
+
+	/* ro image without meta hashtable */
+	if (!sbi->raw_meta_hashtable)
+		return 1;
+
 	index = bnode->pages[0]->index >>
 			(sbi->log_super_page_size - PAGE_SHIFT);
 
@@ -100,13 +101,9 @@ static int  __get_checksum_for_bnode(void *bnode_data,
 	crc_on_hashtable = vdfs4_get_meta_hashtable(sbi, ino);
 
 	if (crc_on_bnode != crc_on_hashtable[index]) {
-#if defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
-		/* suppress warning log */
-		/* VDFS4_WARNING("wrong bnode hash bnode:%x hashtable:%x\n",
-		      crc_on_bnode, crc_on_hashtable[index]); */
-#else
+		VDFS4_ERR("wrong bnode hash bnode:%x hashtable:%x\n",
+			  crc_on_bnode, crc_on_hashtable[index]);
 		return 0;
-#endif
 	}
 	return 1;
 }
@@ -124,7 +121,7 @@ static void free_bnode(struct vdfs4_bnode *bnode);
  * @param [in]	fmt	Error message string
  * @return		void
  */
-void vdfs4_dump_panic_remount(struct vdfs4_bnode *bnode, uint32_t err_type,
+void vdfs4_dump_panic(struct vdfs4_bnode *bnode, unsigned int err_type,
 		const char *fmt, ...)
 {
 	struct vdfs4_sb_info *sbi = bnode->host->sbi;
@@ -136,7 +133,7 @@ void vdfs4_dump_panic_remount(struct vdfs4_bnode *bnode, uint32_t err_type,
 	vaf.fmt = fmt;
 	vaf.va = &args;
 
-	VDFS4_NOTICE("VDFS4(%s): error in %pf, %pV\n", device,
+	VDFS4_ERR("VDFS4(%s): error in %pf, %pV\n", device,
 			__builtin_return_address(0), &vaf);
 	va_end(args);
 
@@ -172,7 +169,7 @@ static int read_or_create_bnode_data(struct vdfs4_bnode *bnode, int create,
 	int ret;
 	int count;
 	int type = VDFS4_META_READ;
-	int reread_count = 0;
+	int reread_count = VDFS4_META_REREAD_BNODE;
 
 	page_idx = (unsigned long)bnode->node_id *
 				(unsigned long)btree->pages_per_node;
@@ -202,7 +199,8 @@ do_reread:
 		ret = -ENOMEM;
 		release_pages(bnode->pages, (int)btree->pages_per_node, 0);
 		dump_stack();
-		vdfs4_fatal_error(bnode->host->sbi, "vm_map_ram fails");
+		vdfs4_fatal_error(bnode->host->sbi, 0, 0, "vm_map_ram fails");
+		/* TODO : need retry ? */
 		goto err_read;
 	}
 
@@ -286,12 +284,12 @@ do_reread:
 		vdfs4_bnode_sanity_check(bnode);
 #endif
 
-	/* temporary code: first time we read incorrectly, next time
-	it was ok. Need to know if such situation can really happen */
-	if (reread_count != 0)
-		vdfs4_fatal_error(bnode->host->sbi,
-		"wrong data read from mmc, need to investigate (try %d/%d)",
-		reread_count, VDFS4_META_REREAD_BNODE);
+	/* first time we read incorrectly, next time it was ok.
+	   Need to know if such situation can really happen */
+	if (reread_count != VDFS4_META_REREAD_BNODE)
+		VDFS4_ERR("wrong data read from mmc, need to investigate (try %d/%d)",
+		VDFS4_META_REREAD_BNODE - (reread_count + 1),
+		VDFS4_META_REREAD_BNODE);
 
 	return 0;
 
@@ -302,23 +300,20 @@ err_exit_vunmap:
 	vdfs4_dump_bnode(bnode, data);
 	vdfs4_dump_basetable(VDFS4_SB(btree->inode->i_sb), NULL, 0);
 
-	vdfs4_record_err_dump_disk(btree->sbi, VDFS4_DEBUG_ERR_BNODE_READ,
-		 btree->btree_type, page_idx, "bnode read err",
-		 (void *)data, bnode->host->node_size_bytes);
-
 	vm_unmap_ram(data, btree->pages_per_node);
 	release_pages(bnode->pages, (int)btree->pages_per_node, 0);
 	memset(bnode->pages, 0, sizeof(struct page *) * btree->pages_per_node);
 
-	if (reread_count < VDFS4_META_REREAD_BNODE) {
-		reread_count++;
-		VDFS4_ERR("do bnode re-read %d", reread_count);
+	if (--reread_count >= 0) {
+		VDFS4_ERR("do bnode re-read %d",
+			VDFS4_META_REREAD - reread_count);
 		goto do_reread;
 	}
 
 	ret = -EINVAL;
 	if (is_sbi_flag_set(btree->sbi, IS_MOUNT_FINISHED))
-		vdfs4_fatal_error(bnode->host->sbi, "file: bnode validate");
+		vdfs4_fatal_error(bnode->host->sbi, VDFS4_DEBUG_ERR_BNODE_VALIDATE,
+				0, "file: bnode validate");
 
 err_read:
 	/* publish error code */
@@ -450,9 +445,8 @@ struct vdfs4_bnode *vdfs4_alloc_new_bnode(struct vdfs4_btree *btree)
 		return ERR_PTR(-ENOSPC);
 
 	if (__test_and_set_bit((int)bitmap->first_free_id, bitmap->data)) {
-		vdfs4_dump_panic_remount(
-			btree->head_bnode, VDFS4_DEBUG_ERR_BNODE_ALLOC,
-			"cannot allocate bnode id");
+		vdfs4_dump_panic(btree->head_bnode, VDFS4_DEBUG_ERR_BNODE_ALLOC,
+				"cannot allocate bnode id");
 		return ERR_PTR(-EFAULT);
 	}
 
@@ -544,11 +538,10 @@ void vdfs4_put_bnode(struct vdfs4_bnode *bnode)
 	struct vdfs4_btree *btree = bnode->host;
 
 	mutex_lock(&btree->hash_lock);
-	if (bnode->ref_count <= 0) {
-		vdfs4_dump_panic_remount(
-			btree->head_bnode, VDFS4_DEBUG_ERR_BNODE_PUT,
-			"ref count less 0");
-	}
+	if (bnode->ref_count <= 0)
+		vdfs4_dump_panic(btree->head_bnode, VDFS4_DEBUG_ERR_BNODE_PUT,
+				"ref count less 0");
+
 	if (--bnode->ref_count == 0)
 		unhash_bnode(bnode);
 	else
@@ -644,17 +637,15 @@ int vdfs4_destroy_bnode(struct vdfs4_bnode *bnode)
 
 
 	if (bnode_id == VDFS4_INVALID_NODE_ID) {
-		vdfs4_dump_panic_remount(
-			bnode, VDFS4_DEBUG_ERR_BNODE_DESTROY,
-			"invalid bnode id %u", bnode_id);
+		vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_DESTROY,
+				"invalid bnode id %u", bnode_id);
 		return -EINVAL;
 	}
 
 	mutex_lock(&btree->hash_lock);
 	if (--bnode->ref_count != 0) {
-		vdfs4_dump_panic_remount(
-			bnode, VDFS4_DEBUG_ERR_BNODE_DESTROY,
-			"invalid ref count %d", bnode->ref_count);
+		vdfs4_dump_panic(bnode, VDFS4_DEBUG_ERR_BNODE_DESTROY,
+				"invalid ref count %d", bnode->ref_count);
 		mutex_unlock(&btree->hash_lock);
 		return -EFAULT;
 	}
@@ -665,9 +656,8 @@ int vdfs4_destroy_bnode(struct vdfs4_bnode *bnode)
 	free_bnode(bnode);
 
 	if (!vdfs4_test_and_clear_bit((int)bnode_id, bitmap->data)) {
-		vdfs4_dump_panic_remount(
-			btree->head_bnode, VDFS4_DEBUG_ERR_BNODE_DESTROY,
-			"already clear bit %u", bnode_id);
+		vdfs4_dump_panic(btree->head_bnode, VDFS4_DEBUG_ERR_BNODE_DESTROY,
+				"already clear bit %u", bnode_id);
 		return -EFAULT;
 	}
 
@@ -739,11 +729,10 @@ void vdfs4_destroy_free_bnode_bitmap(struct vdfs4_bnode_bitmap *bitmap)
 void vdfs4_mark_bnode_dirty(struct vdfs4_bnode *node)
 {
 	VDFS4_BUG_ON(!node, NULL);
-	if (node->mode != VDFS4_BNODE_MODE_RW) {
-		vdfs4_dump_panic_remount(
-			node, VDFS4_DEBUG_ERR_BNODE_DIRTY,
-			"invalid bnode mode %u", node->mode);
-	}
+	if (node->mode != VDFS4_BNODE_MODE_RW)
+		vdfs4_dump_panic(node, VDFS4_DEBUG_ERR_BNODE_DIRTY,
+				"invalid bnode mode %u", node->mode);
+
 	vdfs4_assert_btree_write(node->host);
 	vdfs4_add_chunk_bnode(node->host->sbi, node->pages);
 }

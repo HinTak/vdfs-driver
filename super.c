@@ -325,7 +325,8 @@ int vdfs4_sync_fs(struct super_block *sb, int wait)
 
 		ret = vdfs4_sync_metadata(sbi);
 		if (ret)
-			vdfs4_fatal_error(sbi, "metadata commit failed:%d", ret);
+			vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_META_COMMIT,
+					0, "metadata commit failed:%d", ret);
 		up_write(&si->writeback_lock);
 		(*transaction_count)--;
 		up_write(&si->transaction_lock);
@@ -532,13 +533,11 @@ static int vdfs4_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct super_block	*sb = dentry->d_sb;
 	struct vdfs4_sb_info	*sbi = sb->s_fs_info;
 	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
-	struct vdfs4_fsm_info	*fsm = sbi->fsm_info;
 
 	buf->f_type = (long) VDFS4_SB_SIGNATURE;
 	buf->f_bsize = (long int)sbi->block_size;
 	buf->f_blocks = sbi->volume_blocks_count;
-	buf->f_bavail = buf->f_bfree =
-		sbi->free_blocks_count + ((fsm) ? fsm->next_free_blocks : 0);
+	buf->f_bavail = buf->f_bfree = VDFS4_GET_FREE_BLOCKS_COUNT(sbi);
 	buf->f_files = sbi->files_count + sbi->folders_count + 0xfefefe;
 	memcpy((void *)&buf->f_fsid.val[0], l_sb->exsb.volume_uuid,
 			sizeof(int));
@@ -599,22 +598,19 @@ static void vdfs4_evict_inode(struct inode *inode)
 
 	error = vdfs4_xattrtree_remove_all(sbi->xattr_tree, inode->i_ino);
 	if (error) {
-		vdfs4_fatal_error(sbi,
-			"cannot clear xattrs for ino#%lu: %d",
+		vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_INODE_EVICT,
+			inode->i_ino, "cannot clear xattrs for ino#%lu: %d",
 			inode->i_ino, error);
-		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_EVICT,
-			inode->i_ino, 0, "fail xattrs ino", NULL, 0);
 		goto out_trans;
 	}
 
 	if (S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode)) {
 		error = vdfs4_truncate_blocks(inode, 0);
 		if (error) {
-			vdfs4_fatal_error(sbi,
-					"cannot truncate ino#%lu blocks: %d",
-					inode->i_ino, error);
-			vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_EVICT,
-					inode->i_ino, 0, "fail truncate ino", NULL, 0);
+			vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_INODE_EVICT,
+				inode->i_ino,
+				"cannot truncate ino#%lu blocks: %d",
+				inode->i_ino, error);
 			goto out_trans;
 		}
 		inode->i_size = 0;
@@ -633,10 +629,10 @@ static void vdfs4_evict_inode(struct inode *inode)
 				strlen(VDFS4_I(inode)->name),
 				VDFS4_I(inode)->record_type);
 	if (error) {
-		vdfs4_fatal_error(sbi, "cannot remove inode ino#%lu: %d",
-				inode->i_ino, error);
-		vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_INODE_EVICT,
-				inode->i_ino, 0, "fail cattree ino", NULL, 0);
+		vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_INODE_EVICT,
+			inode->i_ino,
+			"cannot remove inode ino#%lu: %d",
+			inode->i_ino, error);
 		goto out_unlock;
 	}
 
@@ -932,7 +928,8 @@ static void vdfs4_print_reformat_history(struct vdfs4_sb_info *sbi)
 	unlock_page(sbi->superblocks);
 }
 
-void vdfs4_fatal_error(struct vdfs4_sb_info *sbi, const char *fmt, ...)
+void vdfs4_fatal_error(struct vdfs4_sb_info *sbi, unsigned int err_type,
+		unsigned long i_ino, const char *fmt, ...)
 {
 	const char *device = sbi->sb->s_id;
 	struct va_format vaf;
@@ -944,6 +941,10 @@ void vdfs4_fatal_error(struct vdfs4_sb_info *sbi, const char *fmt, ...)
 	VDFS4_ERR("VDFS4(%s): error in %pf, %pV\n", device,
 			__builtin_return_address(0), &vaf);
 	va_end(args);
+
+	if (err_type)
+		vdfs4_record_err_dump_disk(sbi, err_type, i_ino, 0,
+			fmt, NULL, 0);
 
 #ifdef CONFIG_VDFS4_PANIC_ON_ERROR
 	panic("VDFS4(%s): forced kernel panic after fatal error\n", device);
@@ -1129,6 +1130,11 @@ static int vdfs4_sb_read(struct super_block *sb, int silent)
 #ifdef CONFIG_VDFS4_AUTHENTICATION
 	if (check_signature)
 		set_sbi_flag(sbi, VOLUME_AUTH);
+	if (!check_signature && esb->read_only) {
+		VDFS4_WARNING("dncs cannot be used with ro image(%s)\n", sb->s_id);
+		ret = -EINVAL;
+		goto err_superblock_copy_unmap;
+	}
 #endif
 	if (esb->read_only)
 		sb->s_flags |= MS_RDONLY;
@@ -1298,40 +1304,6 @@ static int vdfs4_check_resize_volume(struct super_block *sb)
 	return 0;
 }
 
-static int get_hashtable_size(struct vdfs4_sb_info *sbi,
-		      sector_t iblock, __u64 *size) {
-
-	struct page *page;
-	struct vdfs4_meta_hashtable *table = NULL;
-	int ret = 0;
-	sector_t start_sector;
-
-	ret = vdfs4_get_table_sector(sbi, iblock, &start_sector);
-	if (ret)
-		return ret;
-
-	page = alloc_page(GFP_NOFS | __GFP_ZERO);
-	if (!page)
-		return -ENOMEM;
-
-	ret = vdfs4_read_page(sbi->sb->s_bdev, page, start_sector, 8, 0);
-	if (ret)
-		goto exit;
-
-	table = kmap_atomic(page);
-	if (!table) {
-		ret = -ENOMEM;
-		goto exit;
-	}
-	/* size of the meta hash table */
-	*size = le64_to_cpu(table->size);
-	kunmap_atomic(table);
-
-exit:
-	__free_page(page);
-	return ret;
-}
-
 /**
  * @brief			load meta hash table check
  * @param [in]		sb	VFS superblock info stucture
@@ -1344,67 +1316,96 @@ static int load_meta_hashtable(struct super_block *sb)
 	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
 	struct vdfs4_super_block *esb = &l_sb->sb;
 	struct vdfs4_extended_super_block *exsb = &l_sb->exsb;
-	struct vdfs4_meta_hashtable *hashtable;
-	__u64 table_tbc, table_start;
-	__u64 hashtable_size_in_bytes;
-	__u32 on_disk_checksum, checksum;
-	int is_not_hashtable, ret;
+	struct vdfs4_meta_hashtable *hashtable = NULL;
+	__u32 orig_cksum, calc_cksum;
+	int is_not_hashtable, i;
+	sector_t mehs_start;
+	unsigned int mehs_page_cnt, mehs_sector_cnt;
+	int ret = 0;
+	struct page **pages = NULL;
 
-	sbi->raw_meta_hashtable = NULL;
-	table_tbc = le64_to_cpu(exsb->tables.length);
-	table_start = (sector_t)table_tbc >> 1;
+	/*
+	 * Only signed ro image has meta hashtable.
+	 */
+	if (!esb->read_only)
+		return 0;
 
-	/* Meta hashtable for R/O partition is placed in second base table */
-	ret = get_hashtable_size(sbi, table_start,
-				 &hashtable_size_in_bytes);
+	if (!exsb->meta_hashtable_area.length) {
+		VDFS4_WARNING("Image(%s) is RO image. But no hashtable.",
+			      sb->s_id);
+		return 0;
+	}
 
-	hashtable = vdfs4_vmalloc((unsigned long int)(DIV_ROUND_UP(
-				   hashtable_size_in_bytes,
-				   (__u64)PAGE_SIZE) << PAGE_SHIFT));
-	if (!hashtable)
-		return -ENOMEM;
+	mehs_start = exsb->meta_hashtable_area.begin <<
+		(sbi->block_size_shift - SECTOR_SIZE_SHIFT);
+	mehs_sector_cnt = exsb->meta_hashtable_area.length <<
+		(sbi->block_size_shift - SECTOR_SIZE_SHIFT);
+	mehs_page_cnt = DIV_ROUND_UP(mehs_sector_cnt, SECTOR_PER_PAGE);
 
-	ret = vdfs4_table_IO(sbi, hashtable, hashtable_size_in_bytes,
-			     READ | REQ_META | REQ_PRIO, &table_start);
+	/* allocate memory for table data */
+	hashtable = vdfs4_vmalloc(mehs_page_cnt << PAGE_SHIFT);
+	if (!hashtable) {
+		ret = -ENOMEM;
+		goto fail;
+	}
 
+	pages = kzalloc(sizeof(struct page*) * mehs_page_cnt, GFP_NOFS);
+	if (!pages) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+
+	for (i = 0; i < mehs_page_cnt; i++) {
+		pages[i] = vmalloc_to_page((u8*)hashtable + (i << PAGE_SHIFT));
+		if (!pages[i]) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+	}
+
+	ret = vdfs4_read_pages(sb->s_bdev, pages, mehs_start, mehs_page_cnt);
 	if (ret) {
-		VDFS4_WARNING("Failed to meta hash table IO.");
-		vfree(hashtable);
-		return ret;
+		ret = -EIO;
+		goto fail;
 	}
 
-	/* from superblock */
-	on_disk_checksum = esb->meta_hashtable_checksum;
-
-	is_not_hashtable = strncmp(hashtable->signature,
-				    VDFS4_META_HASHTABLE,
-				    sizeof(VDFS4_META_HASHTABLE) - 1);
-	/* signature not match */
+	/* Check signature */
+	is_not_hashtable = strncmp(hashtable->signature, VDFS4_META_HASHTABLE,
+				   sizeof(VDFS4_META_HASHTABLE) - 1);
 	if (is_not_hashtable) {
-		VDFS4_WARNING("wrong meta hashtable signature(%#x)",
-			  *(u32 *)hashtable->signature);
+		VDFS4_WARNING("wrong meta hashtable signature(0x%08X)",
+			      *(u32*)hashtable->signature);
+		ret = -EINVAL;
 		goto fail;
 	}
 
-	if (le32_to_cpu(hashtable->size) > 4096 * PAGE_SIZE) {
+	/* Check table size */
+	if (le32_to_cpu(hashtable->size) > (4096 * PAGE_SIZE)) {
 		VDFS4_WARNING("wrong hashtable size (%llx)", hashtable->size);
+		ret = -EINVAL;
 		goto fail;
 	}
 
-	checksum = crc32(0, hashtable, le32_to_cpu(hashtable->size));
-
-	if (checksum != on_disk_checksum) {
-		VDFS4_WARNING("meta hashtable crc mismatch.(org:%#x,calc:%#x)",
-			  on_disk_checksum, checksum);
+	/* Verification */
+	orig_cksum = esb->meta_hashtable_checksum;
+	calc_cksum = crc32(0, hashtable, le32_to_cpu(hashtable->size));
+	if (orig_cksum != calc_cksum) {
+		VDFS4_WARNING("meta hashtable crc mismatch.(orig:%#x,calc:%#x)",
+			      orig_cksum, calc_cksum);
+		ret = -EFAULT;
 		goto fail;
 	}
 
+	/* Set */
 	sbi->raw_meta_hashtable = hashtable;
 
-	return 0;
 fail:
-	vfree(hashtable);
-	return -EINVAL;
+	if (pages)
+		kfree(pages);
+	if (ret && hashtable)
+		vfree(hashtable);
+
+	return ret;
 }
 
 /**
@@ -1826,7 +1827,7 @@ static ssize_t vdfs4_info(struct vdfs4_sb_info *sbi, char *buf)
 static ssize_t vdfs4_err_count(struct vdfs4_sb_info *sbi, char *buf)
 {
 	int rtn = 0;
-	uint32_t err_count = 0;
+	unsigned int err_count = 0;
 
 	if (!sbi)
 		return snprintf(buf, PAGE_SIZE, "%d", -EINVAL);
@@ -1918,6 +1919,7 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	struct vdfs4_layout_sb *l_sb = NULL;
 	struct vdfs4_extended_super_block *exsb = NULL;
 	struct timespec ts;
+	u64 volume_blocks, free_blocks;
 
 #ifdef CONFIG_VDFS4_PRINT_MOUNT_TIME
 	unsigned long mount_start = jiffies;
@@ -2022,11 +2024,9 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	if (!is_sbi_flag_set(sbi, DO_NOT_CHECK_SIGN)) {
 		ret = load_meta_hashtable(sb);
 		if (ret) {
-#if !defined(CONFIG_VDFS4_DEBUG_AUTHENTICAION)
 			VDFS4_ERR("meta hashtable read error (%s,ret:%d)\n",
 				  bdevname(sb->s_bdev, bdev_name), ret);
 			goto vdfs4_extended_sb_read_error;
-#endif
 		}
 	}
 #else
@@ -2187,10 +2187,16 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 	}
 #endif
 
-	getnstimeofday(&ts);
+	get_monotonic_boottime(&ts);
 	sbi->mount_time = ts.tv_sec;
 	atomic_set(&sbi->running_errcnt, 0);
-	VDFS4_NOTICE("mounted %s\n",  bdevname(sb->s_bdev, bdev_name));
+
+	volume_blocks = sbi->volume_blocks_count;
+	free_blocks = VDFS4_GET_FREE_BLOCKS_COUNT(sbi);
+	VDFS4_NOTICE("mounted %s (Size:%lluMiB, Avail:%lluMiB)\n",
+		     bdevname(sb->s_bdev, bdev_name),
+		     volume_blocks >> (20 - sbi->block_size_shift),
+		     free_blocks >> (20 - sbi->block_size_shift));
 	return 0;
 
 	kobject_del(&sbi->s_kobj);

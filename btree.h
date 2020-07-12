@@ -287,7 +287,7 @@ int vdfs4_check_btree_records_order(struct vdfs4_btree *btree);
 
 void vdfs4_init_new_node_descr(struct vdfs4_bnode *bnode,
 		enum vdfs4_node_type type);
-void vdfs4_dump_panic_remount(struct vdfs4_bnode *bnode, uint32_t err_type,
+void vdfs4_dump_panic(struct vdfs4_bnode *bnode, unsigned int err_type,
 		const char *fmt, ...);
 int vdfs4_check_and_sign_dirty_bnodes(struct page **page,
 		struct vdfs4_btree *btree, __u64 version);

@@ -75,11 +75,10 @@ void vdfs4_del_from_orphan(struct vdfs4_sb_info *sbi, struct inode *inode)
 		prev->next_orphan_id = VDFS4_I(inode)->next_orphan_id;
 		mark_inode_dirty(&prev->vfs_inode);
 		ret = __vdfs4_write_inode(sbi, &prev->vfs_inode);
-		if (ret) {
-			vdfs4_fatal_error(sbi, "delete from orphan list");
-			vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_ORPHAN,
-					inode->i_ino, 0, "fail delete orphan", NULL, 0);
-		}
+		if (ret)
+			vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_ORPHAN,
+				inode->i_ino, "delete from orphan list");
+
 		clear_vdfs4_inode_flag(inode, ORPHAN_INODE);
 		VDFS4_I(inode)->next_orphan_id = FINAL_ORPHAN_ID;
 		list_del_init(&VDFS4_I(inode)->orphan_list);
@@ -101,11 +100,10 @@ int vdfs4_process_orphan_inodes(struct vdfs4_sb_info *sbi)
 			return -EINVAL;
 		if (inode->i_nlink ||
 		    !is_vdfs4_inode_flag_set(inode, ORPHAN_INODE)) {
-			vdfs4_fatal_error(sbi,
+			vdfs4_fatal_error(sbi, VDFS4_DEBUG_ERR_ORPHAN,
+					inode->i_ino,
 					"non-orphan ino#%lu in orphan list",
 					inode->i_ino);
-			vdfs4_record_err_dump_disk(sbi, VDFS4_DEBUG_ERR_ORPHAN,
-					inode->i_ino, 0, "non orphan", NULL, 0);
 			return -EINVAL;
 		}
 
