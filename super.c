@@ -27,7 +27,7 @@
 #include <linux/buffer_head.h>
 #include <linux/crc32.h>
 #include <linux/version.h>
-#include <linux/genhd.h>
+#include <linux/part_stat.h>
 #include <linux/exportfs.h>
 #include <linux/vmalloc.h>
 #include <linux/writeback.h>
