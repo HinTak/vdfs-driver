@@ -26,7 +26,11 @@
 #include <linux/mpage.h>
 #include <linux/writeback.h>
 #include <linux/backing-dev.h>
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,7,0))
+#include <linux/blkdev.h>
+#else
 #include <linux/part_stat.h>
+#endif
 #include <linux/bio.h>
 #include <linux/pagemap.h>
 #include <linux/pagevec.h>

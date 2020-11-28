@@ -27,7 +27,11 @@
 #include <linux/buffer_head.h>
 #include <linux/crc32.h>
 #include <linux/version.h>
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,7,0))
+#include <linux/genhd.h>
+#else
 #include <linux/part_stat.h>
+#endif
 #include <linux/exportfs.h>
 #include <linux/vmalloc.h>
 #include <linux/writeback.h>
