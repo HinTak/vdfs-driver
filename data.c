@@ -2017,8 +2017,12 @@ int vdfs4_auth_decompress_sw(struct inode *inode, struct page **chunk_pages,
 		/* nothing to do: non-auth, non-compressed chunk */
 		return 0;
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0))
+	src = vdfs4_vm_map_ram(chunk_pages, (unsigned)cext->blocks_n, -1);
+#else
 	src = vdfs4_vm_map_ram(chunk_pages, (unsigned)cext->blocks_n, -1,
 			PAGE_KERNEL);
+#endif
 	if (!src)
 		return -ENOMEM;
 
@@ -2063,7 +2067,11 @@ int vdfs4_auth_decompress_sw(struct inode *inode, struct page **chunk_pages,
 		goto exit_alloc_pages;
 	}
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0))
+	dst = vdfs4_vm_map_ram(unpacked_pages, pages_count, -1);
+#else
 	dst = vdfs4_vm_map_ram(unpacked_pages, pages_count, -1, PAGE_KERNEL);
+#endif
 	if (!dst) {
 		ret = -ENOMEM;
 		VDFS4_ERR("cannot allocate memory for file-based decom");

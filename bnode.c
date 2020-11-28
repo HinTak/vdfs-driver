@@ -196,7 +196,11 @@ do_reread:
 	if (bnode->mode == VDFS4_BNODE_MODE_RO)
 		prot = PAGE_KERNEL_RO;
 #endif
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0))
+	data = vdfs4_vm_map_ram(bnode->pages, btree->pages_per_node, -1);
+#else
 	data = vdfs4_vm_map_ram(bnode->pages, btree->pages_per_node, -1, prot);
+#endif
 	if (!data) {
 		VDFS4_ERR("unable to vmap %d pages", btree->pages_per_node);
 		ret = -ENOMEM;
@@ -754,7 +758,11 @@ int vdfs4_check_and_sign_dirty_bnodes(struct page **page,
 	void *bnode_data;
 
 	bnode_data = vdfs4_vm_map_ram(page, btree->pages_per_node,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0))
+				-1);
+#else
 				-1, PAGE_KERNEL);
+#endif
 	if (!bnode_data) {
 		VDFS4_ERR("can not allocate virtual memory");
 		return -ENOMEM;
