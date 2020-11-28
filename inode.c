@@ -468,7 +468,7 @@ int vdfs4_get_free_inode(struct vdfs4_sb_info *sbi, ino_t *i_ino,
 	struct page *page = NULL;
 	void *data;
 	__u64 last_used = atomic64_read(&sbi->free_inode_bitmap.last_used);
-	pgoff_t page_index = (pgoff_t)last_used;
+	__u64 page_index = last_used;
 	/* find_from is modulo, page_index is result of div */
 	__u64 find_from = do_div(page_index, VDFS4_BIT_BLKSIZE(PAGE_SIZE,
 			INODE_BITMAP_MAGIC_LEN));
@@ -556,7 +556,7 @@ int vdfs4_get_free_inode(struct vdfs4_sb_info *sbi, ino_t *i_ino,
 			} else
 				find_from = 0;
 			VDFS4_DEBUG_INO("move to next page"
-				" ind = %lu, id_off = %llu, data = %d\n",
+				" ind = %llu, id_off = %llu, data = %d\n",
 				page_index, id_offset, data_size);
 		}
 
