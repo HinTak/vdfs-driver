@@ -21,6 +21,9 @@
 
 #include "vdfs4.h"
 #include "debug.h"
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0))
+#include <linux/blkdev.h>
+#endif
 
 #ifdef VDFS4_DEBUG_DUMP
 static inline void dump_bnode(void *data, struct page **pages,

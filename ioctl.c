@@ -27,6 +27,9 @@
 #include <fs/internal.h>
 #include <linux/namei.h>
 #include <linux/buffer_head.h>
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0))
+#include <linux/blkdev.h>
+#endif
 
 static int vdfs4_set_type_status(struct vdfs4_inode_info *inode_i,
 		unsigned int status)
