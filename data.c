@@ -1445,7 +1445,9 @@ exit:
 int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi)
 {
 	int ret = 0;
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0))
 	struct super_block *sb = sbi->sb;
+#endif
 	struct vdfs4_layout_sb *l_sb = sbi->raw_superblock;
 	struct vdfs4_extended_super_block *exsb = &l_sb->exsb;
 	struct vdfs4_snapshot_info *snapshot = sbi->snapshot_info;
@@ -1459,7 +1461,11 @@ int vdfs4_sync_metadata(struct vdfs4_sb_info *sbi)
 	}
 
 	/* Write statistics */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0))
 	if (sb->s_bdev->bd_part) {
+#else
+	{
+#endif
 		u64 kbytes_written = sbi->kbytes_written;
 
 		kbytes_written += BD_PART_WRITTEN(sbi);

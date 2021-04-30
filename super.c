@@ -1844,10 +1844,12 @@ static ssize_t vdfs4_err_count(struct vdfs4_sb_info *sbi, char *buf)
 
 static ssize_t vdfs4_lifetime_write_kbytes(struct vdfs4_sb_info *sbi, char *buf)
 {
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0))
 	struct super_block *sb = sbi->sb;
 
 	if (!sb->s_bdev->bd_part)
 		return snprintf(buf, PAGE_SIZE, "0\n");
+#endif
 
 	return snprintf(buf, PAGE_SIZE, "%llu\n",
 			(unsigned long long)(sbi->kbytes_written +
@@ -1932,8 +1934,10 @@ static int vdfs4_fill_super(struct super_block *sb, void *data, int silent)
 		return -ENXIO;
 	if (!sb->s_bdev)
 		return -ENXIO;
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0))
 	if (!sb->s_bdev->bd_part)
 		return -ENXIO;
+#endif
 
 	VDFS4_NOTICE("mount \"%s\" (%s)\n",
 		VDFS4_VERSION, bdevname(sb->s_bdev, bdev_name));
