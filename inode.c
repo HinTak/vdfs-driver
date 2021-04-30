@@ -1382,8 +1382,17 @@ static int vdfs4_readpage_special(struct file *file, struct page *page)
  * param [in]	nr_pages	Number of pages
  * @return			Returns error codes
  */
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,8,0))
+static int vdfs4_readpages(struct file *file, struct address_space *mapping,
+		struct list_head *pages, unsigned nr_pages)
+{
+	int ret;
+#else
 static void vdfs4_readahead(struct readahead_control *rac)
 {
+#endif
+
 	#define list_to_page(head) (list_entry((head)->prev, struct page, lru))
 #ifdef CONFIG_VDFS4_TRACE
 	struct page *page = list_to_page(pages);
@@ -1392,8 +1401,15 @@ static void vdfs4_readahead(struct readahead_control *rac)
 	VT_PREPARE_PARAM(vt_data);
 	VT_AOPS_START(vt_data, vdfs_trace_aops_readpages,
 		      mapping->host, file, page->index, nr_pages, AOPS_SYNC);
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,8,0))
+	ret = mpage_readpages(mapping, pages, nr_pages, vdfs4_get_block);
+#else
 	mpage_readahead(rac, vdfs4_get_block);
+#endif
 	VT_FINISH(vt_data);
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,8,0))
+	return ret;
+#endif
 }
 
 static int vdfs4_readpages_special(struct file *file,
@@ -2918,7 +2934,11 @@ err_reserve:
  */
 const struct address_space_operations vdfs4_aops = {
 	.readpage	= vdfs4_readpage,
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,8,0))
+	.readpages	= vdfs4_readpages,
+#else
 	.readahead	= vdfs4_readahead,
+#endif
 	.writepage	= vdfs4_writepage,
 	.writepages	= vdfs4_writepages,
 	.write_begin	= vdfs4_write_begin,
