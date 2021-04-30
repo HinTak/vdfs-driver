@@ -1240,9 +1240,14 @@ static int vdfs4_extended_sb_read(struct super_block *sb)
 		sbi->folders_count = le64_to_cpu(exsb->folders_count);
 
 		/* For write statistics */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0))
 		if (sb->s_bdev->bd_part)
 			sbi->sectors_written_start =
 				(u64)part_stat_read(sb->s_bdev->bd_part, sectors[1]);
+#else
+		sbi->sectors_written_start =
+			(u64)part_stat_read(sb->s_bdev, sectors[1]);
+#endif
 
 		sbi->kbytes_written =
 			le64_to_cpu(exsb->kbytes_written);

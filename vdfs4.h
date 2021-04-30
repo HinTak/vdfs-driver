@@ -408,9 +408,15 @@ struct vdfs4_sb_info {
 /* For write statistics. Suppose sector size is 512 bytes,
  * and the return value is in kbytes. s is of struct vdfs_sb_info.
  */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0))
 #define BD_PART_WRITTEN(s)					\
 (((u64)part_stat_read(s->sb->s_bdev->bd_part, sectors[1]) -	\
 	s->sectors_written_start) >> 1)
+#else
+#define BD_PART_WRITTEN(s)					\
+(((u64)part_stat_read(s->sb->s_bdev, sectors[1]) -	\
+	s->sectors_written_start) >> 1)
+#endif
 
 #ifdef CONFIG_VDFS4_SQUEEZE_PROFILING
 struct vdfs4_prof_data {
